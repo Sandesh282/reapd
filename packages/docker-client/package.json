@@ -5,6 +5,7 @@
   "main": "./src/index.ts",
   "types": "./src/index.ts",
   "scripts": {
+    "test": "node --import tsx --test 'src/**/*.test.ts'",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
@@ -12,6 +13,7 @@
   },
   "devDependencies": {
     "@types/dockerode": "^3.3.32",
+    "tsx": "^4.19.2",
     "typescript": "^5.7.2",
     "@types/node": "^22.10.1"
   }
