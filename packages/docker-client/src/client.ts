@@ -68,7 +68,7 @@ export async function createPreviewContainer(
   opts: CreatePreviewContainerOptions
 ): Promise<ContainerInfo> {
   const appPort = opts.appPort ?? 3000;
-  const containerName = `reapd-pr-${opts.subdomain}`;
+  const containerName = `reapd-${opts.subdomain}`; // subdomain is the bare label, e.g. "pr-104"
   const traefikRouter = opts.subdomain; // e.g. "pr-104"
 
   const envArray = Object.entries(opts.env ?? {}).map(
@@ -148,10 +148,13 @@ export async function pollUntilHealthy(
     if (signal.aborted) throw new AbortError('Health-check aborted: deployment superseded');
 
     try {
-      const res = await fetch(internalUrl, { signal });
+      // Bound each attempt to 2s so a half-open connection can't outlive the deadline
+      const attemptSignal = AbortSignal.any([signal, AbortSignal.timeout(2_000)]);
+      const res = await fetch(internalUrl, { signal: attemptSignal });
       if (res.ok || res.status < 500) return; // container is responding
     } catch {
-      // Connection refused / ECONNRESET — container not ready yet
+      if (signal.aborted) throw new AbortError('Health-check aborted: deployment superseded');
+      // Connection refused / attempt timeout — container not ready yet
     }
 
     await sleep(delay, signal);
@@ -183,11 +186,17 @@ export async function forceRemoveContainer(
 
 function sleep(ms: number, signal?: AbortSignal): Promise<void> {
   return new Promise((resolve, reject) => {
-    const timer = setTimeout(resolve, ms);
-    signal?.addEventListener('abort', () => {
+    if (signal?.aborted) return reject(new AbortError('Sleep interrupted'));
+
+    const onAbort = () => {
       clearTimeout(timer);
       reject(new AbortError('Sleep interrupted'));
-    });
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort); // don't leak a listener per poll
+      resolve();
+    }, ms);
+    signal?.addEventListener('abort', onAbort, { once: true });
   });
 }
 
