@@ -2,9 +2,12 @@
   "name": "@reapd/worker",
   "version": "0.0.1",
   "private": true,
+  "type": "module",
   "scripts": {
+    "cli": "node --import tsx src/cli/reapd-cli.ts",
     "dev": "tsx watch src/index.ts",
     "build": "tsc",
+    "test": "node --import tsx --test 'src/**/*.test.ts'",
     "typecheck": "tsc --noEmit",
     "lint": "eslint src"
   },
