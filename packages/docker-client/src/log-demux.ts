@@ -51,9 +51,13 @@ export async function* demuxDockerLogs(
     while (buffer.length >= HEADER_SIZE) {
       // Read stream type from byte 0
       const streamByte = buffer[0];
-      // Skip stdin (0x00) and any unknown stream types
-      if (streamByte !== 0x01 && streamByte !== 0x02) {
-        // Corrupt frame — discard one byte and try re-syncing
+      const hasZeroPadding = buffer[1] === 0 && buffer[2] === 0 && buffer[3] === 0;
+
+      if (
+        (streamByte !== 0x00 && streamByte !== 0x01 && streamByte !== 0x02) ||
+        !hasZeroPadding
+      ) {
+        // Misaligned/corrupt header — discard one byte and try re-syncing
         buffer = buffer.subarray(1);
         continue;
       }
@@ -63,6 +67,12 @@ export async function* demuxDockerLogs(
 
       // Wait until we have the full frame payload in the buffer
       if (buffer.length < HEADER_SIZE + payloadLength) break;
+
+      if (streamByte === 0x00) {
+        // Valid stdin frame: skip the whole frame, payload included
+        buffer = buffer.subarray(HEADER_SIZE + payloadLength);
+        continue;
+      }
 
       const payload = buffer
         .subarray(HEADER_SIZE, HEADER_SIZE + payloadLength)
