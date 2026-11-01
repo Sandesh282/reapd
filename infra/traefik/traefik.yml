@@ -1,0 +1,59 @@
+# infra/traefik/traefik.yml
+# Traefik v3 static configuration for local development.
+# Dynamic configuration (router rules) is read from Docker container labels.
+
+global:
+  checkNewVersion: false
+  sendAnonymousUsage: false
+
+# ── API / Dashboard ───────────────────────────────────────────────────────────
+api:
+  dashboard: true     # Accessible at http://localhost:8080/dashboard/
+  insecure: true      # Dashboard is HTTP-only (local dev only)
+
+# ── Entrypoints ───────────────────────────────────────────────────────────────
+entryPoints:
+  web:
+    address: ":80"
+    # Redirect all HTTP → HTTPS
+    http:
+      redirections:
+        entryPoint:
+          to: websecure
+          scheme: https
+          permanent: true
+
+  websecure:
+    address: ":443"
+
+# ── Providers ─────────────────────────────────────────────────────────────────
+providers:
+  docker:
+    # Traefik reads container labels from the Docker Socket Proxy — not the raw socket.
+    # The proxy enforces read-only ACLs (CONTAINERS=1, no EXEC, no PRIVILEGED).
+    endpoint: "tcp://socket-proxy:2375"
+    exposedByDefault: false     # Only containers with traefik.enable=true are routed
+    network: reapd-preview-edge # Traefik looks for container IPs on this network
+    watch: true                 # Pick up new containers without restart
+
+  file:
+    directory: /etc/traefik/dynamic
+    watch: true
+
+# ── TLS ───────────────────────────────────────────────────────────────────────
+# Local dev uses mkcert certificates served from a static file provider.
+# Production will use Cloudflare DNS-01 ACME for *.preview.<domain>.
+tls:
+  stores:
+    default:
+      defaultCertificate:
+        certFile: /etc/traefik/certs/preview.localhost.pem
+        keyFile: /etc/traefik/certs/preview.localhost-key.pem
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+log:
+  level: INFO
+
+accessLog:
+  format: common
+
