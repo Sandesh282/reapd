@@ -165,7 +165,8 @@ export async function pollUntilHealthy(
       const code = (err as { code?: string })?.code;
       if (
         code === 'UNABLE_TO_VERIFY_LEAF_SIGNATURE' ||
-        code === 'SELF_SIGNED_CERT_IN_CHAIN'
+        code === 'SELF_SIGNED_CERT_IN_CHAIN' ||
+        code === 'DEPTH_ZERO_SELF_SIGNED_CERT'
       ) {
         throw new Error(
           `TLS verification failed for ${internalUrl} (${code}). Set NODE_EXTRA_CA_CERTS="$(mkcert -CAROOT)/rootCA.pem" for local mkcert TLS.`
@@ -252,6 +253,41 @@ export async function listManagedContainers(
       state: c.State,
       status: c.Status,
     };
+  });
+}
+
+export interface ManagedImageSummary {
+  id: string;
+  /** Full repository:tag string, e.g. 'reapd-pr-104:a1b2c3d' */
+  repoTag: string;
+  subdomain: string;
+  deploymentId: string;
+}
+
+/**
+ * Lists all preview images managed by reapd (`reapd.managed=true`), optionally
+ * filtered by subdomain. Used by `reapd down` to prune the image even when the
+ * container has already been removed.
+ */
+export async function listManagedImages(
+  docker: Dockerode,
+  filter?: { subdomain?: string }
+): Promise<ManagedImageSummary[]> {
+  const labelFilters = ['reapd.managed=true'];
+  if (filter?.subdomain) labelFilters.push(`reapd.subdomain=${filter.subdomain}`);
+
+  const images = await docker.listImages({
+    filters: { label: labelFilters },
+  });
+
+  return images.flatMap((img) => {
+    const repoTag = img.RepoTags?.[0] ?? img.Id.slice(0, 19);
+    return [{
+      id: img.Id,
+      repoTag,
+      subdomain: img.Labels?.['reapd.subdomain'] ?? '',
+      deploymentId: img.Labels?.['reapd.deployment_id'] ?? '',
+    }];
   });
 }
 
