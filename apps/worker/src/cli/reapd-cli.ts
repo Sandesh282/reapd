@@ -89,7 +89,7 @@ async function runUp(rawArgs: string[]): Promise<void> {
     const buildRes = await buildDockerImage(buildOptions);
     console.log(`✅ Built ${buildRes.imageTag} in ${buildRes.buildDurationMs}ms`);
   } finally {
-    await cloned.cleanup();
+    await cloned.cleanup().catch(() => {/* best-effort: don't mask build/abort errors */});
   }
 
   const docker = createDockerClient();
