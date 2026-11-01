@@ -42,7 +42,12 @@ services:
     image: tecnativa/docker-socket-proxy:0.3.0
     container_name: reapd-socket-proxy
     restart: unless-stopped
+    ports:
+      # Loopback only: lets the local CLI/worker reach the proxy without exposing it to the LAN
+      - "127.0.0.1:2375:2375"
     environment:
+      # Required for container create/start/remove and image builds (default is read-only)
+      POST: 1
       # Allowed endpoints (1 = enabled)
       CONTAINERS: 1
       IMAGES: 1
@@ -52,6 +57,8 @@ services:
       PRIVILEGED: 0
       HOST: 0
       EXEC: 0
+      VOLUMES: 0
+      SWARM: 0
       INFO: 1
       PING: 1
       VERSION: 1
@@ -87,7 +94,7 @@ services:
     image: redis:7-alpine
     container_name: reapd-redis
     restart: unless-stopped
-    command: redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru --save ""
+    command: redis-server --maxmemory 256mb --maxmemory-policy noeviction --save ""
     ports:
       - "6379:6379"    # Exposed for local redis-cli / BullMQ access
     networks:
