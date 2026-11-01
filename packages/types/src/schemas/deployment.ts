@@ -2,9 +2,8 @@
 import { z } from 'zod';
 import { DEPLOYMENT_STATUSES } from '../domain/state-machine.js';
 
-export const DeploymentStatusSchema = z.enum(
-  DEPLOYMENT_STATUSES as unknown as [string, ...string[]]
-);
+// Readonly tuple passed directly so Deployment['status'] stays the literal union
+export const DeploymentStatusSchema = z.enum(DEPLOYMENT_STATUSES);
 
 export const DeploymentSchema = z.object({
   id: z.string().uuid(),
