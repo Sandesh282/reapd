@@ -1,0 +1,121 @@
+# infra/docker-compose.yml
+# reapd local development stack.
+#
+# Services:
+#   traefik       — Reverse proxy with wildcard *.preview.localhost TLS
+#   socket-proxy  — Restricted Docker API proxy (read-only, no privileged ops)
+#   postgres      — PostgreSQL 17 primary database
+#   redis         — Redis 7 for BullMQ job queue + Redis Streams log buffer
+#
+# Networks:
+#   control-internal  — API, Worker, PostgreSQL, Redis. Isolated from previews.
+#   preview-edge      — Traefik + preview containers. icc=false between containers.
+
+services:
+
+  # ── Traefik v3 ─────────────────────────────────────────────────────────────
+  traefik:
+    # v3.6+ negotiates the Docker API version; v3.2 hard-codes 1.24, which
+    # Docker Engine 29 (min API 1.40) rejects, so no routes are ever discovered.
+    image: traefik:v3.6
+    container_name: reapd-traefik
+    restart: unless-stopped
+    ports:
+      - "80:80"        # HTTP (redirects → HTTPS)
+      - "443:443"      # HTTPS wildcard *.preview.localhost
+      - "8080:8080"    # Traefik dashboard (dev only)
+    volumes:
+      - ./traefik/traefik.yml:/etc/traefik/traefik.yml:ro
+      - ./traefik/dynamic:/etc/traefik/dynamic:ro
+      - ./traefik/certs:/etc/traefik/certs:ro
+    networks:
+      - control-internal
+      - preview-edge
+    depends_on:
+      - socket-proxy
+
+  # ── Docker Socket Proxy ─────────────────────────────────────────────────────
+  # The worker never mounts /var/run/docker.sock directly.
+  # This proxy enforces read-only ACLs: containers, images, networks, build.
+  # PRIVILEGED, HOST, and EXEC are all disabled.
+  socket-proxy:
+    image: tecnativa/docker-socket-proxy:0.3.0
+    container_name: reapd-socket-proxy
+    restart: unless-stopped
+    environment:
+      # Allowed endpoints (1 = enabled)
+      CONTAINERS: 1
+      IMAGES: 1
+      NETWORKS: 1
+      BUILD: 1
+      # Blocked endpoints (0 = disabled)
+      PRIVILEGED: 0
+      HOST: 0
+      EXEC: 0
+      INFO: 1
+      PING: 1
+      VERSION: 1
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - control-internal
+
+  # ── PostgreSQL 17 ───────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:17-alpine
+    container_name: reapd-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: reapd
+      POSTGRES_PASSWORD: reapd_dev_password
+      POSTGRES_DB: reapd
+    ports:
+      - "5432:5432"    # Exposed for local psql / Drizzle Studio access
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - control-internal
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U reapd -d reapd"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  # ── Redis 7 ─────────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: reapd-redis
+    restart: unless-stopped
+    command: redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru --save ""
+    ports:
+      - "6379:6379"    # Exposed for local redis-cli / BullMQ access
+    networks:
+      - control-internal
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+# ── Volumes ──────────────────────────────────────────────────────────────────
+volumes:
+  postgres_data:
+    driver: local
+
+# ── Networks ─────────────────────────────────────────────────────────────────
+networks:
+  control-internal:
+    name: reapd-control-internal
+    driver: bridge
+    # NOTE: not `internal: true` locally, because published ports (postgres/redis)
+    # don't work on internal networks. Production sets internal: true (Phase 7).
+
+  preview-edge:
+    name: reapd-preview-edge
+    driver: bridge
+    # NOTE: enable_icc=false is deferred to Phase 7. With icc disabled on a shared
+    # bridge, Traefik (same bridge) also cannot reach preview containers, so the
+    # PRD's isolation design needs revisiting (e.g. per-PR networks that Traefik joins,
+    # or DOCKER-USER rules that allow only Traefik -> previews).
+

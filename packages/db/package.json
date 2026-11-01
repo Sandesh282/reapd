@@ -1,0 +1,23 @@
+{
+  "name": "@reapd/db",
+  "version": "0.0.1",
+  "private": true,
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "db:migrate": "node --import tsx src/migrations/run.ts"
+  },
+  "dependencies": {
+    "drizzle-orm": "^0.38.2",
+    "postgres": "^3.4.5",
+    "@reapd/types": "*"
+  },
+  "devDependencies": {
+    "drizzle-kit": "^0.30.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2",
+    "@types/node": "^22.10.1"
+  }
+}
+

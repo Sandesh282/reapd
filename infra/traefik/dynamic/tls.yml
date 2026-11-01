@@ -1,0 +1,9 @@
+# infra/traefik/dynamic/tls.yml
+# Dynamic TLS configuration — Traefik hot-reloads this file automatically.
+# Declares the wildcard *.preview.localhost certificate for all preview routers.
+
+tls:
+  certificates:
+    - certFile: /etc/traefik/certs/preview.localhost.pem
+      keyFile:  /etc/traefik/certs/preview.localhost-key.pem
+

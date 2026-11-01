@@ -1,0 +1,24 @@
+{
+  "name": "@reapd/worker",
+  "version": "0.0.1",
+  "private": true,
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint src"
+  },
+  "dependencies": {
+    "bullmq": "^5.34.4",
+    "ioredis": "^5.4.2",
+    "@reapd/types": "*",
+    "@reapd/db": "*",
+    "@reapd/docker-client": "*"
+  },
+  "devDependencies": {
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2",
+    "@types/node": "^22.10.1"
+  }
+}
+
