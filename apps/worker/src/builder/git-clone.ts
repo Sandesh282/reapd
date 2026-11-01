@@ -2,11 +2,11 @@
 // Ephemeral Git shallow clone at an exact commit SHA or ref.
 // Supports AbortSignal cancellation (for commit superseding) and deterministic cleanup.
 
-import { spawn } from 'node:child_process';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { AbortError } from '@reapd/docker-client';
+import { runProcess } from './run-process.js';
 
 export interface CloneRepoOptions {
   /** Repository URL or local git path */
@@ -47,31 +47,44 @@ export async function cloneRepoAtSha(opts: CloneRepoOptions): Promise<CloneResul
 
   try {
     const authenticatedUrl = injectTokenIfPresent(opts.repoUrl, opts.authToken);
+    const gitEnv = {
+      GIT_TERMINAL_PROMPT: '0',
+      // Suppress GPG signing so a global commit.gpgsign=true doesn't hang tests
+      GIT_CONFIG_COUNT: '1',
+      GIT_CONFIG_KEY_0: 'commit.gpgsign',
+      GIT_CONFIG_VALUE_0: 'false',
+    };
 
-    await runGit(['init', '--quiet'], workDir, opts.signal, opts.onLog);
-    await runGit(['remote', 'add', 'origin', authenticatedUrl], workDir, opts.signal, opts.onLog);
-    await runGit(
-      ['fetch', '--depth', '1', '--no-tags', 'origin', opts.commitSha],
-      workDir,
-      opts.signal,
-      opts.onLog
-    );
-    await runGit(['checkout', '--quiet', 'FETCH_HEAD'], workDir, opts.signal, opts.onLog);
+    const git = (args: string[]) =>
+      runProcess({ cmd: 'git', args, cwd: workDir, env: gitEnv, signal: opts.signal, onLog: opts.onLog });
+
+    await git(['init', '--quiet']);
+    await git(['remote', 'add', 'origin', authenticatedUrl]);
+    // '--' prevents a sha that starts with '-' from being parsed as a flag
+    await git(['fetch', '--depth', '1', '--no-tags', 'origin', '--', opts.commitSha]);
+    await git(['checkout', '--quiet', 'FETCH_HEAD']);
 
     let resolvedSha = '';
-    await runGit(['rev-parse', 'HEAD'], workDir, opts.signal, (stream, line) => {
-      if (stream === 'stdout' && line.trim().length === 40) {
-        resolvedSha = line.trim();
-      }
+    await runProcess({
+      cmd: 'git',
+      args: ['rev-parse', 'HEAD'],
+      cwd: workDir,
+      env: gitEnv,
+      signal: opts.signal,
+      onLog: (_stream, line) => {
+        if (line.trim().length === 40) resolvedSha = line.trim();
+      },
     });
 
-    return {
-      workDir,
-      resolvedSha: resolvedSha || opts.commitSha,
-      cleanup,
-    };
+    if (!resolvedSha) {
+      throw new Error(
+        `Could not resolve HEAD SHA after checkout (commitSha=${opts.commitSha})`
+      );
+    }
+
+    return { workDir, resolvedSha, cleanup };
   } catch (err) {
-    await cleanup();
+    await cleanup().catch(() => {/* best-effort: original error takes priority */});
     throw err;
   }
 }
@@ -90,68 +103,3 @@ function injectTokenIfPresent(repoUrl: string, token?: string): string {
   }
   return repoUrl;
 }
-
-function runGit(
-  args: string[],
-  cwd: string,
-  signal: AbortSignal,
-  onLog?: (stream: 'stdout' | 'stderr', line: string) => void
-): Promise<void> {
-  return new Promise((resolve, reject) => {
-    if (signal.aborted) {
-      return reject(new AbortError('Git command aborted'));
-    }
-
-    const child = spawn('git', args, {
-      cwd,
-      env: {
-        ...process.env,
-        GIT_TERMINAL_PROMPT: '0',
-      },
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
-
-    const onAbort = () => {
-      child.kill('SIGTERM');
-      reject(new AbortError('Git command aborted by signal'));
-    };
-    signal.addEventListener('abort', onAbort, { once: true });
-
-    let stderrBuf = '';
-
-    child.stdout.on('data', (chunk: Buffer) => {
-      for (const line of chunk.toString('utf8').split('\n')) {
-        const trimmed = line.trimEnd();
-        if (trimmed) onLog?.('stdout', trimmed);
-      }
-    });
-
-    child.stderr.on('data', (chunk: Buffer) => {
-      const text = chunk.toString('utf8');
-      stderrBuf += text;
-      for (const line of text.split('\n')) {
-        const trimmed = line.trimEnd();
-        if (trimmed) onLog?.('stderr', trimmed);
-      }
-    });
-
-    child.on('error', (err) => {
-      signal.removeEventListener('abort', onAbort);
-      reject(err);
-    });
-
-    child.on('close', (code) => {
-      signal.removeEventListener('abort', onAbort);
-      if (signal.aborted) {
-        return reject(new AbortError('Git command aborted'));
-      }
-      if (code !== 0) {
-        return reject(
-          new Error(`git ${args[0]} exited with code ${code}: ${stderrBuf.trim()}`)
-        );
-      }
-      resolve();
-    });
-  });
-}
-
