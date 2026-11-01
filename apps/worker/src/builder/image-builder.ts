@@ -96,7 +96,7 @@ export async function buildDockerImage(
       // BuildKit writes normal build progress to stderr with --progress=plain
       for (const line of text.split('\n')) {
         const trimmed = line.trimEnd();
-        if (trimmed) opts.onLog?.('stdout', trimmed);
+        if (trimmed) opts.onLog?.('stderr', trimmed);
       }
     });
 
