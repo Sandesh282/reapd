@@ -2,10 +2,10 @@
 // Builds a Docker image from a checked-out directory using BuildKit (`DOCKER_BUILDKIT=1`),
 // streaming stdout/stderr lines in real time and aborting immediately if superseded.
 
-import { spawn } from 'node:child_process';
 import { access } from 'node:fs/promises';
 import { join } from 'node:path';
 import { AbortError } from '@reapd/docker-client';
+import { runProcess } from './run-process.js';
 
 export interface BuildImageOptions {
   /** Absolute path to the cloned repository directory */
@@ -16,6 +16,12 @@ export interface BuildImageOptions {
   imageTag: string;
   /** Deployment ID applied as an image label for orphan reconciliation */
   deploymentId: string;
+  /**
+   * PR subdomain (e.g. 'pr-104') applied as `reapd.subdomain` label so the
+   * reconciler and `reapd down` can locate the image even after the container
+   * has been removed.
+   */
+  subdomain?: string;
   /** Cancellation signal */
   signal: AbortSignal;
   /** Callback invoked for every build log line */
@@ -29,7 +35,12 @@ export interface BuildImageResult {
 
 /**
  * Invokes `docker build` with BuildKit enabled (`--progress=plain`) against `contextDir`.
- * Rejects with `AbortError` if `signal` aborts mid-build and kills the subprocess.
+ * Rejects with `AbortError` if `signal` aborts mid-build (waits for the subprocess to
+ * exit cleanly before throwing so tmp directories are safe to remove).
+ *
+ * A hard 5-minute build timeout is layered on top of the caller-supplied signal via
+ * `AbortSignal.any`. Individual build steps that hang (e.g. `RUN sleep infinity`) will
+ * be killed after the deadline rather than blocking the worker indefinitely.
  */
 export async function buildDockerImage(
   opts: BuildImageOptions
@@ -52,6 +63,11 @@ export async function buildDockerImage(
     process.env['DOCKER_HOST'] ??
     `tcp://${process.env['DOCKER_PROXY_HOST'] ?? '127.0.0.1'}:${process.env['DOCKER_PROXY_PORT'] ?? '2375'}`;
 
+  // We shell out to the `docker` CLI rather than going through dockerode because
+  // dockerode has no native BuildKit support — it speaks the old Image Build API
+  // which doesn't support cache mounts, multi-stage progress, or the /grpc control
+  // plane that BuildKit requires. The `docker` CLI must therefore be present on the
+  // worker host (documented in infra/README.md and the Phase 7 worker Dockerfile).
   const args = [
     'build',
     '--progress=plain',
@@ -61,62 +77,24 @@ export async function buildDockerImage(
     'reapd.managed=true',
     '--label',
     `reapd.deployment_id=${opts.deploymentId}`,
+    ...(opts.subdomain ? ['--label', `reapd.subdomain=${opts.subdomain}`] : []),
     targetDir,
   ];
 
-  await new Promise<void>((resolve, reject) => {
-    const child = spawn('docker', args, {
-      cwd: targetDir,
-      env: {
-        ...process.env,
-        DOCKER_BUILDKIT: '1',
-        DOCKER_HOST: dockerHost,
-      },
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
+  // 5-minute hard cap: a stuck RUN step should never block the worker permanently
+  const buildTimeout = AbortSignal.timeout(5 * 60 * 1000);
+  const combined = AbortSignal.any([opts.signal, buildTimeout]);
 
-    const onAbort = () => {
-      child.kill('SIGTERM');
-      reject(new AbortError('BuildKit process aborted by signal'));
-    };
-    opts.signal.addEventListener('abort', onAbort, { once: true });
-
-    let stderrTail = '';
-
-    child.stdout.on('data', (chunk: Buffer) => {
-      for (const line of chunk.toString('utf8').split('\n')) {
-        const trimmed = line.trimEnd();
-        if (trimmed) opts.onLog?.('stdout', trimmed);
-      }
-    });
-
-    child.stderr.on('data', (chunk: Buffer) => {
-      const text = chunk.toString('utf8');
-      stderrTail = (stderrTail + text).slice(-2000);
-      // BuildKit writes normal build progress to stderr with --progress=plain
-      for (const line of text.split('\n')) {
-        const trimmed = line.trimEnd();
-        if (trimmed) opts.onLog?.('stderr', trimmed);
-      }
-    });
-
-    child.on('error', (err) => {
-      opts.signal.removeEventListener('abort', onAbort);
-      reject(err);
-    });
-
-    child.on('close', (code) => {
-      opts.signal.removeEventListener('abort', onAbort);
-      if (opts.signal.aborted) {
-        return reject(new AbortError('BuildKit process aborted'));
-      }
-      if (code !== 0) {
-        return reject(
-          new Error(`Docker build failed (exit ${code}): ${stderrTail.trim()}`)
-        );
-      }
-      resolve();
-    });
+  await runProcess({
+    cmd: 'docker',
+    args,
+    cwd: targetDir,
+    env: {
+      DOCKER_BUILDKIT: '1',
+      DOCKER_HOST: dockerHost,
+    },
+    signal: combined,
+    onLog: opts.onLog,
   });
 
   return {
@@ -124,4 +102,3 @@ export async function buildDockerImage(
     buildDurationMs: Date.now() - startedAt,
   };
 }
-
