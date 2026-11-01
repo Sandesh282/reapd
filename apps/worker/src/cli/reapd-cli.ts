@@ -13,6 +13,7 @@ import {
   forceRemoveContainer,
   removeImage,
   listManagedContainers,
+  listManagedImages,
   pollUntilHealthy,
 } from '@reapd/docker-client';
 import { cloneRepoAtSha } from '../builder/git-clone.js';
@@ -56,12 +57,18 @@ async function runUp(rawArgs: string[]): Promise<void> {
   }
 
   const appPort = Number(values.port ?? '3000');
+  if (!Number.isInteger(appPort) || appPort <= 0 || appPort > 65535) {
+    throw new Error(`Invalid --port value: ${values.port}`);
+  }
+
   const subdomain = `pr-${prNumber}`;
   const deploymentId = `cli-${subdomain}-${randomUUID().slice(0, 8)}`;
   const ac = new AbortController();
 
-  process.on('SIGINT', () => ac.abort());
-  process.on('SIGTERM', () => ac.abort());
+  // process.once: a second Ctrl-C while SIGTERM handling is in-flight
+  // should not register a second listener
+  process.once('SIGINT', () => ac.abort());
+  process.once('SIGTERM', () => ac.abort());
 
   console.log(`📥 Cloning ${values.repo} @ ${values.sha} ...`);
   const cloned = await cloneRepoAtSha({
@@ -77,24 +84,35 @@ async function runUp(rawArgs: string[]): Promise<void> {
 
   try {
     console.log(`🔨 Building image ${imageTag} (resolved SHA: ${cloned.resolvedSha}) ...`);
-    const buildOptions = {
+    const buildRes = await buildDockerImage({
       contextDir: cloned.workDir,
       imageTag,
       deploymentId,
+      subdomain,
       signal: ac.signal,
       onLog: (_stream: 'stdout' | 'stderr', line: string) =>
         console.log(`   [buildkit] ${line}`),
       ...(values.subpath ? { subpath: values.subpath } : {}),
-    };
-    const buildRes = await buildDockerImage(buildOptions);
+    });
     console.log(`✅ Built ${buildRes.imageTag} in ${buildRes.buildDurationMs}ms`);
   } finally {
-    await cloned.cleanup().catch(() => {/* best-effort: don't mask build/abort errors */});
+    await cloned.cleanup().catch((e: unknown) => {
+      console.warn('⚠️  Failed to clean up temp build dir (possible disk leak):', e instanceof Error ? e.message : e);
+    });
   }
 
   const docker = createDockerClient();
   // Remove any existing container for the same PR subdomain before starting the new one
   await forceRemoveContainer(docker, `reapd-${subdomain}`);
+
+  // Prune any old-SHA images for this PR (e.g. from previous `up` runs with different SHAs)
+  const oldImages = await listManagedImages(docker, { subdomain });
+  for (const img of oldImages) {
+    if (img.repoTag !== imageTag) {
+      console.log(`🗑️  Pruning stale image ${img.repoTag} from previous build ...`);
+      await removeImage(docker, img.repoTag);
+    }
+  }
 
   console.log(`🚀 Starting hardened container reapd-${subdomain} ...`);
   const container = await createPreviewContainer(docker, {
@@ -108,7 +126,14 @@ async function runUp(rawArgs: string[]): Promise<void> {
   const healthUrl = `${previewUrl}${values['health-path'] ?? '/health'}`;
 
   console.log(`⏳ Polling readiness at ${healthUrl} ...`);
-  await pollUntilHealthy(healthUrl, ac.signal, { maxWaitMs: 30_000 });
+  try {
+    await pollUntilHealthy(healthUrl, ac.signal, { maxWaitMs: 30_000 });
+  } catch (err) {
+    // Roll back the container so we don't leave a dangling, unreachable preview
+    console.error(`⚠️  Health-check failed — rolling back container ${container.name} ...`);
+    await forceRemoveContainer(docker, container.name).catch(() => {/* best-effort */});
+    throw err;
+  }
 
   console.log(
     `🟢 LIVE: ${previewUrl} (container=${container.id.slice(0, 12)}, image=${imageTag})`
@@ -127,21 +152,33 @@ async function runDown(rawArgs: string[]): Promise<void> {
     throw new Error('Missing required flag: --pr <number>');
   }
 
-  const subdomain = `pr-${values.pr}`;
+  const prNumber = Number(values.pr);
+  if (!Number.isInteger(prNumber) || prNumber <= 0) {
+    throw new Error(`Invalid --pr number: ${values.pr}`);
+  }
+
+  const subdomain = `pr-${prNumber}`;
   const containerName = `reapd-${subdomain}`;
   const docker = createDockerClient();
-
-  const managed = await listManagedContainers(docker);
-  const target = managed.find(
-    (c) => c.subdomain === subdomain || c.name === containerName
-  );
 
   console.log(`🧹 Removing container ${containerName} and anonymous volumes ...`);
   await forceRemoveContainer(docker, containerName);
 
-  if (target?.image) {
-    console.log(`🗑️  Pruning image ${target.image} ...`);
-    await removeImage(docker, target.image);
+  // Find image by label so we can prune even if the container was already gone
+  const images = await listManagedImages(docker, { subdomain });
+  for (const img of images) {
+    console.log(`🗑️  Pruning image ${img.repoTag} ...`);
+    await removeImage(docker, img.repoTag);
+  }
+
+  if (images.length === 0) {
+    // Fall back to listing containers in case image labels are missing (e.g. pre-label builds)
+    const managed = await listManagedContainers(docker);
+    const target = managed.find((c) => c.subdomain === subdomain);
+    if (target?.image) {
+      console.log(`🗑️  Pruning image ${target.image} (fallback) ...`);
+      await removeImage(docker, target.image);
+    }
   }
 
   console.log(`✅ Teardown complete for ${subdomain}`);
@@ -170,7 +207,7 @@ async function runLs(): Promise<void> {
 
 function printUsage(): void {
   console.log(`Usage:
-  reapd-cli up   --repo <url-or-path> --pr <number> [--sha <sha>] [--subpath <dir>] [--port <port>]
+  reapd-cli up   --repo <url-or-path> --pr <number> [--sha <sha>] [--subpath <dir>] [--port <port>] [--health-path <path>]
   reapd-cli down --pr <number>
   reapd-cli ls`);
 }
@@ -179,4 +216,3 @@ main().catch((err: unknown) => {
   console.error('❌ Error:', err instanceof Error ? err.message : String(err));
   process.exitCode = 1;
 });
-
