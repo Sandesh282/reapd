@@ -89,7 +89,7 @@ export const deployments = pgTable(
   },
   (table) => [
     index('idx_deployments_reconcile').on(table.status, table.expiresAt),
-    index('idx_deployments_pr_gen').on(table.pullRequestId, table.generation),
+    index('idx_deployments_pr_gen').on(table.pullRequestId, table.generation.desc()),
     index('idx_deployments_subdomain').on(table.subdomain, table.status),
   ]
 );

@@ -62,7 +62,7 @@ CREATE TABLE deployments (
   -- Snapshot of pull_requests.latest_generation at the time this deployment was created.
   -- Used in transitionDeploymentStatus to detect stale workers.
   generation        INTEGER           NOT NULL,
-  -- pr-<number>.preview.<domain> — no protocol, no trailing slash
+  -- Bare DNS label only, e.g. 'pr-104'. The host is built as '<subdomain>.preview.<domain>'.
   subdomain         VARCHAR(120)      NOT NULL,
   status            deployment_status NOT NULL DEFAULT 'QUEUED',
   -- Set once the container is created; null until STARTING state
