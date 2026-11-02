@@ -16,7 +16,8 @@
     "infra:up": "docker compose -f infra/docker-compose.yml up -d",
     "infra:down": "docker compose -f infra/docker-compose.yml down",
     "infra:logs": "docker compose -f infra/docker-compose.yml logs -f",
-    "certs:gen": "bash infra/scripts/gen-certs.sh"
+    "certs:gen": "bash infra/scripts/gen-certs.sh",
+    "reapd": "npm run cli --workspace @reapd/worker --"
   },
   "devDependencies": {
     "turbo": "^2.3.3",

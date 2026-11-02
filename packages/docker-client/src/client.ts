@@ -3,6 +3,9 @@
 // All container operations in reapd go through this client — never raw dockerode.
 
 import Dockerode from 'dockerode';
+import * as https from 'node:https';
+import * as http from 'node:http';
+import { lookup as dnsLookup } from 'node:dns';
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -144,16 +147,32 @@ export async function pollUntilHealthy(
   let delay = opts?.initialDelayMs ?? 250;
   const deadline = Date.now() + maxWait;
 
+  let lastError = 'no response';
+
   while (Date.now() < deadline) {
     if (signal.aborted) throw new AbortError('Health-check aborted: deployment superseded');
 
     try {
       // Bound each attempt to 2s so a half-open connection can't outlive the deadline
-      const attemptSignal = AbortSignal.any([signal, AbortSignal.timeout(2_000)]);
-      const res = await fetch(internalUrl, { signal: attemptSignal });
-      if (res.ok || res.status < 500) return; // container is responding
-    } catch {
+      const status = await probeHttpStatus(internalUrl, signal, 2_000);
+      // Note: Traefik returns 404 while its Docker provider is still discovering
+      // the newly started container (or 502 while the container port is booting).
+      if (status >= 200 && status < 500 && status !== 404) return;
+      lastError = `HTTP ${status}`;
+    } catch (err: unknown) {
       if (signal.aborted) throw new AbortError('Health-check aborted: deployment superseded');
+      // Surface TLS certificate chain errors immediately instead of silently retrying for 30s
+      const code = (err as { code?: string })?.code;
+      if (
+        code === 'UNABLE_TO_VERIFY_LEAF_SIGNATURE' ||
+        code === 'SELF_SIGNED_CERT_IN_CHAIN' ||
+        code === 'DEPTH_ZERO_SELF_SIGNED_CERT'
+      ) {
+        throw new Error(
+          `TLS verification failed for ${internalUrl} (${code}). Set NODE_EXTRA_CA_CERTS="$(mkcert -CAROOT)/rootCA.pem" for local mkcert TLS.`
+        );
+      }
+      lastError = code ?? (err instanceof Error ? err.message : String(err));
       // Connection refused / attempt timeout — container not ready yet
     }
 
@@ -161,7 +180,9 @@ export async function pollUntilHealthy(
     delay = Math.min(delay * 2, 4_000); // cap at 4s between retries
   }
 
-  throw new Error(`Health-check timed out after ${maxWait}ms: ${internalUrl}`);
+  throw new Error(
+    `Health-check timed out after ${maxWait}ms: ${internalUrl} (last error: ${lastError})`
+  );
 }
 
 /**
@@ -170,10 +191,10 @@ export async function pollUntilHealthy(
  */
 export async function forceRemoveContainer(
   docker: Dockerode,
-  containerId: string
+  containerIdOrName: string
 ): Promise<void> {
   try {
-    const container = docker.getContainer(containerId);
+    const container = docker.getContainer(containerIdOrName);
     await container.remove({ force: true, v: true });
   } catch (err: unknown) {
     // 404 means already removed — not an error
@@ -182,7 +203,143 @@ export async function forceRemoveContainer(
   }
 }
 
+/**
+ * Removes an image tag from the Docker host.
+ * Safe to call on a non-existent image (404 is ignored).
+ */
+export async function removeImage(
+  docker: Dockerode,
+  imageTag: string,
+  opts?: { force?: boolean }
+): Promise<void> {
+  try {
+    const img = docker.getImage(imageTag);
+    await img.remove({ force: opts?.force ?? true, noprune: false });
+  } catch (err: unknown) {
+    if (isDockerNotFoundError(err)) return;
+    throw err;
+  }
+}
+
+export interface ManagedContainerSummary {
+  id: string;
+  name: string;
+  subdomain: string;
+  deploymentId: string;
+  image: string;
+  state: string;
+  status: string;
+}
+
+/**
+ * Lists all preview containers managed by reapd (`reapd.managed=true`).
+ */
+export async function listManagedContainers(
+  docker: Dockerode
+): Promise<ManagedContainerSummary[]> {
+  const containers = await docker.listContainers({
+    all: true,
+    filters: { label: ['reapd.managed=true'] },
+  });
+
+  return containers.map((c) => {
+    const rawName = c.Names[0] ?? '';
+    return {
+      id: c.Id,
+      name: rawName.startsWith('/') ? rawName.slice(1) : rawName,
+      subdomain: c.Labels['reapd.subdomain'] ?? '',
+      deploymentId: c.Labels['reapd.deployment_id'] ?? '',
+      image: c.Image,
+      state: c.State,
+      status: c.Status,
+    };
+  });
+}
+
+export interface ManagedImageSummary {
+  id: string;
+  /** Full repository:tag string, e.g. 'reapd-pr-104:a1b2c3d' */
+  repoTag: string;
+  subdomain: string;
+  deploymentId: string;
+}
+
+/**
+ * Lists all preview images managed by reapd (`reapd.managed=true`), optionally
+ * filtered by subdomain. Used by `reapd down` to prune the image even when the
+ * container has already been removed.
+ */
+export async function listManagedImages(
+  docker: Dockerode,
+  filter?: { subdomain?: string }
+): Promise<ManagedImageSummary[]> {
+  const labelFilters = ['reapd.managed=true'];
+  if (filter?.subdomain) labelFilters.push(`reapd.subdomain=${filter.subdomain}`);
+
+  const images = await docker.listImages({
+    filters: { label: labelFilters },
+  });
+
+  return images.flatMap((img) => {
+    const repoTag = img.RepoTags?.[0] ?? img.Id.slice(0, 19);
+    return [{
+      id: img.Id,
+      repoTag,
+      subdomain: img.Labels?.['reapd.subdomain'] ?? '',
+      deploymentId: img.Labels?.['reapd.deployment_id'] ?? '',
+    }];
+  });
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+/**
+ * Performs an HTTP(S) GET probe with RFC 6761 `*.localhost` → `127.0.0.1` resolution
+ * (macOS `getaddrinfo` does not resolve `*.preview.localhost` in Node by default,
+ * whereas `curl` and browsers have built-in RFC 6761 special-use domain handling).
+ */
+function probeHttpStatus(
+  targetUrl: string,
+  signal: AbortSignal,
+  timeoutMs: number
+): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const parsed = new URL(targetUrl);
+    const isHttps = parsed.protocol === 'https:';
+    const requestFn = isHttps ? https.request : http.request;
+
+    const req = requestFn(
+      parsed,
+      {
+        method: 'GET',
+        timeout: timeoutMs,
+        signal,
+        lookup: (hostname, options, cb) => {
+          if (hostname === 'localhost' || hostname.endsWith('.localhost')) {
+            if (typeof options === 'object' && options !== null && options.all) {
+              cb(null, [{ address: '127.0.0.1', family: 4 }]);
+            } else {
+              cb(null, '127.0.0.1', 4);
+            }
+            return;
+          }
+          dnsLookup(hostname, options, cb);
+        },
+      },
+      (res) => {
+        res.resume(); // drain response body
+        resolve(res.statusCode ?? 0);
+      }
+    );
+
+    req.on('timeout', () => {
+      req.destroy(new Error('ETIMEDOUT'));
+    });
+
+    req.on('error', reject);
+    req.end();
+  });
+}
 
 function sleep(ms: number, signal?: AbortSignal): Promise<void> {
   return new Promise((resolve, reject) => {

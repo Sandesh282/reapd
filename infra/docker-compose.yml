@@ -53,6 +53,11 @@ services:
       IMAGES: 1
       NETWORKS: 1
       BUILD: 1
+      # EVENTS=1 is required by Traefik's watch=true Docker provider for instant
+      # container discovery; SESSION=1 & GRPC=1 are required by BuildKit.
+      EVENTS: 1
+      SESSION: 1
+      GRPC: 1
       # Blocked endpoints (0 = disabled)
       PRIVILEGED: 0
       HOST: 0
