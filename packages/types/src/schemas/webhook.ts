@@ -10,7 +10,7 @@ export const GitHubUserSchema = z.object({
 });
 
 export const GitHubRefSchema = z.object({
-  sha: z.string().length(40),
+  sha: z.string().regex(/^[0-9a-f]{40}$/i, 'Expected 40-char hex commit SHA'),
   ref: z.string().max(255),
   label: z.string().max(512).optional(),
 });

@@ -2,8 +2,8 @@
 // Builds a Docker image from a checked-out directory using BuildKit (`DOCKER_BUILDKIT=1`),
 // streaming stdout/stderr lines in real time and aborting immediately if superseded.
 
-import { access } from 'node:fs/promises';
-import { join } from 'node:path';
+import { access, realpath } from 'node:fs/promises';
+import { join, sep } from 'node:path';
 import { AbortError } from '@reapd/docker-client';
 import { runProcess } from './run-process.js';
 
@@ -49,13 +49,41 @@ export async function buildDockerImage(
     throw new AbortError('Image build aborted before start');
   }
 
-  const targetDir = opts.subpath ? join(opts.contextDir, opts.subpath) : opts.contextDir;
-  const dockerfilePath = join(targetDir, 'Dockerfile');
+  const resolvedContext = await realpath(opts.contextDir);
+  const candidateDir = opts.subpath
+    ? join(resolvedContext, opts.subpath)
+    : resolvedContext;
+  let targetDir = await realpath(candidateDir);
+
+  if (
+    targetDir !== resolvedContext &&
+    !targetDir.startsWith(`${resolvedContext}${sep}`)
+  ) {
+    throw new Error(
+      `Invalid subpath "${opts.subpath}": resolves outside repository context directory`
+    );
+  }
+
+  let dockerfilePath = join(targetDir, 'Dockerfile');
 
   try {
     await access(dockerfilePath);
   } catch {
-    throw new Error(`No Dockerfile found at ${dockerfilePath}`);
+    // Dogfooding fallback: if no explicit subpath was given and the repo has
+    // a `sample-app/Dockerfile` (like Sandesh282/reapd itself), build that.
+    if (!opts.subpath) {
+      const sampleDir = join(resolvedContext, 'sample-app');
+      const sampleDockerfile = join(sampleDir, 'Dockerfile');
+      try {
+        await access(sampleDockerfile);
+        targetDir = await realpath(sampleDir);
+        dockerfilePath = sampleDockerfile;
+      } catch {
+        throw new Error(`No Dockerfile found at ${dockerfilePath}`);
+      }
+    } else {
+      throw new Error(`No Dockerfile found at ${dockerfilePath}`);
+    }
   }
 
   const startedAt = Date.now();

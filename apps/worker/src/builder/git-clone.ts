@@ -39,6 +39,10 @@ export async function cloneRepoAtSha(opts: CloneRepoOptions): Promise<CloneResul
     throw new AbortError('Git clone aborted before start');
   }
 
+  if (!opts.commitSha || opts.commitSha.startsWith('-') || /[\s\0]/.test(opts.commitSha)) {
+    throw new Error(`Invalid commitSha or ref: ${JSON.stringify(opts.commitSha)}`);
+  }
+
   const workDir = await mkdtemp(join(tmpdir(), `reapd-build-${opts.deploymentId}-`));
 
   const cleanup = async (): Promise<void> => {
@@ -46,20 +50,13 @@ export async function cloneRepoAtSha(opts: CloneRepoOptions): Promise<CloneResul
   };
 
   try {
-    const authenticatedUrl = injectTokenIfPresent(opts.repoUrl, opts.authToken);
-    const gitEnv = {
-      GIT_TERMINAL_PROMPT: '0',
-      // Suppress GPG signing so a global commit.gpgsign=true doesn't hang tests
-      GIT_CONFIG_COUNT: '1',
-      GIT_CONFIG_KEY_0: 'commit.gpgsign',
-      GIT_CONFIG_VALUE_0: 'false',
-    };
+    const gitEnv = buildGitEnv(opts.authToken);
 
     const git = (args: string[]) =>
       runProcess({ cmd: 'git', args, cwd: workDir, env: gitEnv, signal: opts.signal, onLog: opts.onLog });
 
     await git(['init', '--quiet']);
-    await git(['remote', 'add', 'origin', authenticatedUrl]);
+    await git(['remote', 'add', 'origin', opts.repoUrl]);
     // '--' prevents a sha that starts with '-' from being parsed as a flag
     await git(['fetch', '--depth', '1', '--no-tags', 'origin', '--', opts.commitSha]);
     await git(['checkout', '--quiet', 'FETCH_HEAD']);
@@ -89,17 +86,26 @@ export async function cloneRepoAtSha(opts: CloneRepoOptions): Promise<CloneResul
   }
 }
 
-function injectTokenIfPresent(repoUrl: string, token?: string): string {
-  if (!token) return repoUrl;
-  try {
-    const parsed = new URL(repoUrl);
-    if (parsed.protocol === 'https:') {
-      parsed.username = 'x-access-token';
-      parsed.password = token;
-      return parsed.toString();
-    }
-  } catch {
-    // Local file path or SCP-style git URL — leave untouched
+/**
+ * Builds the environment variables for `git` subprocesses.
+ * If an installation authToken is provided, passes it via `GIT_CONFIG_*` env vars
+ * rather than embedding it in the remote URL so it never appears in process args (`ps`)
+ * or persists on disk in `.git/config` (fixes #3).
+ */
+function buildGitEnv(token?: string): Record<string, string> {
+  const env: Record<string, string> = {
+    GIT_TERMINAL_PROMPT: '0',
+    // Suppress GPG signing so a global commit.gpgsign=true doesn't hang tests
+    GIT_CONFIG_COUNT: token ? '2' : '1',
+    GIT_CONFIG_KEY_0: 'commit.gpgsign',
+    GIT_CONFIG_VALUE_0: 'false',
+  };
+
+  if (token) {
+    const basicAuth = Buffer.from(`x-access-token:${token}`).toString('base64');
+    env['GIT_CONFIG_KEY_1'] = 'http.extraHeader';
+    env['GIT_CONFIG_VALUE_1'] = `Authorization: Basic ${basicAuth}`;
   }
-  return repoUrl;
+
+  return env;
 }

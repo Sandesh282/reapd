@@ -41,12 +41,20 @@ test('shallow-clones an exact commit SHA and cleans up temporary directory', asy
       repoUrl: originDir,
       commitSha: sha1,
       deploymentId: 'unit-test-1',
+      authToken: 'ghs_secret_test_token_12345',
       signal: ac.signal,
     });
     workDir = res.workDir;
 
     // Assert correct SHA was checked out
     assert.equal(res.resolvedSha, sha1);
+
+    // Assert authToken is never persisted to .git/config on disk (issue #3)
+    const gitConfig = await readFile(join(res.workDir, '.git', 'config'), 'utf8');
+    assert.ok(
+      !gitConfig.includes('ghs_secret_test_token_12345'),
+      'authToken must not be written to .git/config'
+    );
 
     // Assert we got v1 content, not HEAD (v2)
     const content = await readFile(join(res.workDir, 'version.txt'), 'utf8');
