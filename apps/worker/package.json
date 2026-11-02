@@ -6,7 +6,7 @@
   "scripts": {
     "cli": "node --import tsx src/cli/reapd-cli.ts",
     "dev": "tsx watch src/index.ts",
-    "build": "tsc", // TODO(phase-7): noEmit=true in tsconfig; add a real outDir before the production deploy
+    "build": "tsc",
     "test": "node --import tsx --test 'src/**/*.test.ts'",
     "typecheck": "tsc --noEmit",
     "lint": "eslint src"
