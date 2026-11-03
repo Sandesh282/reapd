@@ -6,6 +6,7 @@ import { mkdtemp, writeFile, readFile, rm, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { cloneRepoAtSha, buildGitEnv } from './git-clone.js';
+import { parseGenerationFromTag } from '../jobs/build.js';
 
 // Shared git env for test repos: suppress GPG signing and prompts
 const testGitEnv = ['config', '--local'];
@@ -108,4 +109,10 @@ test('throws AbortError if signal is already aborted before clone starts', async
       return true;
     }
   );
+});
+
+test('parseGenerationFromTag extracts generation number from image tags', () => {
+  assert.equal(parseGenerationFromTag('reapd-pr-104:g1-a1b2c3d'), 1);
+  assert.equal(parseGenerationFromTag('reapd-pr-104:g42-deadbeef'), 42);
+  assert.equal(parseGenerationFromTag('reapd-pr-104:a1b2c3d'), null);
 });

@@ -3,6 +3,7 @@
 // When imported as a library, exports builder/job modules without side effects.
 // When executed directly (`tsx src/index.ts`), starts the BullMQ worker + reconciler.
 
+import { realpathSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Worker } from 'bullmq';
@@ -15,9 +16,17 @@ export * from './builder/image-builder.js';
 export * from './jobs/build.js';
 export * from './reconciler/index.js';
 
-const isMainModule =
-  process.argv[1] !== undefined &&
-  resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+function checkIsMainModule(): boolean {
+  const entryArg = process.argv[1];
+  if (!entryArg) return false;
+  try {
+    return realpathSync(entryArg) === realpathSync(fileURLToPath(import.meta.url));
+  } catch {
+    return resolve(entryArg) === fileURLToPath(import.meta.url);
+  }
+}
+
+const isMainModule = checkIsMainModule();
 
 if (isMainModule) {
   try {

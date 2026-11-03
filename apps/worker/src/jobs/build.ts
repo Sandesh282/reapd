@@ -37,6 +37,15 @@ export interface BuildJobPayload {
 const REDIS_URL = process.env['REDIS_URL'] ?? 'redis://localhost:6379';
 const docker = createDockerClient();
 
+/**
+ * Extracts the generation number from an image tag like `reapd-pr-104:g2-a1b2c3d`.
+ * Returns `null` if the tag does not carry a generation prefix.
+ */
+export function parseGenerationFromTag(repoTag: string): number | null {
+  const match = /:g(\d+)-[0-9a-f]+$/i.exec(repoTag);
+  return match?.[1] ? Number(match[1]) : null;
+}
+
 export async function buildJobHandler(job: Job<BuildJobPayload>): Promise<void> {
   const { deploymentId } = job.data;
   const ac = new AbortController();
@@ -142,11 +151,13 @@ export async function buildJobHandler(job: Job<BuildJobPayload>): Promise<void> 
       throw new AbortError('Deployment superseded after STARTING transition');
     }
 
-    // Replace any previous container on the same PR subdomain and prune older images
+    // Replace any previous container on the same PR subdomain and prune only OLDER
+    // generation images (never delete a newer generation's image if running concurrently)
     const oldImages = await listManagedImages(docker, { subdomain });
     await forceRemoveContainer(docker, containerName);
     for (const img of oldImages) {
-      if (img.repoTag !== imageTag) {
+      const imgGen = parseGenerationFromTag(img.repoTag);
+      if (imgGen !== null && imgGen < generation) {
         await removeImage(docker, img.repoTag).catch(() => {});
       }
     }
