@@ -40,33 +40,41 @@ const docker = createDockerClient();
 export async function buildJobHandler(job: Job<BuildJobPayload>): Promise<void> {
   const { deploymentId } = job.data;
   const ac = new AbortController();
-
-  // ── Subscribe to cancel channel BEFORE reading state or starting work ──────
-  // Prevents the race where a superseding webhook publishes `cancel:deploy:<id>`
-  // between our initial DB check and the subscription becoming active.
   const sub = new Redis(REDIS_URL);
-  await sub.subscribe(`cancel:deploy:${deploymentId}`);
-  sub.on('message', () => {
-    console.log(`🛑 Cancel signal received for deployment ${deploymentId}`);
-    ac.abort();
-  });
 
   try {
+    // ── Subscribe to cancel channel BEFORE reading state or starting work ────
+    // Attach listener prior to `subscribe` so a message arriving in the same
+    // socket read as the subscribe confirmation is never missed.
+    sub.on('message', () => {
+      console.log(`🛑 Cancel signal received for deployment ${deploymentId}`);
+      ac.abort();
+    });
+    await sub.subscribe(`cancel:deploy:${deploymentId}`);
+
     const deployment = await getDeploymentWithRepo(db, deploymentId);
     if (!deployment) {
       throw new UnrecoverableError(`Deployment not found: ${deploymentId}`);
     }
 
-    const { subdomain, commitSha, owner, name, installationId } = deployment;
+    const { subdomain, commitSha, generation, owner, name, installationId } = deployment;
     const shortSha = commitSha.slice(0, 7);
-    const imageTag = `reapd-${subdomain}:${shortSha}`;
+    // Include generation in the image tag so two generations building the same SHA
+    // never delete each other's image tag during cleanup.
+    const imageTag = `reapd-${subdomain}:g${generation}-${shortSha}`;
     const containerName = `reapd-${subdomain}`;
+
+    const envOverride =
+      process.env['NODE_ENV'] !== 'production'
+        ? process.env['REAPD_REPO_URL_OVERRIDE']
+        : undefined;
     const repoUrl =
-      job.data.repoUrl ??
-      process.env['REAPD_REPO_URL_OVERRIDE'] ??
-      `https://github.com/${owner}/${name}.git`;
+      job.data.repoUrl ?? envOverride ?? `https://github.com/${owner}/${name}.git`;
 
     // ── Phase 1: QUEUED → BUILDING ───────────────────────────────────────────
+    // Note: if a worker process crashes mid-build and BullMQ re-runs a stalled job,
+    // `BUILDING → BUILDING` is rejected by `assertValidTransition` and the deployment
+    // transitions cleanly to `FAILED` (Phase 4 reconciler cleans up any leftovers).
     const buildTrans = await transitionDeploymentStatus(db, {
       deploymentId,
       toStatus: 'BUILDING',
@@ -76,11 +84,11 @@ export async function buildJobHandler(job: Job<BuildJobPayload>): Promise<void> 
       return;
     }
 
-    const authToken = repoUrl.startsWith('https://')
-      ? await getInstallationToken(installationId, ac.signal).catch((err: unknown) => {
-          const msg = err instanceof Error ? err.message : String(err);
-          console.warn(`⚠️  Proceeding without installation token: ${msg}`);
-          return undefined;
+    const authToken = repoUrl.startsWith('https://github.com/')
+      ? await getInstallationToken({
+          installationId,
+          repoName: name,
+          signal: ac.signal,
         })
       : undefined;
 
@@ -113,6 +121,11 @@ export async function buildJobHandler(job: Job<BuildJobPayload>): Promise<void> 
     }
 
     // ── Phase 2: BUILDING → STARTING ─────────────────────────────────────────
+    if (ac.signal.aborted) {
+      await removeImage(docker, imageTag).catch(() => {});
+      throw new AbortError('Deployment superseded before container start');
+    }
+
     const startTrans = await transitionDeploymentStatus(db, {
       deploymentId,
       toStatus: 'STARTING',
@@ -122,6 +135,11 @@ export async function buildJobHandler(job: Job<BuildJobPayload>): Promise<void> 
     if (!startTrans.transitioned) {
       await removeImage(docker, imageTag).catch(() => {});
       return;
+    }
+
+    if (ac.signal.aborted) {
+      await removeImage(docker, imageTag).catch(() => {});
+      throw new AbortError('Deployment superseded after STARTING transition');
     }
 
     // Replace any previous container on the same PR subdomain and prune older images
@@ -143,7 +161,9 @@ export async function buildJobHandler(job: Job<BuildJobPayload>): Promise<void> 
     try {
       await pollUntilHealthy(healthUrl, ac.signal, { maxWaitMs: 30_000 });
     } catch (err) {
-      await forceRemoveContainer(docker, container.name).catch(() => {});
+      // Remove by unique `container.id` (never `container.name`) so an aborting
+      // worker can never destroy a newer generation's container on the same PR.
+      await forceRemoveContainer(docker, container.id).catch(() => {});
       throw err;
     }
 
@@ -154,7 +174,7 @@ export async function buildJobHandler(job: Job<BuildJobPayload>): Promise<void> 
       containerId: container.id,
     });
     if (!testTrans.transitioned) {
-      await forceRemoveContainer(docker, container.name).catch(() => {});
+      await forceRemoveContainer(docker, container.id).catch(() => {});
       return;
     }
 
@@ -164,19 +184,20 @@ export async function buildJobHandler(job: Job<BuildJobPayload>): Promise<void> 
       toStatus: 'LIVE',
     });
     if (!liveTrans.transitioned) {
-      await forceRemoveContainer(docker, container.name).catch(() => {});
+      await forceRemoveContainer(docker, container.id).catch(() => {});
       return;
     }
 
     console.log(`🟢 LIVE: https://${subdomain}.preview.localhost (deployment ${deploymentId})`);
   } catch (err) {
     if (err instanceof AbortError || (err instanceof Error && err.name === 'AbortError')) {
-      // Transition to SUPERSEDED if the webhook hasn't already marked it terminal
       await transitionDeploymentStatus(db, {
         deploymentId,
         toStatus: 'SUPERSEDED',
         reason: 'Aborted via cancel signal',
-      }).catch(() => {});
+      }).catch((dbErr: unknown) => {
+        console.warn(`⚠️  Failed to record SUPERSEDED status for ${deploymentId}:`, dbErr);
+      });
       return;
     }
 
@@ -189,7 +210,9 @@ export async function buildJobHandler(job: Job<BuildJobPayload>): Promise<void> 
       deploymentId,
       toStatus: 'FAILED',
       reason,
-    }).catch(() => {});
+    }).catch((dbErr: unknown) => {
+      console.warn(`⚠️  Failed to record FAILED status for ${deploymentId}:`, dbErr);
+    });
 
     throw err;
   } finally {

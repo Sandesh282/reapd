@@ -6,7 +6,7 @@
 const RECONCILE_INTERVAL_MS = 60_000;
 
 export function startReconciler(): () => void {
-  console.log('♻️  Reconciler loop started (60s interval — Phase 4 implements sweep logic)');
+  console.log('♻️  Reconciler timer registered (60s scaffold — sweep logic lands in Phase 4)');
   const timer = setInterval(() => {
     // Phase 4 will query idx_deployments_reconcile and prune expired/orphaned resources
   }, RECONCILE_INTERVAL_MS);
@@ -14,4 +14,3 @@ export function startReconciler(): () => void {
   timer.unref();
   return () => clearInterval(timer);
 }
-
