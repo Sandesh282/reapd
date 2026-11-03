@@ -21,12 +21,46 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  e2e_phase_gates:
-    name: Phase 2, 3 & 4 E2E Smoke Gates (Traefik + BuildKit + Postgres + Redis)
+  verify_smoke_coverage:
+    name: Verify all smoke scripts are included in CI
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 50
+
+      - name: Check that every infra/scripts/*-smoke.sh file is registered in this workflow
+        run: |
+          for script in infra/scripts/*-smoke.sh; do
+            base=$(basename "$script")
+            if ! grep -q "$base" .github/workflows/full_stack_smoke_tests.yml; then
+              echo "❌ Smoke script $script is not included in .github/workflows/full_stack_smoke_tests.yml matrix"
+              exit 1
+            fi
+          done
+
+  e2e_smoke_gate:
+    name: E2E Smoke (${{ matrix.gate.label }})
+    needs: [verify_smoke_coverage]
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        gate:
+          - label: 'Phase 1 — Hardened Container & Traefik TLS'
+            script: './infra/scripts/cli-smoke.sh'
+          - label: 'Phase 2 — CLI Git Clone & BuildKit Lifecycle'
+            script: './infra/scripts/phase2-smoke.sh'
+          - label: 'Phase 3 — Webhook HMAC, Idempotency & Worker'
+            script: './infra/scripts/phase3-smoke.sh'
+          - label: 'Phase 4 — Rapid Superseding & Desired-State Reconciler'
+            script: './infra/scripts/phase4-smoke.sh'
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 50
 
       - name: Set up Node & dependencies
         uses: ./.github/actions/setup-node-and-deps
@@ -50,12 +84,17 @@ jobs:
           docker compose -f infra/docker-compose.yml up -d --wait
           docker exec -i reapd-postgres psql -U reapd -d reapd < packages/db/src/migrations/0001_initial_schema.sql
 
-      - name: Run Phase 2 CLI Lifecycle Gate
-        run: ./infra/scripts/phase2-smoke.sh
+      - name: Run ${{ matrix.gate.script }}
+        run: ${{ matrix.gate.script }}
 
-      - name: Run Phase 3 Webhook-to-LIVE Gate
-        run: ./infra/scripts/phase3-smoke.sh
-
-      - name: Run Phase 4 Superseding & Desired-State Reconciler Gate
-        run: ./infra/scripts/phase4-smoke.sh
-
+  check_all_smoke_tests_pass:
+    name: Check that all necessary tests pass
+    needs: [verify_smoke_coverage, e2e_smoke_gate]
+    if: always()
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Verify all E2E smoke shards succeeded
+        if: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}
+        run: exit 1
+      - name: All E2E smoke gates passed
+        run: echo "✅ All full-stack smoke gates passed"

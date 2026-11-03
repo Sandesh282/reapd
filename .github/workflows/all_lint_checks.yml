@@ -21,22 +21,29 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  shell_and_config_lint:
-    name: Shellcheck & Workspace Config Validation
+  shellcheck_lint:
+    name: ShellCheck (infra/scripts/*.sh)
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 50
 
-      - name: Run ShellCheck on verification gate scripts
+      - name: Run ShellCheck on all verification gate scripts
         run: shellcheck infra/scripts/*.sh
 
-      - name: Validate docker-compose configuration syntax
-        run: docker compose -f infra/docker-compose.yml config >/dev/null
+  architecture_boundaries:
+    name: 4-Layer Architecture & Import Boundaries
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 50
 
-      - name: Verify 4-layer architecture dependency boundaries
+      - name: Verify Domain Layer (@reapd/types) has zero I/O dependencies
         run: |
-          # Domain layer (@reapd/types) must have zero internal or I/O dependencies
           node -e '
             const fs = require("node:fs");
             const pkg = JSON.parse(fs.readFileSync("packages/types/package.json", "utf8"));
@@ -47,9 +54,105 @@ jobs:
               process.exit(1);
             }
           '
-          # Route layer (apps/api) must never import raw sql from drizzle-orm directly
-          if grep -rn "from 'drizzle-orm'" apps/api/src/; then
-            echo "❌ Route layer (apps/api) must not import drizzle-orm directly (use @reapd/db repositories)"
+
+      - name: Verify Route Layer (apps/api) never imports drizzle-orm or dockerode directly
+        run: |
+          if grep -rnE "from '(drizzle-orm|dockerode)'" apps/api/src/; then
+            echo "❌ Route layer (apps/api) must delegate to @reapd/db and never import drizzle-orm or dockerode directly"
             exit 1
           fi
 
+  bad_patterns_and_ts_suppressions:
+    name: Bad Patterns & TS Suppression Check
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 50
+
+      - name: Disallow @ts-ignore, @ts-nocheck, and .only( in TypeScript files
+        run: |
+          if grep -rnE "@ts-ignore|@ts-nocheck|\.only\(" apps/ packages/; then
+            echo "❌ Disallowed @ts-ignore, @ts-nocheck, or test .only() found"
+            exit 1
+          fi
+
+      - name: Verify no committed secrets or private keys
+        run: |
+          if git ls-files | grep -E "\.pem$|\.env$"; then
+            echo "❌ Tracked .pem or .env file detected in git index"
+            exit 1
+          fi
+
+  lockfile_and_engines:
+    name: Package Lockfile & Node Engine Consistency
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 50
+
+      - name: Check package-lock.json updated when package.json changes
+        if: ${{ github.event_name == 'pull_request' }}
+        run: |
+          git fetch origin main --depth=50
+          CHANGED=$(git diff --name-only origin/main...HEAD)
+          if echo "$CHANGED" | grep -qE '(^|/)package\.json$' && ! echo "$CHANGED" | grep -q '^package-lock\.json$'; then
+            # Verify npm ci --ignore-scripts still succeeds with existing lockfile
+            npm ci --ignore-scripts
+          fi
+
+      - name: Verify backend workspaces require Node >=22
+        run: |
+          node -e '
+            const fs = require("node:fs");
+            for (const p of ["apps/api/package.json", "apps/worker/package.json", "packages/db/package.json"]) {
+              const pkg = JSON.parse(fs.readFileSync(p, "utf8"));
+              if (!pkg.engines || pkg.engines.node !== ">=22") {
+                console.error(p + " must specify engines.node = \">=22\"");
+                process.exit(1);
+              }
+            }
+          '
+
+  infra_and_workflow_config:
+    name: Docker Socket-Proxy Hardening & Workflow Naming Check
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 50
+
+      - name: Validate docker-compose.yml syntax & socket-proxy ACLs
+        run: |
+          docker compose -f infra/docker-compose.yml config >/dev/null
+          grep -q "PRIVILEGED: 0" infra/docker-compose.yml
+          grep -q "HOST: 0" infra/docker-compose.yml
+          grep -q "EXEC: 0" infra/docker-compose.yml
+
+      - name: Verify all Drizzle schema tables match 0001_initial_schema.sql
+        run: |
+          for tbl in repositories pull_requests deployments deployment_events test_runs webhook_deliveries; do
+            grep -q "CREATE TABLE $tbl" packages/db/src/migrations/0001_initial_schema.sql
+            grep -q "'$tbl'" packages/db/src/schema.ts
+          done
+
+  check_all_lint_checks_pass:
+    name: Check that all lint checks pass
+    needs:
+      - shellcheck_lint
+      - architecture_boundaries
+      - bad_patterns_and_ts_suppressions
+      - lockfile_and_engines
+      - infra_and_workflow_config
+    if: always()
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Verify all lint jobs succeeded
+        if: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}
+        run: exit 1
+      - name: All lint checks passed
+        run: echo "✅ All lint checks passed"

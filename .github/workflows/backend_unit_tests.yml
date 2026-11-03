@@ -21,8 +21,62 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  unit_and_db_tests:
-    name: Worker, Docker-Client & PostgreSQL 17 Integration Tests
+  verify_associated_test_files:
+    name: Verify associated test files
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 50
+
+      - name: Check required unit & integration test suites exist
+        run: |
+          REQUIRED_TESTS=(
+            "packages/docker-client/src/log-demux.test.ts"
+            "packages/db/src/repositories/deployments.test.ts"
+            "apps/worker/src/builder/git-clone.test.ts"
+            "apps/worker/src/reconciler/reconciler.test.ts"
+          )
+          for f in "${REQUIRED_TESTS[@]}"; do
+            if [[ ! -f "$f" ]]; then
+              echo "❌ Missing required test suite: $f"
+              exit 1
+            fi
+          done
+
+  docker_client_unit_tests:
+    name: Unit tests (@reapd/docker-client)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 50
+
+      - name: Set up Node & dependencies
+        uses: ./.github/actions/setup-node-and-deps
+
+      - name: Run @reapd/docker-client unit tests
+        run: npm run test --workspace @reapd/docker-client
+
+  worker_unit_tests:
+    name: Unit tests (@reapd/worker)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 50
+
+      - name: Set up Node & dependencies
+        uses: ./.github/actions/setup-node-and-deps
+
+      - name: Run @reapd/worker unit tests
+        run: npm run test --workspace @reapd/worker
+
+  postgres_db_integration_tests:
+    name: PostgreSQL 17 integration tests (@reapd/db)
     runs-on: ubuntu-24.04
     services:
       postgres:
@@ -46,6 +100,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 50
 
       - name: Set up Node & dependencies
         uses: ./.github/actions/setup-node-and-deps
@@ -53,12 +109,21 @@ jobs:
       - name: Apply PostgreSQL 17 schema migration
         run: PGPASSWORD=reapd_dev_password psql -h localhost -U reapd -d reapd -f packages/db/src/migrations/0001_initial_schema.sql
 
-      - name: Run @reapd/docker-client unit tests (8-byte stream demuxer)
-        run: npm run test --workspace @reapd/docker-client
-
-      - name: Run @reapd/worker unit tests (git clone, build timeouts, reconciler)
-        run: npm run test --workspace @reapd/worker
-
-      - name: Run @reapd/db integration tests (state machine, lock hierarchy, reconciler queries)
+      - name: Run @reapd/db integration tests
         run: npm run test --workspace @reapd/db
 
+  check_all_backend_tests_pass:
+    name: Check that all backend unit tests pass
+    needs:
+      - verify_associated_test_files
+      - docker_client_unit_tests
+      - worker_unit_tests
+      - postgres_db_integration_tests
+    if: always()
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Verify all backend test jobs succeeded
+        if: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}
+        run: exit 1
+      - name: All backend unit tests passed
+        run: echo "✅ All backend unit & DB integration tests passed"
