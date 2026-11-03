@@ -6,7 +6,9 @@
 //   1. Expire Due Environments — mark `LIVE` rows where `expires_at <= NOW()` as `EXPIRED`
 //   2. Fence Stuck Builds      — mark `QUEUED`/`BUILDING`/`STARTING`/`TESTING` rows
 //                                with `updated_at` older than 20 minutes as `FAILED`
-//   3. Diff Actual vs. Desired — query Docker for all `reapd.managed=true` containers & images
+//   3. Diff Actual vs. Desired — snapshot Docker `reapd.managed=true` containers & images
+//                                BEFORE querying Postgres so a concurrent worker transitioning
+//                                `BUILDING -> STARTING` is guaranteed to appear in the DB read
 //   4. Purge Orphans           — remove any container not in `STARTING`/`TESTING`/`LIVE`,
 //                                prune any image not in an active build or `LIVE` state,
 //                                and sweep stale `/tmp/reapd-build-*` directories
@@ -33,12 +35,14 @@ import {
 const DEFAULT_RECONCILE_INTERVAL_MS = 60_000;
 const DEFAULT_STUCK_BUILD_MINUTES = 20;
 const DEFAULT_TMP_DIR_MAX_AGE_MS = 30 * 60 * 1000; // 30 minutes
+const SWEEP_TIMEOUT_MS = 30_000;
 
 export interface ReconcileSweepOptions {
   dbClient?: DrizzleClient;
   dockerClient?: Dockerode;
   stuckBuildMinutes?: number;
   tmpDirMaxAgeMs?: number;
+  tmpRootDir?: string;
 }
 
 export interface ReconcileSweepResult {
@@ -58,8 +62,22 @@ export async function runReconcileSweep(
 ): Promise<ReconcileSweepResult> {
   const dbClient = opts?.dbClient ?? db;
   const dockerClient = opts?.dockerClient ?? createDockerClient();
-  const stuckBuildMinutes = opts?.stuckBuildMinutes ?? DEFAULT_STUCK_BUILD_MINUTES;
-  const tmpDirMaxAgeMs = opts?.tmpDirMaxAgeMs ?? DEFAULT_TMP_DIR_MAX_AGE_MS;
+
+  const envStuckMin = Number(process.env['REAPD_STUCK_BUILD_MINUTES']);
+  const stuckBuildMinutes =
+    opts?.stuckBuildMinutes ??
+    (Number.isFinite(envStuckMin) && envStuckMin > 0
+      ? envStuckMin
+      : DEFAULT_STUCK_BUILD_MINUTES);
+
+  const envTmpAge = Number(process.env['REAPD_TMP_DIR_MAX_AGE_MS']);
+  const tmpDirMaxAgeMs =
+    opts?.tmpDirMaxAgeMs ??
+    (Number.isFinite(envTmpAge) && envTmpAge >= 0
+      ? envTmpAge
+      : DEFAULT_TMP_DIR_MAX_AGE_MS);
+
+  const tmpRootDir = opts?.tmpRootDir ?? tmpdir();
 
   // ── 1. Expire LIVE deployments past their TTL ─────────────────────────────
   const expiredDeploymentIds = await expireDueDeployments(dbClient);
@@ -73,15 +91,27 @@ export async function runReconcileSweep(
     console.log(`♻️  [reconciler] Fenced stuck build ${id} -> FAILED`);
   }
 
-  // ── 3. Fetch active deployment IDs from PostgreSQL ────────────────────────
+  // ── 3. Snapshot Docker resources FIRST, then read desired state from Postgres ─
+  // Reading Docker before Postgres prevents a TOCTOU race where a worker transitions
+  // BUILDING -> STARTING and creates a container in the millisecond after the DB read,
+  // which would otherwise look like an untracked orphan in the Docker list.
+  const [managedContainers, managedImages] = await Promise.all([
+    listManagedContainers(dockerClient),
+    listManagedImages(dockerClient),
+  ]);
+
   const { activeBuildOrLiveIds, activeContainerIds } =
     await getActiveDeploymentIds(dbClient);
 
   // ── 4a. Purge orphan containers (not in STARTING, TESTING, or LIVE) ───────
-  const managedContainers = await listManagedContainers(dockerClient);
   const removedContainerIds: string[] = [];
 
   for (const container of managedContainers) {
+    // Manual CLI previews (`reapd up`) carry `cli-pr-<n>-<uuid>` and are managed by `reapd down`
+    if (container.deploymentId.startsWith('cli-')) {
+      continue;
+    }
+
     const isDesired =
       container.deploymentId !== '' &&
       activeContainerIds.has(container.deploymentId);
@@ -90,19 +120,26 @@ export async function runReconcileSweep(
       console.log(
         `♻️  [reconciler] Removing orphan container ${container.name} (${container.id.slice(0, 12)}, deployment=${container.deploymentId || 'unknown'})`
       );
-      await forceRemoveContainer(dockerClient, container.id).catch((err: unknown) => {
+      try {
+        await forceRemoveContainer(dockerClient, container.id);
+        removedContainerIds.push(container.id);
+      } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : String(err);
-        console.warn(`⚠️  [reconciler] Failed to remove container ${container.id.slice(0, 12)}: ${msg}`);
-      });
-      removedContainerIds.push(container.id);
+        console.warn(
+          `⚠️  [reconciler] Failed to remove container ${container.id.slice(0, 12)}: ${msg}`
+        );
+      }
     }
   }
 
   // ── 4b. Purge orphan images (not in QUEUED/BUILDING/STARTING/TESTING/LIVE) ─
-  const managedImages = await listManagedImages(dockerClient);
   const removedImageTags: string[] = [];
 
   for (const img of managedImages) {
+    if (img.deploymentId.startsWith('cli-')) {
+      continue;
+    }
+
     const isDesired =
       img.deploymentId !== '' &&
       activeBuildOrLiveIds.has(img.deploymentId);
@@ -111,16 +148,18 @@ export async function runReconcileSweep(
       console.log(
         `♻️  [reconciler] Pruning orphan image ${img.repoTag} (deployment=${img.deploymentId || 'unknown'})`
       );
-      await removeImage(dockerClient, img.repoTag).catch((err: unknown) => {
+      try {
+        await removeImage(dockerClient, img.repoTag);
+        removedImageTags.push(img.repoTag);
+      } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : String(err);
         console.warn(`⚠️  [reconciler] Failed to prune image ${img.repoTag}: ${msg}`);
-      });
-      removedImageTags.push(img.repoTag);
+      }
     }
   }
 
   // ── 4c. Sweep stale `/tmp/reapd-build-*` directories from crashed workers ─
-  const removedTmpDirs = await sweepStaleTempBuildDirs(tmpDirMaxAgeMs);
+  const removedTmpDirs = await sweepStaleTempBuildDirs(tmpDirMaxAgeMs, tmpRootDir);
 
   return {
     expiredDeploymentIds,
@@ -131,9 +170,11 @@ export async function runReconcileSweep(
   };
 }
 
-async function sweepStaleTempBuildDirs(maxAgeMs: number): Promise<string[]> {
+export async function sweepStaleTempBuildDirs(
+  maxAgeMs: number,
+  rootTmp = tmpdir()
+): Promise<string[]> {
   const removed: string[] = [];
-  const rootTmp = tmpdir();
   const cutoffMs = Date.now() - maxAgeMs;
 
   try {
@@ -162,7 +203,8 @@ async function sweepStaleTempBuildDirs(maxAgeMs: number): Promise<string[]> {
 
 /**
  * Starts the periodic background reconciler loop.
- * Uses an `isRunning` guard so overlapping sweeps cannot interleave if Docker is slow.
+ * Uses an `isRunning` guard and a 30s timeout so overlapping sweeps cannot interleave
+ * or wedge the timer permanently if Docker or Postgres stalls.
  */
 export function startReconciler(opts?: { intervalMs?: number }): () => void {
   const envInterval = Number(process.env['REAPD_RECONCILE_INTERVAL_MS']);
@@ -178,12 +220,23 @@ export function startReconciler(opts?: { intervalMs?: number }): () => void {
   const tick = async (): Promise<void> => {
     if (stopped || isRunning) return;
     isRunning = true;
+    let timerId: ReturnType<typeof setTimeout> | undefined;
     try {
-      await runReconcileSweep();
+      await Promise.race([
+        runReconcileSweep(),
+        new Promise<never>((_resolve, reject) => {
+          timerId = setTimeout(
+            () => reject(new Error(`Reconcile sweep timed out after ${SWEEP_TIMEOUT_MS}ms`)),
+            SWEEP_TIMEOUT_MS
+          );
+          timerId.unref();
+        }),
+      ]);
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       console.error(`❌ [reconciler] Sweep failed: ${msg}`);
     } finally {
+      if (timerId) clearTimeout(timerId);
       isRunning = false;
     }
   };
