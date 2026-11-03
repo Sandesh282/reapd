@@ -1,6 +1,7 @@
 // packages/db/src/repositories/deployments.ts
 // Atomic deployment state transitions with audit trail.
-// All writes go through this function — never raw UPDATE elsewhere.
+// Worker lifecycle transitions go through `transitionDeploymentStatus`
+// (webhook ingestion performs its batch supersede inside `ingestPullRequestWebhook`).
 
 import { sql } from 'drizzle-orm';
 import {
@@ -50,17 +51,18 @@ export async function transitionDeploymentStatus(
   input: TransitionInput
 ): Promise<TransitionResult> {
   return db.transaction(async (tx) => {
-    // ── Step 1: Row-lock deployment and read parent generation ───────────────
+    // ── Step 1: Row-lock deployment + parent PR and read generation ─────────
     const rows = await tx.execute<{
       status: DeploymentStatus;
       generation: number;
+      pull_request_id: string;
       latest_generation: number;
     }>(sql`
-      SELECT d.status, d.generation, pr.latest_generation
+      SELECT d.status, d.generation, d.pull_request_id, pr.latest_generation
       FROM   deployments   d
       JOIN   pull_requests pr ON pr.id = d.pull_request_id
       WHERE  d.id = ${input.deploymentId}
-      FOR UPDATE OF d
+      FOR UPDATE OF d, pr
     `);
 
     const row = rows[0];
@@ -114,6 +116,31 @@ export async function transitionDeploymentStatus(
         ${effectiveReason}
       )
     `);
+
+    // ── Step 6: Expire any prior LIVE deployment on the same PR ──────────────
+    if (effectiveTarget === 'LIVE') {
+      const priorLive = await tx.execute<{ id: string }>(sql`
+        UPDATE deployments
+        SET status     = 'EXPIRED',
+            updated_at = NOW()
+        WHERE pull_request_id = ${row.pull_request_id}
+          AND id <> ${input.deploymentId}
+          AND status = 'LIVE'
+        RETURNING id
+      `);
+
+      for (const old of priorLive) {
+        await tx.execute(sql`
+          INSERT INTO deployment_events (deployment_id, from_status, to_status, reason)
+          VALUES (
+            ${old.id},
+            'LIVE'::deployment_status,
+            'EXPIRED'::deployment_status,
+            ${'Replaced by generation ' + row.generation}
+          )
+        `);
+      }
+    }
 
     return {
       transitioned: effectiveTarget === input.toStatus,

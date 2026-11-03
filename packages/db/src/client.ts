@@ -13,6 +13,10 @@ try {
   // .env is optional when variables are injected via the environment
 }
 
+if (process.env['NODE_ENV'] === 'production' && !process.env['DATABASE_URL']) {
+  throw new Error('DATABASE_URL must be set when NODE_ENV=production');
+}
+
 const sql = postgres(
   process.env['DATABASE_URL'] ?? 'postgres://reapd:reapd_dev_password@localhost:5432/reapd'
 );

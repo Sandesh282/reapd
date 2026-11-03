@@ -138,8 +138,8 @@ export async function findRepositoryByGithubId(
   if (!row) return null;
   return {
     id: row.id,
-    defaultTtlSec: row.default_ttl_sec,
-    installationId: row.installation_id,
+    defaultTtlSec: Number(row.default_ttl_sec),
+    installationId: Number(row.installation_id),
   };
 }
 
@@ -155,16 +155,25 @@ export async function upsertRepository(
     name: string;
     installationId: number;
   }
-): Promise<{ id: string }> {
-  const rows = await db.execute<{ id: string }>(sql`
+): Promise<{ id: string; defaultTtlSec: number; installationId: number }> {
+  const rows = await db.execute<{
+    id: string;
+    default_ttl_sec: number;
+    installation_id: number;
+  }>(sql`
     INSERT INTO repositories (github_repo_id, owner, name, installation_id)
     VALUES (${repo.githubRepoId}, ${repo.owner}, ${repo.name}, ${repo.installationId})
     ON CONFLICT (github_repo_id) DO UPDATE
       SET installation_id = EXCLUDED.installation_id,
           owner           = EXCLUDED.owner,
           name            = EXCLUDED.name
-    RETURNING id
+    RETURNING id, default_ttl_sec, installation_id
   `);
-  return rows[0]!;
+  const row = rows[0]!;
+  return {
+    id: row.id,
+    defaultTtlSec: Number(row.default_ttl_sec),
+    installationId: Number(row.installation_id),
+  };
 }
 
