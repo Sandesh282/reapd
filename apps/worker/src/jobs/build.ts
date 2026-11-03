@@ -153,8 +153,12 @@ export async function buildJobHandler(job: Job<BuildJobPayload>): Promise<void> 
 
     // Replace any previous container on the same PR subdomain and prune only OLDER
     // generation images (never delete a newer generation's image if running concurrently)
+    // Check abort signal here: if a Gen N+1 worker has already created a new container
+    // under `containerName`, skipping the remove prevents Gen N from killing it.
     const oldImages = await listManagedImages(docker, { subdomain });
-    await forceRemoveContainer(docker, containerName);
+    if (!ac.signal.aborted) {
+      await forceRemoveContainer(docker, containerName);
+    }
     for (const img of oldImages) {
       const imgGen = parseGenerationFromTag(img.repoTag);
       if (imgGen !== null && imgGen < generation) {
