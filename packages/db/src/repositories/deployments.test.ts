@@ -10,7 +10,12 @@ import assert from 'node:assert/strict';
 import { randomInt, randomUUID } from 'node:crypto';
 import { sql } from 'drizzle-orm';
 import { db, closeDb } from '../client.js';
-import { transitionDeploymentStatus } from './deployments.js';
+import {
+  expireDueDeployments,
+  fenceStuckDeployments,
+  getActiveDeploymentIds,
+  transitionDeploymentStatus,
+} from './deployments.js';
 import { ingestPullRequestWebhook, upsertRepository } from './webhook.js';
 
 const TEST_PR_NUMBER = 401;
@@ -174,6 +179,88 @@ test('transitionDeploymentStatus: stale generation, terminal early-exit, LIVE re
       activeDeployId = nextIngest.newDeploymentId!;
       await transitionDeploymentStatus(db, { deploymentId: activeDeployId, toStatus: 'BUILDING' });
     }
+
+    // ── 6. Reconciler DB queries: fenceStuckDeployments, expireDueDeployments, getActiveDeploymentIds
+    // Backdate `activeDeployId` (currently BUILDING) by 25 minutes and verify fenceStuckDeployments marks it FAILED
+    await db.execute(sql`
+      UPDATE deployments
+      SET updated_at = NOW() - INTERVAL '25 minutes'
+      WHERE id = ${activeDeployId}
+    `);
+    const fenced = await fenceStuckDeployments(db, 20);
+    assert.ok(fenced.includes(activeDeployId), 'stuck BUILDING row should be fenced to FAILED');
+
+    // Ingest a new deployment, walk it to LIVE with an already-elapsed TTL, and verify expireDueDeployments
+    const dTtl = randomUUID();
+    deliveries.push(dTtl);
+    const ttlIngest = await ingestPullRequestWebhook(db, {
+      deliveryId: dTtl,
+      eventType: 'pull_request',
+      action: 'synchronize',
+      prNumber: TEST_PR_NUMBER,
+      prTitle: 'DB test PR',
+      commitSha: SHA_2,
+      branchName: 'test/db',
+      authorLogin: 'Sandesh282',
+      repoId: repo.id,
+      installationId: 77701,
+      ttlSeconds: -10, // already expired
+    });
+    const ttlDeployId = ttlIngest.newDeploymentId!;
+    await transitionDeploymentStatus(db, { deploymentId: ttlDeployId, toStatus: 'BUILDING' });
+    await transitionDeploymentStatus(db, { deploymentId: ttlDeployId, toStatus: 'STARTING' });
+    await transitionDeploymentStatus(db, { deploymentId: ttlDeployId, toStatus: 'TESTING' });
+    await transitionDeploymentStatus(db, { deploymentId: ttlDeployId, toStatus: 'LIVE' });
+
+    const activeBeforeExpire = await getActiveDeploymentIds(db);
+    assert.ok(activeBeforeExpire.activeContainerIds.has(ttlDeployId));
+
+    const expiredDue = await expireDueDeployments(db);
+    assert.ok(expiredDue.includes(ttlDeployId), 'TTL-elapsed LIVE row should be expired');
+
+    const activeAfterExpire = await getActiveDeploymentIds(db);
+    assert.ok(!activeAfterExpire.activeContainerIds.has(ttlDeployId));
+
+    // ── 7. PR closed webhook: expires LIVE deployment and marks is_open = false
+    const dReopen = randomUUID();
+    deliveries.push(dReopen);
+    const reopenIngest = await ingestPullRequestWebhook(db, {
+      deliveryId: dReopen,
+      eventType: 'pull_request',
+      action: 'reopened',
+      prNumber: TEST_PR_NUMBER,
+      prTitle: 'DB test PR',
+      commitSha: SHA_3,
+      branchName: 'test/db',
+      authorLogin: 'Sandesh282',
+      repoId: repo.id,
+      installationId: 77701,
+      ttlSeconds: 3600,
+    });
+    const reopenDeployId = reopenIngest.newDeploymentId!;
+    await transitionDeploymentStatus(db, { deploymentId: reopenDeployId, toStatus: 'BUILDING' });
+    await transitionDeploymentStatus(db, { deploymentId: reopenDeployId, toStatus: 'STARTING' });
+    await transitionDeploymentStatus(db, { deploymentId: reopenDeployId, toStatus: 'TESTING' });
+    await transitionDeploymentStatus(db, { deploymentId: reopenDeployId, toStatus: 'LIVE' });
+
+    const dClose = randomUUID();
+    deliveries.push(dClose);
+    const closeRes = await ingestPullRequestWebhook(db, {
+      deliveryId: dClose,
+      eventType: 'pull_request',
+      action: 'closed',
+      prNumber: TEST_PR_NUMBER,
+      prTitle: 'DB test PR',
+      commitSha: SHA_3,
+      branchName: 'test/db',
+      authorLogin: 'Sandesh282',
+      repoId: repo.id,
+      installationId: 77701,
+      ttlSeconds: 3600,
+    });
+    assert.equal(closeRes.duplicate, false);
+    assert.equal(closeRes.newDeploymentId, undefined);
+    assert.deepEqual(closeRes.expiredIds, [reopenDeployId]);
   } finally {
     for (const deliv of deliveries) {
       await db.execute(sql`DELETE FROM webhook_deliveries WHERE delivery_id = ${deliv}`).catch(() => {});

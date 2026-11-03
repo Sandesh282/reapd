@@ -233,4 +233,110 @@ export async function getDeploymentWithRepo(
   };
 }
 
+/**
+ * Marks all `LIVE` deployments whose `expires_at <= NOW()` as `EXPIRED`
+ * and records an immutable `deployment_events` entry for each.
+ * Uses `idx_deployments_reconcile (status, expires_at)`.
+ */
+export async function expireDueDeployments(
+  db: DrizzleClient
+): Promise<string[]> {
+  return db.transaction(async (tx) => {
+    const expired = await tx.execute<{ id: string }>(sql`
+      UPDATE deployments
+      SET status     = 'EXPIRED',
+          updated_at = NOW()
+      WHERE status = 'LIVE'
+        AND expires_at <= NOW()
+      RETURNING id
+    `);
+
+    for (const row of expired) {
+      await tx.execute(sql`
+        INSERT INTO deployment_events (deployment_id, from_status, to_status, reason)
+        VALUES (
+          ${row.id},
+          'LIVE'::deployment_status,
+          'EXPIRED'::deployment_status,
+          'TTL expired (reconciler sweep)'
+        )
+      `);
+    }
+
+    return expired.map((r) => r.id);
+  });
+}
+
+/**
+ * Fences any deployment stuck in `QUEUED`, `BUILDING`, `STARTING`, or `TESTING`
+ * whose `updated_at` is older than `maxAgeMinutes` (default: 20 minutes per PRD §6.1)
+ * by transitioning it to `FAILED`.
+ */
+export async function fenceStuckDeployments(
+  db: DrizzleClient,
+  maxAgeMinutes = 20
+): Promise<string[]> {
+  return db.transaction(async (tx) => {
+    const reason = `Build timed out or worker crashed (exceeded ${maxAgeMinutes}m reconciler fence)`;
+    const stuck = await tx.execute<{ id: string; status: DeploymentStatus }>(sql`
+      UPDATE deployments
+      SET status         = 'FAILED',
+          failure_reason = ${reason},
+          updated_at     = NOW()
+      WHERE status IN ('QUEUED', 'BUILDING', 'STARTING', 'TESTING')
+        AND updated_at <= NOW() - (${maxAgeMinutes} * INTERVAL '1 minute')
+      RETURNING id, status
+    `);
+
+    for (const row of stuck) {
+      await tx.execute(sql`
+        INSERT INTO deployment_events (deployment_id, from_status, to_status, reason)
+        VALUES (
+          ${row.id},
+          ${row.status}::deployment_status,
+          'FAILED'::deployment_status,
+          ${reason}
+        )
+      `);
+    }
+
+    return stuck.map((r) => r.id);
+  });
+}
+
+/**
+ * Returns the set of deployment IDs that are legitimately allowed to own a
+ * Docker container or image right now (`QUEUED`, `BUILDING`, `STARTING`, `TESTING`, or `LIVE`).
+ * Any managed container or image whose `reapd.deployment_id` is NOT in this set is an orphan.
+ */
+export async function getActiveDeploymentIds(
+  db: DrizzleClient
+): Promise<{
+  activeBuildOrLiveIds: Set<string>;
+  activeContainerIds: Set<string>;
+}> {
+  const rows = await db.execute<{ id: string; status: DeploymentStatus }>(sql`
+    SELECT id, status
+    FROM deployments
+    WHERE status IN ('QUEUED', 'BUILDING', 'STARTING', 'TESTING', 'LIVE')
+  `);
+
+  const activeBuildOrLiveIds = new Set<string>();
+  const activeContainerIds = new Set<string>();
+
+  for (const row of rows) {
+    activeBuildOrLiveIds.add(row.id);
+    if (
+      row.status === 'STARTING' ||
+      row.status === 'TESTING' ||
+      row.status === 'LIVE'
+    ) {
+      activeContainerIds.add(row.id);
+    }
+  }
+
+  return { activeBuildOrLiveIds, activeContainerIds };
+}
+
+
 
