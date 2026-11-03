@@ -12,12 +12,15 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 TMP_REPO="$(mktemp -d /tmp/reapd-phase3-repo-XXXXXX)"
+API_LOG="$(mktemp /tmp/reapd-phase3-api-XXXXXX.log)"
+WORKER_LOG="$(mktemp /tmp/reapd-phase3-worker-XXXXXX.log)"
 API_PORT=3031
 TEST_SECRET="phase3-smoke-webhook-secret"
+TEST_QUEUE="build-smoke-$$"
 TEST_REPO_ID=999301
 TEST_PR_NUMBER=301
-DELIVERY_INSTALL="$(uuidgen | tr '[:upper:]' '[:lower:]')"
-DELIVERY_PR="$(uuidgen | tr '[:upper:]' '[:lower:]')"
+DELIVERY_INSTALL="$(node -e 'console.log(crypto.randomUUID())')"
+DELIVERY_PR="$(node -e 'console.log(crypto.randomUUID())')"
 API_PID=""
 WORKER_PID=""
 
@@ -30,8 +33,9 @@ cleanup() {
     kill "$WORKER_PID" 2>/dev/null || true
     wait "$WORKER_PID" 2>/dev/null || true
   fi
-  rm -rf "$TMP_REPO"
+  rm -rf "$TMP_REPO" "$API_LOG" "$WORKER_LOG"
   (cd "$ROOT" && npm run reapd -- down --pr "$TEST_PR_NUMBER" >/dev/null 2>&1) || true
+  docker exec -i reapd-redis sh -c "redis-cli --scan --pattern 'bull:$TEST_QUEUE*' | xargs -r redis-cli del" >/dev/null 2>&1 || true
   docker exec -i reapd-postgres psql -U reapd -d reapd -q <<SQL >/dev/null 2>&1 || true
 DELETE FROM webhook_deliveries WHERE delivery_id IN ('$DELIVERY_INSTALL', '$DELIVERY_PR');
 DELETE FROM repositories WHERE github_repo_id = $TEST_REPO_ID;
@@ -62,12 +66,13 @@ git -C "$TMP_REPO" commit -q -m "phase3 smoke fixture"
 TARGET_SHA="$(git -C "$TMP_REPO" rev-parse HEAD)"
 
 cd "$ROOT"
-export NODE_EXTRA_CA_CERTS="$(mkcert -CAROOT)/rootCA.pem"
+MKCERT_CAROOT="$(mkcert -CAROOT)"
+export NODE_EXTRA_CA_CERTS="$MKCERT_CAROOT/rootCA.pem"
 
 # ── 2. Start API server ──────────────────────────────────────────────────────
 echo "🚀 Starting API server on :$API_PORT..."
-PORT="$API_PORT" GITHUB_WEBHOOK_SECRET="$TEST_SECRET" \
-  npx --workspace @reapd/api tsx src/index.ts >/tmp/reapd-phase3-api.log 2>&1 &
+PORT="$API_PORT" GITHUB_WEBHOOK_SECRET="$TEST_SECRET" REAPD_BUILD_QUEUE="$TEST_QUEUE" \
+  node --import tsx "$ROOT/apps/api/src/index.ts" >"$API_LOG" 2>&1 &
 API_PID=$!
 
 for _ in {1..30}; do
@@ -79,7 +84,7 @@ done
 
 if ! curl -fsS "http://127.0.0.1:$API_PORT/health" >/dev/null 2>&1; then
   echo "❌ FAIL: API server did not become healthy"
-  cat /tmp/reapd-phase3-api.log
+  cat "$API_LOG"
   exit 1
 fi
 
@@ -190,12 +195,12 @@ fi
 
 # ── 7. Start BullMQ worker and wait for LIVE ─────────────────────────────────
 echo "👷 Starting BullMQ worker to process the queued build..."
-REAPD_REPO_URL_OVERRIDE="$TMP_REPO" \
-  npx --workspace @reapd/worker tsx src/index.ts >/tmp/reapd-phase3-worker.log 2>&1 &
+REAPD_REPO_URL_OVERRIDE="$TMP_REPO" REAPD_BUILD_QUEUE="$TEST_QUEUE" \
+  node --import tsx "$ROOT/apps/worker/src/index.ts" >"$WORKER_LOG" 2>&1 &
 WORKER_PID=$!
 
 STATUS=""
-for _ in {1..90}; do
+for _ in {1..120}; do
   STATUS="$(docker exec -i reapd-postgres psql -U reapd -d reapd -tAq -c \
     "SELECT status FROM deployments WHERE subdomain = 'pr-$TEST_PR_NUMBER' LIMIT 1;")"
   if [[ "$STATUS" == "LIVE" || "$STATUS" == "FAILED" || "$STATUS" == "SUPERSEDED" ]]; then
@@ -206,7 +211,10 @@ done
 
 if [[ "$STATUS" != "LIVE" ]]; then
   echo "❌ FAIL: expected deployment to reach LIVE, got '$STATUS'"
-  cat /tmp/reapd-phase3-worker.log
+  echo "--- API LOG ---"
+  cat "$API_LOG"
+  echo "--- WORKER LOG ---"
+  cat "$WORKER_LOG"
   exit 1
 fi
 
