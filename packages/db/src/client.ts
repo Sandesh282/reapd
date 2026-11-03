@@ -23,6 +23,11 @@ const sql = postgres(
 
 export const db = drizzle(sql, { schema });
 
+/** Closes the underlying postgres-js connection pool (used by tests and graceful shutdown) */
+export async function closeDb(): Promise<void> {
+  await sql.end({ timeout: 2 });
+}
+
 /** Drizzle client type — use this for dependency injection in repository functions */
 export type DrizzleClient = typeof db;
 

@@ -51,18 +51,33 @@ export async function transitionDeploymentStatus(
   input: TransitionInput
 ): Promise<TransitionResult> {
   return db.transaction(async (tx) => {
-    // ── Step 1: Row-lock deployment + parent PR and read generation ─────────
+    // ── Step 1: Lock parent PR first, then deployment (matches webhook lock order)
+    // Locking `pull_requests` before `deployments` in both `ingestPullRequestWebhook`
+    // and `transitionDeploymentStatus` prevents 40P01 deadlocks under concurrent load.
+    const prRows = await tx.execute<{
+      id: string;
+      latest_generation: number;
+    }>(sql`
+      SELECT pr.id, pr.latest_generation
+      FROM   pull_requests pr
+      WHERE  pr.id = (
+        SELECT d.pull_request_id FROM deployments d WHERE d.id = ${input.deploymentId}
+      )
+      FOR UPDATE
+    `);
+
+    const prRow = prRows[0];
+    if (!prRow) throw new DeploymentNotFoundError(input.deploymentId);
+
     const rows = await tx.execute<{
       status: DeploymentStatus;
       generation: number;
       pull_request_id: string;
-      latest_generation: number;
     }>(sql`
-      SELECT d.status, d.generation, d.pull_request_id, pr.latest_generation
-      FROM   deployments   d
-      JOIN   pull_requests pr ON pr.id = d.pull_request_id
+      SELECT d.status, d.generation, d.pull_request_id
+      FROM   deployments d
       WHERE  d.id = ${input.deploymentId}
-      FOR UPDATE OF d, pr
+      FOR UPDATE
     `);
 
     const row = rows[0];
@@ -76,13 +91,13 @@ export async function transitionDeploymentStatus(
 
     // ── Step 2: Stale-generation check ──────────────────────────────────────
     const isStale =
-      row.generation < row.latest_generation &&
+      row.generation < prRow.latest_generation &&
       input.toStatus !== 'SUPERSEDED' &&
       input.toStatus !== 'EXPIRED';
 
     const effectiveTarget: DeploymentStatus = isStale ? 'SUPERSEDED' : input.toStatus;
     const effectiveReason = isStale
-      ? `Preempted by generation ${row.latest_generation}`
+      ? `Preempted by generation ${prRow.latest_generation}`
       : (input.reason ?? null);
 
     // ── Step 3: Domain-layer guard ───────────────────────────────────────────
@@ -119,12 +134,13 @@ export async function transitionDeploymentStatus(
 
     // ── Step 6: Expire any prior LIVE deployment on the same PR ──────────────
     if (effectiveTarget === 'LIVE') {
+      const replaceReason = `Replaced by generation ${row.generation}`;
       const priorLive = await tx.execute<{ id: string }>(sql`
         UPDATE deployments
         SET status     = 'EXPIRED',
             updated_at = NOW()
         WHERE pull_request_id = ${row.pull_request_id}
-          AND id <> ${input.deploymentId}
+          AND generation < ${row.generation}
           AND status = 'LIVE'
         RETURNING id
       `);
@@ -136,7 +152,7 @@ export async function transitionDeploymentStatus(
             ${old.id},
             'LIVE'::deployment_status,
             'EXPIRED'::deployment_status,
-            ${'Replaced by generation ' + row.generation}
+            ${replaceReason}
           )
         `);
       }
