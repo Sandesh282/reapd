@@ -55,7 +55,8 @@ git -C "$TMP_REPO" commit -am "v2: serve reapd-v2" --quiet
 
 echo "▶️  Running reapd-cli up for PR #2 @ ${TARGET_SHA:0:7}"
 cd "$ROOT"
-export NODE_EXTRA_CA_CERTS="$(mkcert -CAROOT)/rootCA.pem"
+MKCERT_CAROOT="$(mkcert -CAROOT)"
+export NODE_EXTRA_CA_CERTS="$MKCERT_CAROOT/rootCA.pem"
 npm run reapd -- up --repo "$TMP_REPO" --sha "$TARGET_SHA" --pr 2
 
 echo "🔎 Verifying https://pr-2.preview.localhost/ returns 'reapd-v1'"
