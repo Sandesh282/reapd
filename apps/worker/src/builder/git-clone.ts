@@ -56,7 +56,7 @@ export async function cloneRepoAtSha(opts: CloneRepoOptions): Promise<CloneResul
       runProcess({ cmd: 'git', args, cwd: workDir, env: gitEnv, signal: opts.signal, onLog: opts.onLog });
 
     await git(['init', '--quiet']);
-    await git(['remote', 'add', 'origin', opts.repoUrl]);
+    await git(['remote', 'add', 'origin', '--', opts.repoUrl]);
     // '--' prevents a sha that starts with '-' from being parsed as a flag
     await git(['fetch', '--depth', '1', '--no-tags', 'origin', '--', opts.commitSha]);
     await git(['checkout', '--quiet', 'FETCH_HEAD']);
@@ -89,10 +89,11 @@ export async function cloneRepoAtSha(opts: CloneRepoOptions): Promise<CloneResul
 /**
  * Builds the environment variables for `git` subprocesses.
  * If an installation authToken is provided, passes it via `GIT_CONFIG_*` env vars
- * rather than embedding it in the remote URL so it never appears in process args (`ps`)
- * or persists on disk in `.git/config` (fixes #3).
+ * scoped specifically to `https://github.com/` rather than embedding it in the remote URL
+ * so it never appears in process args (`ps`), never persists on disk in `.git/config`,
+ * and is never sent to non-GitHub redirect targets (fixes #3).
  */
-function buildGitEnv(token?: string): Record<string, string> {
+export function buildGitEnv(token?: string): Record<string, string> {
   const env: Record<string, string> = {
     GIT_TERMINAL_PROMPT: '0',
     // Suppress GPG signing so a global commit.gpgsign=true doesn't hang tests
@@ -103,7 +104,7 @@ function buildGitEnv(token?: string): Record<string, string> {
 
   if (token) {
     const basicAuth = Buffer.from(`x-access-token:${token}`).toString('base64');
-    env['GIT_CONFIG_KEY_1'] = 'http.extraHeader';
+    env['GIT_CONFIG_KEY_1'] = 'http.https://github.com/.extraHeader';
     env['GIT_CONFIG_VALUE_1'] = `Authorization: Basic ${basicAuth}`;
   }
 

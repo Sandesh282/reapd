@@ -53,7 +53,15 @@ export async function buildDockerImage(
   const candidateDir = opts.subpath
     ? join(resolvedContext, opts.subpath)
     : resolvedContext;
-  let targetDir = await realpath(candidateDir);
+
+  let targetDir: string;
+  try {
+    targetDir = await realpath(candidateDir);
+  } catch {
+    throw new Error(
+      `Invalid subpath "${opts.subpath}": target directory does not exist`
+    );
+  }
 
   if (
     targetDir !== resolvedContext &&
@@ -69,9 +77,9 @@ export async function buildDockerImage(
   try {
     await access(dockerfilePath);
   } catch {
-    // Dogfooding fallback: if no explicit subpath was given and the repo has
-    // a `sample-app/Dockerfile` (like Sandesh282/reapd itself), build that.
-    if (!opts.subpath) {
+    // Dogfooding fallback (non-production): when testing against Sandesh282/reapd
+    // itself without an explicit subpath, build `sample-app/Dockerfile`.
+    if (!opts.subpath && process.env['NODE_ENV'] !== 'production') {
       const sampleDir = join(resolvedContext, 'sample-app');
       const sampleDockerfile = join(sampleDir, 'Dockerfile');
       try {
