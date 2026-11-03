@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
 # Phase 4 verification gate (PRD v2.2 §8):
 # 1. Creates a temporary Git fixture repo with 3 distinct commits (Gen 1, Gen 2, Gen 3)
-#    where Gen 1 has a slow build step (`RUN sleep 5`) so Gen 2 & Gen 3 preempt it mid-flight
+#    using a unique cache-busting token per run so BuildKit never caches the `sleep` steps
 # 2. Boots the Fastify API server and BullMQ worker (with reconciler interval = 2s)
 # 3. Fires 3 rapid signed `pull_request` webhooks for PR #401 (Gen 1 opened, Gen 2 & Gen 3 synchronize)
-# 4. Asserts Gen 1 & Gen 2 are marked `SUPERSEDED` while Gen 3 reaches `LIVE` and serves `reapd-phase4-gen3`
+# 4. Asserts Gen 1 & Gen 2 are marked `SUPERSEDED`, worker logs record the cancel signal,
+#    their images are pruned, exactly 1 container is running, and Gen 3 serves `reapd-phase4-gen3`
 # 5. Spawns an untracked "zombie" preview container (`reapd.managed=true`, bogus deployment_id)
 #    simulating a `SIGKILL`'d worker crash, and asserts the reconciler purges it to 0 orphans
 # 6. Sends a signed `pull_request` `action: "closed"` webhook for PR #401 and asserts Gen 3
-#    transitions `LIVE -> EXPIRED` and its container + image are reaped
+#    transitions `LIVE -> EXPIRED` and both its container AND image are reaped
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -20,6 +21,7 @@ TEST_SECRET="phase4-smoke-webhook-secret"
 TEST_QUEUE="build-phase4-$$"
 TEST_REPO_ID=999401
 TEST_PR_NUMBER=401
+RUN_TOKEN="$(node -e 'console.log(crypto.randomUUID())')"
 ZOMBIE_CONTAINER_NAME="reapd-pr-zombie-401"
 DELIVERY_INSTALL="$(node -e 'console.log(crypto.randomUUID())')"
 DELIVERY_GEN1="$(node -e 'console.log(crypto.randomUUID())')"
@@ -86,14 +88,14 @@ EOF
   git -C "$TMP_REPO" rev-parse HEAD
 }
 
-# Gen 1 sleeps 6s inside BuildKit so it is guaranteed to be mid-build when Gen 2 & Gen 3 arrive
-SHA_GEN1="$(write_commit "reapd-phase4-gen1" "RUN sleep 6")"
-SHA_GEN2="$(write_commit "reapd-phase4-gen2" "RUN sleep 4")"
+# Bake $RUN_TOKEN into the RUN step so BuildKit never serves the sleep layer from cache on repeat runs
+SHA_GEN1="$(write_commit "reapd-phase4-gen1" "RUN echo 'gen1-$RUN_TOKEN' && sleep 6")"
+SHA_GEN2="$(write_commit "reapd-phase4-gen2" "RUN echo 'gen2-$RUN_TOKEN' && sleep 4")"
 SHA_GEN3="$(write_commit "reapd-phase4-gen3" "")"
 
-echo "📝 Fixture commits created:"
-echo "   Gen 1: $SHA_GEN1 (slow build)"
-echo "   Gen 2: $SHA_GEN2"
+echo "📝 Fixture commits created (run token $RUN_TOKEN):"
+echo "   Gen 1: $SHA_GEN1 (uncached 6s build)"
+echo "   Gen 2: $SHA_GEN2 (uncached 4s build)"
 echo "   Gen 3: $SHA_GEN3"
 
 cd "$ROOT"
@@ -195,7 +197,7 @@ curl -fsS -X POST "http://127.0.0.1:$API_PORT/webhooks/github" \
 # ── 3. Fire 3 rapid commits to trigger in-flight superseding ─────────────────
 echo "⚡ Firing 3 rapid commits to PR #$TEST_PR_NUMBER..."
 send_pr_webhook "$DELIVERY_GEN1" "opened" "$SHA_GEN1"
-sleep 1.2
+sleep 1.5
 send_pr_webhook "$DELIVERY_GEN2" "synchronize" "$SHA_GEN2"
 sleep 0.5
 send_pr_webhook "$DELIVERY_GEN3" "synchronize" "$SHA_GEN3"
@@ -226,12 +228,29 @@ if [[ "$GEN_SUMMARY" != "g1:SUPERSEDED,g2:SUPERSEDED,g3:LIVE" ]]; then
   exit 1
 fi
 
+GEN1_ID="$(docker exec -i reapd-postgres psql -U reapd -d reapd -tAq -c \
+  "SELECT id FROM deployments WHERE subdomain = 'pr-$TEST_PR_NUMBER' AND generation = 1 LIMIT 1;")"
+GEN3_ID="$(docker exec -i reapd-postgres psql -U reapd -d reapd -tAq -c \
+  "SELECT id FROM deployments WHERE subdomain = 'pr-$TEST_PR_NUMBER' AND generation = 3 LIMIT 1;")"
+
+if ! grep -q "Cancel signal received for deployment $GEN1_ID" "$WORKER_LOG"; then
+  echo "❌ FAIL: worker log did not record Redis pub/sub cancel signal for Gen 1 ($GEN1_ID)"
+  cat "$WORKER_LOG"
+  exit 1
+fi
+
 BODY="$(curl -fsSL "https://pr-$TEST_PR_NUMBER.preview.localhost/")"
 if [[ "$BODY" != "reapd-phase4-gen3" ]]; then
   echo "❌ FAIL: expected 'reapd-phase4-gen3' from live preview, got '$BODY'"
   exit 1
 fi
-echo "✅ Verified Gen 1 & Gen 2 aborted/SUPERSEDED and Gen 3 serving traffic: '$BODY'"
+
+PR_CONTAINER_COUNT="$(docker ps -q --filter "label=reapd.subdomain=pr-$TEST_PR_NUMBER" | wc -l | tr -d ' ')"
+if [[ "$PR_CONTAINER_COUNT" != "1" ]]; then
+  echo "❌ FAIL: expected exactly 1 running container for pr-$TEST_PR_NUMBER, got $PR_CONTAINER_COUNT"
+  exit 1
+fi
+echo "✅ Verified Gen 1 & Gen 2 aborted via cancel signal and Gen 3 serving traffic: '$BODY'"
 
 # ── 5. Spawn a zombie orphan container and verify reconciler purges it ───────
 echo "🧟 Spawning untracked zombie container ($ZOMBIE_CONTAINER_NAME) with reapd.managed=true..."
@@ -258,7 +277,7 @@ if [[ "$ZOMBIE_GONE" != "1" ]]; then
 fi
 echo "✅ Reconciler detected and purged zombie container ($ZOMBIE_CONTAINER_NAME)"
 
-# ── 6. Close PR #401 and verify Gen 3 expires and container is reaped ────────
+# ── 6. Close PR #401 and verify Gen 3 expires and container + image are reaped
 echo "🔒 Sending pull_request closed webhook for PR #$TEST_PR_NUMBER..."
 send_pr_webhook "$DELIVERY_CLOSE" "closed" "$SHA_GEN3" "closed"
 
@@ -269,21 +288,21 @@ if [[ "$GEN3_AFTER_CLOSE" != "EXPIRED" ]]; then
   exit 1
 fi
 
-CONTAINER_GONE=0
+RESOURCES_GONE=0
 for _ in {1..15}; do
-  if ! docker inspect "reapd-pr-$TEST_PR_NUMBER" >/dev/null 2>&1; then
-    CONTAINER_GONE=1
+  REMAINING_IMG="$(docker images -q --filter "label=reapd.deployment_id=$GEN3_ID" | tr -d '[:space:]')"
+  if ! docker inspect "reapd-pr-$TEST_PR_NUMBER" >/dev/null 2>&1 && [[ -z "$REMAINING_IMG" ]]; then
+    RESOURCES_GONE=1
     break
   fi
   sleep 1
 done
 
-if [[ "$CONTAINER_GONE" != "1" ]]; then
-  echo "❌ FAIL: reconciler did not remove expired PR container reapd-pr-$TEST_PR_NUMBER"
+if [[ "$RESOURCES_GONE" != "1" ]]; then
+  echo "❌ FAIL: reconciler did not remove expired PR container and image for pr-$TEST_PR_NUMBER"
   cat "$WORKER_LOG"
   exit 1
 fi
-echo "✅ PR close transitioned Gen 3 LIVE -> EXPIRED and reconciler removed reapd-pr-$TEST_PR_NUMBER"
+echo "✅ PR close transitioned Gen 3 LIVE -> EXPIRED and reconciler removed container + image"
 
-echo "✅ PASS: Phase 4 verification gate complete (3-commit superseding -> orphan container GC -> PR close teardown)"
-
+echo "✅ PASS: Phase 4 verification gate complete (3-commit superseding -> orphan container GC -> PR close container+image teardown)"
