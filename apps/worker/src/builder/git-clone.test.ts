@@ -6,6 +6,7 @@ import { mkdtemp, writeFile, readFile, rm, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { cloneRepoAtSha, buildGitEnv } from './git-clone.js';
+import { runProcess } from './run-process.js';
 import { parseGenerationFromTag } from '../jobs/build.js';
 
 // Shared git env for test repos: suppress GPG signing and prompts
@@ -115,4 +116,27 @@ test('parseGenerationFromTag extracts generation number from image tags', () => 
   assert.equal(parseGenerationFromTag('reapd-pr-104:g1-a1b2c3d'), 1);
   assert.equal(parseGenerationFromTag('reapd-pr-104:g42-deadbeef'), 42);
   assert.equal(parseGenerationFromTag('reapd-pr-104:a1b2c3d'), null);
+});
+
+test('runProcess rejects with timeout Error (not AbortError) when AbortSignal.timeout fires', async () => {
+  const userController = new AbortController();
+  const timeoutSignal = AbortSignal.timeout(50);
+  const combined = AbortSignal.any([userController.signal, timeoutSignal]);
+
+  await assert.rejects(
+    () =>
+      runProcess({
+        cmd: 'node',
+        args: ['-e', 'setTimeout(() => {}, 5000)'],
+        cwd: tmpdir(),
+        signal: combined,
+        onLog: undefined,
+      }),
+    (err: unknown) => {
+      assert.ok(err instanceof Error);
+      assert.notEqual(err.name, 'AbortError', 'timeout must not be misclassified as AbortError');
+      assert.match(err.message, /timed out/);
+      return true;
+    }
+  );
 });

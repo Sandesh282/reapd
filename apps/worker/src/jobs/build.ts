@@ -40,11 +40,13 @@ const activeBuildControllers = new Map<string, AbortController>();
 
 /**
  * Aborts all currently running build jobs in this worker process (e.g. on SIGTERM / SIGINT).
+ * Passes `'worker_shutdown'` as the abort reason so the job catch block marks the deployment
+ * `FAILED` rather than `SUPERSEDED`.
  */
 export function abortAllActiveBuilds(): void {
   for (const [deploymentId, ac] of activeBuildControllers.entries()) {
     console.log(`🛑 Aborting active build ${deploymentId} due to worker shutdown`);
-    ac.abort();
+    ac.abort('worker_shutdown');
   }
 }
 
@@ -225,12 +227,18 @@ export async function buildJobHandler(job: Job<BuildJobPayload>): Promise<void> 
     console.log(`🟢 LIVE: https://${subdomain}.preview.localhost (deployment ${deploymentId})`);
   } catch (err) {
     if (err instanceof AbortError || (err instanceof Error && err.name === 'AbortError')) {
+      const isShutdown = ac.signal.reason === 'worker_shutdown';
+      const targetStatus = isShutdown ? 'FAILED' : 'SUPERSEDED';
+      const abortReason = isShutdown
+        ? 'Build aborted due to worker shutdown'
+        : 'Aborted via cancel signal';
+
       await transitionDeploymentStatus(db, {
         deploymentId,
-        toStatus: 'SUPERSEDED',
-        reason: 'Aborted via cancel signal',
+        toStatus: targetStatus,
+        reason: abortReason,
       }).catch((dbErr: unknown) => {
-        console.warn(`⚠️  Failed to record SUPERSEDED status for ${deploymentId}:`, dbErr);
+        console.warn(`⚠️  Failed to record ${targetStatus} status for ${deploymentId}:`, dbErr);
       });
       return;
     }

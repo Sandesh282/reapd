@@ -64,6 +64,7 @@ if (isMainModule) {
 
   const shutdown = async (): Promise<void> => {
     console.log('🛑 Shutting down worker...');
+    // Clear the reconciler interval (any in-flight sweep is idempotent if interrupted by exit)
     stopReconciler();
     abortAllActiveBuilds();
     try {
