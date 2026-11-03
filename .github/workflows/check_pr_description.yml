@@ -1,0 +1,40 @@
+name: Check PR Description
+
+on:
+  pull_request:
+    types:
+      - opened
+      - edited
+      - reopened
+
+permissions: read-all
+
+jobs:
+  check_pr_description:
+    name: Validate PR template sections
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check required PR description sections
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const pr = context.payload.pull_request;
+            const body = pr.body || '';
+
+            const requiredSections = [
+              '## Explanation',
+              '## Checklist',
+              '## Verification',
+              '## LLM Disclosure',
+            ];
+
+            const missing = requiredSections.filter(
+              (section) => !body.includes(section)
+            );
+
+            if (missing.length > 0) {
+              core.setFailed(
+                `PR description is missing required sections from .github/pull_request_template.md: ${missing.join(', ')}`
+              );
+            }
+

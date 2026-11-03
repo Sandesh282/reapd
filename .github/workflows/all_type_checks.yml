@@ -1,0 +1,59 @@
+name: Type checks
+
+permissions: read-all
+
+on:
+  push:
+    branches:
+      - main
+      - release-*
+  pull_request:
+    branches:
+      - main
+      - release-*
+    types:
+      - opened
+      - synchronize
+      - reopened
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend_type_checks:
+    name: Backend (@reapd/types, db, docker-client, worker, api)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node & dependencies
+        uses: ./.github/actions/setup-node-and-deps
+
+      - name: Typecheck Domain Layer (@reapd/types)
+        run: npm run typecheck --workspace @reapd/types
+
+      - name: Typecheck Storage & Docker Layers (@reapd/db, @reapd/docker-client)
+        run: |
+          npm run typecheck --workspace @reapd/db
+          npm run typecheck --workspace @reapd/docker-client
+
+      - name: Typecheck Service & Route Layers (@reapd/worker, @reapd/api)
+        run: |
+          npm run typecheck --workspace @reapd/worker
+          npm run typecheck --workspace @reapd/api
+
+  frontend_type_checks:
+    name: Frontend (@reapd/web)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node & dependencies
+        uses: ./.github/actions/setup-node-and-deps
+
+      - name: Typecheck Dashboard (@reapd/web)
+        run: npm run typecheck --workspace @reapd/web
+

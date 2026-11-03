@@ -1,0 +1,15 @@
+name: 'Setup reapd Node & Dependencies'
+description: 'Sets up Node.js 22 with npm cache and installs workspace dependencies cleanly.'
+runs:
+  using: 'composite'
+  steps:
+    - name: Set up Node.js 22
+      uses: actions/setup-node@v4
+      with:
+        node-version: '22'
+        cache: 'npm'
+
+    - name: Install workspace dependencies
+      shell: bash
+      run: npm ci
+

@@ -38,6 +38,9 @@ async function isPostgresReachable(): Promise<boolean> {
 
 test('transitionDeploymentStatus: stale generation, terminal early-exit, LIVE replacement, and lock order', async (t) => {
   if (!(await isPostgresReachable())) {
+    if (process.env['CI']) {
+      assert.fail('PostgreSQL is unreachable in CI — refusing to skip DB integration tests');
+    }
     t.skip('PostgreSQL is not reachable in this environment');
     return;
   }

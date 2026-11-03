@@ -1,0 +1,64 @@
+name: Backend unit tests
+
+permissions: read-all
+
+on:
+  push:
+    branches:
+      - main
+      - release-*
+  pull_request:
+    branches:
+      - main
+      - release-*
+    types:
+      - opened
+      - synchronize
+      - reopened
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unit_and_db_tests:
+    name: Worker, Docker-Client & PostgreSQL 17 Integration Tests
+    runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: reapd
+          POSTGRES_PASSWORD: reapd_dev_password
+          POSTGRES_DB: reapd
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U reapd -d reapd"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=10
+
+    env:
+      CI: 'true'
+      DATABASE_URL: postgresql://reapd:reapd_dev_password@localhost:5432/reapd
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node & dependencies
+        uses: ./.github/actions/setup-node-and-deps
+
+      - name: Apply PostgreSQL 17 schema migration
+        run: PGPASSWORD=reapd_dev_password psql -h localhost -U reapd -d reapd -f packages/db/src/migrations/0001_initial_schema.sql
+
+      - name: Run @reapd/docker-client unit tests (8-byte stream demuxer)
+        run: npm run test --workspace @reapd/docker-client
+
+      - name: Run @reapd/worker unit tests (git clone, build timeouts, reconciler)
+        run: npm run test --workspace @reapd/worker
+
+      - name: Run @reapd/db integration tests (state machine, lock hierarchy, reconciler queries)
+        run: npm run test --workspace @reapd/db
+

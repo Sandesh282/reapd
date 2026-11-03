@@ -1,0 +1,55 @@
+name: Lint checks
+
+permissions: read-all
+
+on:
+  push:
+    branches:
+      - main
+      - release-*
+  pull_request:
+    branches:
+      - main
+      - release-*
+    types:
+      - opened
+      - synchronize
+      - reopened
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  shell_and_config_lint:
+    name: Shellcheck & Workspace Config Validation
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run ShellCheck on verification gate scripts
+        run: shellcheck infra/scripts/*.sh
+
+      - name: Validate docker-compose configuration syntax
+        run: docker compose -f infra/docker-compose.yml config >/dev/null
+
+      - name: Verify 4-layer architecture dependency boundaries
+        run: |
+          # Domain layer (@reapd/types) must have zero internal or I/O dependencies
+          node -e '
+            const fs = require("node:fs");
+            const pkg = JSON.parse(fs.readFileSync("packages/types/package.json", "utf8"));
+            const deps = Object.keys(pkg.dependencies || {});
+            const disallowed = deps.filter((d) => d !== "zod");
+            if (disallowed.length > 0) {
+              console.error("@reapd/types has disallowed dependencies:", disallowed);
+              process.exit(1);
+            }
+          '
+          # Route layer (apps/api) must never import raw sql from drizzle-orm directly
+          if grep -rn "from 'drizzle-orm'" apps/api/src/; then
+            echo "❌ Route layer (apps/api) must not import drizzle-orm directly (use @reapd/db repositories)"
+            exit 1
+          fi
+

@@ -1,0 +1,60 @@
+name: Full-stack smoke tests
+
+permissions: read-all
+
+on:
+  push:
+    branches:
+      - main
+      - release-*
+  pull_request:
+    branches:
+      - main
+      - release-*
+    types:
+      - opened
+      - synchronize
+      - reopened
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  e2e_phase_gates:
+    name: Phase 2, 3 & 4 E2E Smoke Gates (Traefik + BuildKit + Postgres + Redis)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node & dependencies
+        uses: ./.github/actions/setup-node-and-deps
+
+      - name: Install mkcert and generate wildcard *.preview.localhost TLS certs
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libnss3-tools
+          curl -fsSL "https://dl.filippo.io/mkcert/latest?for=linux/amd64" -o mkcert
+          chmod +x mkcert
+          sudo mv mkcert /usr/local/bin/mkcert
+          ./infra/scripts/setup-certs.sh
+
+      - name: Configure *.preview.localhost in /etc/hosts for curl on Linux runners
+        run: |
+          echo "127.0.0.1 pr-1.preview.localhost pr-104.preview.localhost pr-202.preview.localhost pr-301.preview.localhost pr-401.preview.localhost" | sudo tee -a /etc/hosts
+
+      - name: Boot Docker Compose stack & apply PostgreSQL 17 schema
+        run: |
+          docker compose -f infra/docker-compose.yml up -d --wait
+          docker exec -i reapd-postgres psql -U reapd -d reapd < packages/db/src/migrations/0001_initial_schema.sql
+
+      - name: Run Phase 2 CLI Lifecycle Gate
+        run: ./infra/scripts/phase2-smoke.sh
+
+      - name: Run Phase 3 Webhook-to-LIVE Gate
+        run: ./infra/scripts/phase3-smoke.sh
+
+      - name: Run Phase 4 Superseding & Desired-State Reconciler Gate
+        run: ./infra/scripts/phase4-smoke.sh
+
