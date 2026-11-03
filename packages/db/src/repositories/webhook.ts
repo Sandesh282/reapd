@@ -224,29 +224,60 @@ export async function upsertRepository(
 }
 
 /**
- * Deletes a repository row by its GitHub repo ID (cascades to PRs and deployments).
- * Any running preview containers for that repo become orphans and are cleaned up
- * on the next reconciler sweep.
+ * Deletes a repository row by its GitHub repo ID and installation ID (cascades to PRs and deployments).
+ * Returns the IDs of any in-flight deployments (`QUEUED`/`BUILDING`/`STARTING`/`TESTING`) that belonged
+ * to that repository so the caller can publish `cancel:deploy:<id>` signals immediately.
  */
 export async function deleteRepositoryByGithubId(
   db: DrizzleClient,
-  githubRepoId: number
-): Promise<void> {
-  await db.execute(sql`
-    DELETE FROM repositories WHERE github_repo_id = ${githubRepoId}
-  `);
+  githubRepoId: number,
+  installationId: number
+): Promise<string[]> {
+  return db.transaction(async (tx) => {
+    const active = await tx.execute<{ id: string }>(sql`
+      SELECT d.id
+      FROM deployments d
+      JOIN pull_requests pr ON pr.id = d.pull_request_id
+      JOIN repositories  r  ON r.id  = pr.repo_id
+      WHERE r.github_repo_id = ${githubRepoId}
+        AND r.installation_id = ${installationId}
+        AND d.status IN ('QUEUED', 'BUILDING', 'STARTING', 'TESTING')
+    `);
+
+    await tx.execute(sql`
+      DELETE FROM repositories
+      WHERE github_repo_id = ${githubRepoId}
+        AND installation_id = ${installationId}
+    `);
+
+    return active.map((r) => r.id);
+  });
 }
 
 /**
- * Deletes all repository rows belonging to a uninstalled GitHub App installation.
+ * Deletes all repository rows belonging to an uninstalled GitHub App installation.
+ * Returns the IDs of any in-flight deployments so the caller can publish cancel signals.
  */
 export async function deleteRepositoriesByInstallationId(
   db: DrizzleClient,
   installationId: number
-): Promise<void> {
-  await db.execute(sql`
-    DELETE FROM repositories WHERE installation_id = ${installationId}
-  `);
+): Promise<string[]> {
+  return db.transaction(async (tx) => {
+    const active = await tx.execute<{ id: string }>(sql`
+      SELECT d.id
+      FROM deployments d
+      JOIN pull_requests pr ON pr.id = d.pull_request_id
+      JOIN repositories  r  ON r.id  = pr.repo_id
+      WHERE r.installation_id = ${installationId}
+        AND d.status IN ('QUEUED', 'BUILDING', 'STARTING', 'TESTING')
+    `);
+
+    await tx.execute(sql`
+      DELETE FROM repositories WHERE installation_id = ${installationId}
+    `);
+
+    return active.map((r) => r.id);
+  });
 }
 
 

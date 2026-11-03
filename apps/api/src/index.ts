@@ -150,8 +150,14 @@ async function handleInstallationEvent(body: Record<string, unknown>): Promise<v
   if (!installationId) return;
 
   if (action === 'deleted') {
-    await deleteRepositoriesByInstallationId(db, installationId);
-    app.log.info({ installationId }, 'Repositories removed on installation deleted');
+    const activeIds = await deleteRepositoriesByInstallationId(db, installationId);
+    for (const deployId of activeIds) {
+      await redis.publish(`cancel:deploy:${deployId}`, '1');
+    }
+    app.log.info(
+      { installationId, cancelledBuilds: activeIds.length },
+      'Repositories removed on installation deleted',
+    );
     return;
   }
 
@@ -159,8 +165,14 @@ async function handleInstallationEvent(body: Record<string, unknown>): Promise<v
     const removedRepos =
       (body['repositories_removed'] as Array<{ id: number; full_name?: string }> | undefined) ?? [];
     for (const repo of removedRepos) {
-      await deleteRepositoryByGithubId(db, repo.id);
-      app.log.info({ repoId: repo.id, fullName: repo.full_name }, 'Repository removed from installation');
+      const activeIds = await deleteRepositoryByGithubId(db, repo.id, installationId);
+      for (const deployId of activeIds) {
+        await redis.publish(`cancel:deploy:${deployId}`, '1');
+      }
+      app.log.info(
+        { repoId: repo.id, fullName: repo.full_name, cancelledBuilds: activeIds.length },
+        'Repository removed from installation',
+      );
     }
     return;
   }
@@ -208,11 +220,11 @@ async function handlePullRequestEvent(
   const payload = parsed.data;
 
   // Reject PRs originating from external or deleted forks so untrusted code never runs in BuildKit
-  // (allow `closed` events through even when head.repo is null because the author deleted their fork branch)
+  // (allow `closed` events through even when head.repo is null/missing because the author deleted their fork branch)
   const headRepo = payload.pull_request.head.repo;
   if (
     payload.action !== 'closed' &&
-    (headRepo === null || (headRepo !== undefined && headRepo.id !== payload.repository.id))
+    (!headRepo || headRepo.id !== payload.repository.id)
   ) {
     app.log.warn(
       { headRepoId: headRepo?.id ?? null, baseRepoId: payload.repository.id },
@@ -288,7 +300,7 @@ async function handlePullRequestEvent(
   }
 
   if (!result.newDeploymentId) {
-    return { received: true, duplicate: true };
+    throw new Error(`Expected newDeploymentId for pull_request action=${payload.action}`);
   }
 
   // Enqueue the new build job (attempts: 1 because failed deployments are marked

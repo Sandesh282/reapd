@@ -237,18 +237,37 @@ export async function getDeploymentWithRepo(
  * Marks all `LIVE` deployments whose `expires_at <= NOW()` as `EXPIRED`
  * and records an immutable `deployment_events` entry for each.
  * Uses `idx_deployments_reconcile (status, expires_at)`.
+ *
+ * Note on lock ordering: this CTE locks only `deployments` rows (`ORDER BY id FOR UPDATE SKIP LOCKED`)
+ * and never acquires a `pull_requests` lock, so it cannot form a deadlock cycle with
+ * `transitionDeploymentStatus` or `ingestPullRequestWebhook`. Any row currently locked by
+ * an active worker transaction is safely skipped until the next sweep.
  */
 export async function expireDueDeployments(
-  db: DrizzleClient
+  db: DrizzleClient,
+  opts?: { repoId?: string }
 ): Promise<string[]> {
   return db.transaction(async (tx) => {
+    const repoFilter = opts?.repoId
+      ? sql`AND pull_request_id IN (SELECT id FROM pull_requests WHERE repo_id = ${opts.repoId})`
+      : sql``;
+
     const expired = await tx.execute<{ id: string }>(sql`
-      UPDATE deployments
+      WITH due AS (
+        SELECT id
+        FROM deployments
+        WHERE status = 'LIVE'
+          AND expires_at <= NOW()
+          ${repoFilter}
+        ORDER BY id
+        FOR UPDATE SKIP LOCKED
+      )
+      UPDATE deployments d
       SET status     = 'EXPIRED',
           updated_at = NOW()
-      WHERE status = 'LIVE'
-        AND expires_at <= NOW()
-      RETURNING id
+      FROM due
+      WHERE d.id = due.id
+      RETURNING d.id
     `);
 
     for (const row of expired) {
@@ -271,21 +290,38 @@ export async function expireDueDeployments(
  * Fences any deployment stuck in `QUEUED`, `BUILDING`, `STARTING`, or `TESTING`
  * whose `updated_at` is older than `maxAgeMinutes` (default: 20 minutes per PRD §6.1)
  * by transitioning it to `FAILED`.
+ *
+ * Note on lock ordering: locks only `deployments` (`ORDER BY id FOR UPDATE SKIP LOCKED`)
+ * and never waits on `pull_requests`, avoiding any deadlock cycle.
  */
 export async function fenceStuckDeployments(
   db: DrizzleClient,
-  maxAgeMinutes = 20
+  maxAgeMinutes = 20,
+  opts?: { repoId?: string }
 ): Promise<string[]> {
   return db.transaction(async (tx) => {
     const reason = `Build timed out or worker crashed (exceeded ${maxAgeMinutes}m reconciler fence)`;
+    const repoFilter = opts?.repoId
+      ? sql`AND pull_request_id IN (SELECT id FROM pull_requests WHERE repo_id = ${opts.repoId})`
+      : sql``;
+
     const stuck = await tx.execute<{ id: string; status: DeploymentStatus }>(sql`
-      UPDATE deployments
+      WITH stale AS (
+        SELECT id, status
+        FROM deployments
+        WHERE status IN ('QUEUED', 'BUILDING', 'STARTING', 'TESTING')
+          AND updated_at <= NOW() - (${maxAgeMinutes} * INTERVAL '1 minute')
+          ${repoFilter}
+        ORDER BY id
+        FOR UPDATE SKIP LOCKED
+      )
+      UPDATE deployments d
       SET status         = 'FAILED',
           failure_reason = ${reason},
           updated_at     = NOW()
-      WHERE status IN ('QUEUED', 'BUILDING', 'STARTING', 'TESTING')
-        AND updated_at <= NOW() - (${maxAgeMinutes} * INTERVAL '1 minute')
-      RETURNING id, status
+      FROM stale
+      WHERE d.id = stale.id
+      RETURNING d.id, stale.status
     `);
 
     for (const row of stuck) {
