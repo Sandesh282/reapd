@@ -8,7 +8,7 @@ import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Worker } from 'bullmq';
 import { Redis } from 'ioredis';
-import { buildJobHandler, type BuildJobPayload } from './jobs/build.js';
+import { abortAllActiveBuilds, buildJobHandler, type BuildJobPayload } from './jobs/build.js';
 import { startReconciler } from './reconciler/index.js';
 
 export * from './builder/git-clone.js';
@@ -65,6 +65,7 @@ if (isMainModule) {
   const shutdown = async (): Promise<void> => {
     console.log('🛑 Shutting down worker...');
     stopReconciler();
+    abortAllActiveBuilds();
     try {
       await worker.close();
     } finally {

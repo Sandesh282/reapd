@@ -36,6 +36,17 @@ export interface BuildJobPayload {
 
 const REDIS_URL = process.env['REDIS_URL'] ?? 'redis://localhost:6379';
 const docker = createDockerClient();
+const activeBuildControllers = new Map<string, AbortController>();
+
+/**
+ * Aborts all currently running build jobs in this worker process (e.g. on SIGTERM / SIGINT).
+ */
+export function abortAllActiveBuilds(): void {
+  for (const [deploymentId, ac] of activeBuildControllers.entries()) {
+    console.log(`🛑 Aborting active build ${deploymentId} due to worker shutdown`);
+    ac.abort();
+  }
+}
 
 /**
  * Extracts the generation number from an image tag like `reapd-pr-104:g2-a1b2c3d`.
@@ -49,6 +60,7 @@ export function parseGenerationFromTag(repoTag: string): number | null {
 export async function buildJobHandler(job: Job<BuildJobPayload>): Promise<void> {
   const { deploymentId } = job.data;
   const ac = new AbortController();
+  activeBuildControllers.set(deploymentId, ac);
   const sub = new Redis(REDIS_URL);
 
   try {
@@ -152,18 +164,25 @@ export async function buildJobHandler(job: Job<BuildJobPayload>): Promise<void> 
     }
 
     // Replace any previous container on the same PR subdomain and prune only OLDER
-    // generation images (never delete a newer generation's image if running concurrently)
-    // Check abort signal here: if a Gen N+1 worker has already created a new container
-    // under `containerName`, skipping the remove prevents Gen N from killing it.
+    // generation images (never delete a newer generation's image if running concurrently).
+    // Check abort signal before touching Docker so an aborted Gen N worker never removes
+    // a container just started by Gen N+1.
     const oldImages = await listManagedImages(docker, { subdomain });
-    if (!ac.signal.aborted) {
-      await forceRemoveContainer(docker, containerName);
+    if (ac.signal.aborted) {
+      await removeImage(docker, imageTag).catch(() => {});
+      throw new AbortError('Deployment superseded before removing previous container');
     }
+    await forceRemoveContainer(docker, containerName);
     for (const img of oldImages) {
       const imgGen = parseGenerationFromTag(img.repoTag);
       if (imgGen !== null && imgGen < generation) {
         await removeImage(docker, img.repoTag).catch(() => {});
       }
+    }
+
+    if (ac.signal.aborted) {
+      await removeImage(docker, imageTag).catch(() => {});
+      throw new AbortError('Deployment superseded before creating preview container');
     }
 
     const container = await createPreviewContainer(docker, {
@@ -231,6 +250,7 @@ export async function buildJobHandler(job: Job<BuildJobPayload>): Promise<void> 
 
     throw err;
   } finally {
+    activeBuildControllers.delete(deploymentId);
     await sub.unsubscribe().catch(() => {});
     await sub.quit().catch(() => {});
   }
