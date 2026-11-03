@@ -5,7 +5,8 @@ import { execFileSync } from 'node:child_process';
 import { mkdtemp, writeFile, readFile, rm, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { cloneRepoAtSha } from './git-clone.js';
+import { cloneRepoAtSha, buildGitEnv } from './git-clone.js';
+import { parseGenerationFromTag } from '../jobs/build.js';
 
 // Shared git env for test repos: suppress GPG signing and prompts
 const testGitEnv = ['config', '--local'];
@@ -41,12 +42,28 @@ test('shallow-clones an exact commit SHA and cleans up temporary directory', asy
       repoUrl: originDir,
       commitSha: sha1,
       deploymentId: 'unit-test-1',
+      authToken: 'ghs_secret_test_token_12345',
       signal: ac.signal,
     });
     workDir = res.workDir;
 
     // Assert correct SHA was checked out
     assert.equal(res.resolvedSha, sha1);
+
+    // Assert authToken is never persisted to .git/config on disk (issue #3),
+    // neither in raw form nor base64-encoded.
+    const gitConfig = await readFile(join(res.workDir, '.git', 'config'), 'utf8');
+    const encoded = Buffer.from('x-access-token:ghs_secret_test_token_12345').toString('base64');
+    assert.ok(
+      !gitConfig.includes('ghs_secret_test_token_12345') && !gitConfig.includes(encoded),
+      'authToken must not be written to .git/config'
+    );
+
+    // Assert buildGitEnv scopes the Authorization header strictly to https://github.com/
+    const envWithToken = buildGitEnv('ghs_secret_test_token_12345');
+    assert.equal(envWithToken['GIT_CONFIG_COUNT'], '2');
+    assert.equal(envWithToken['GIT_CONFIG_KEY_1'], 'http.https://github.com/.extraHeader');
+    assert.equal(envWithToken['GIT_CONFIG_VALUE_1'], `Authorization: Basic ${encoded}`);
 
     // Assert we got v1 content, not HEAD (v2)
     const content = await readFile(join(res.workDir, 'version.txt'), 'utf8');
@@ -92,4 +109,10 @@ test('throws AbortError if signal is already aborted before clone starts', async
       return true;
     }
   );
+});
+
+test('parseGenerationFromTag extracts generation number from image tags', () => {
+  assert.equal(parseGenerationFromTag('reapd-pr-104:g1-a1b2c3d'), 1);
+  assert.equal(parseGenerationFromTag('reapd-pr-104:g42-deadbeef'), 42);
+  assert.equal(parseGenerationFromTag('reapd-pr-104:a1b2c3d'), null);
 });

@@ -121,7 +121,12 @@ export async function createPreviewContainer(
     },
   });
 
-  await container.start();
+  try {
+    await container.start();
+  } catch (err) {
+    await container.remove({ force: true, v: true }).catch(() => {});
+    throw err;
+  }
 
   return {
     id: container.id,

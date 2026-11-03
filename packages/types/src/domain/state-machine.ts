@@ -47,7 +47,7 @@ export const ACTIVE_STATUSES: ReadonlySet<DeploymentStatus> = new Set([
  * TESTING    → LIVE       (smoke tests passed)
  * TESTING    → SUPERSEDED (newer commit arrived during smoke run)
  * TESTING    → FAILED     (smoke tests failed or timed out)
- * LIVE       → EXPIRED    (PR closed or TTL elapsed)
+ * LIVE       → EXPIRED    (PR closed, TTL elapsed, or replaced by newer LIVE generation)
  */
 export const VALID_TRANSITIONS: Readonly<
   Record<DeploymentStatus, readonly DeploymentStatus[]>

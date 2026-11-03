@@ -2,6 +2,7 @@
   "name": "@reapd/api",
   "version": "0.0.1",
   "private": true,
+  "type": "module",
   "main": "./src/index.ts",
   "scripts": {
     "dev": "tsx watch src/index.ts",
@@ -13,6 +14,8 @@
     "fastify": "^5.2.1",
     "@fastify/cors": "^10.0.2",
     "zod": "^3.23.8",
+    "ioredis": "^5.4.2",
+    "bullmq": "^5.34.4",
     "@reapd/types": "*",
     "@reapd/db": "*"
   },
@@ -20,6 +23,9 @@
     "tsx": "^4.19.2",
     "typescript": "^5.7.2",
     "@types/node": "^22.10.1"
+  },
+  "engines": {
+    "node": ">=21"
   }
 }
 
