@@ -140,8 +140,8 @@ PR_PAYLOAD="$(cat <<JSON
     "title": "Phase 3 smoke PR",
     "state": "open",
     "user": { "login": "Sandesh282", "id": 1 },
-    "head": { "sha": "$TARGET_SHA", "ref": "phase/3-smoke" },
-    "base": { "sha": "$TARGET_SHA", "ref": "main" },
+    "head": { "sha": "$TARGET_SHA", "ref": "phase/3-smoke", "repo": { "id": $TEST_REPO_ID, "full_name": "Sandesh282/reapd" } },
+    "base": { "sha": "$TARGET_SHA", "ref": "main", "repo": { "id": $TEST_REPO_ID, "full_name": "Sandesh282/reapd" } },
     "merged": false,
     "draft": false
   },

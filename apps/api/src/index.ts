@@ -42,29 +42,40 @@ if (!WEBHOOK_SECRET) {
 
 // ── Infrastructure ────────────────────────────────────────────────────────────
 
-const redis = new Redis(REDIS_URL, { maxRetriesPerRequest: 3 });
-const buildQueue = new Queue<{ deploymentId: string }>(BUILD_QUEUE_NAME, { connection: redis });
+// BullMQ v5 requires `maxRetriesPerRequest: null`; `enableOfflineQueue: false`
+// ensures `publish` / `add` fail fast if Redis is disconnected rather than hanging.
+const redis = new Redis(REDIS_URL, {
+  maxRetriesPerRequest: null,
+  enableOfflineQueue: false,
+});
+const buildQueue = new Queue<{ deploymentId: string }>(BUILD_QUEUE_NAME, {
+  connection: redis,
+});
 
 // ── Fastify ───────────────────────────────────────────────────────────────────
 
 const app = Fastify({
   logger: true,
-  bodyLimit: 5 * 1024 * 1024, // 5 MB to accommodate large GitHub webhook payloads
+  bodyLimit: 1024 * 1024, // 1 MB cap; HMAC is verified on the raw Buffer before JSON.parse
 });
 
 /**
- * Custom content-type parser that saves the raw Buffer alongside the parsed
- * JSON body. Fastify's default JSON parser discards the raw bytes, but we
- * need them to verify the X-Hub-Signature-256 HMAC.
+ * Custom content-type parser that preserves the raw Buffer without running
+ * `JSON.parse` upfront. The webhook handler verifies the X-Hub-Signature-256
+ * HMAC over the raw bytes first and only parses JSON for authenticated payloads.
  */
 app.addContentTypeParser(
   'application/json',
   { parseAs: 'buffer' },
   (req, body, done) => {
+    (req as unknown as Record<string, unknown>)['rawBody'] = body;
+    // Defer JSON.parse on the webhook route until after HMAC verification
+    if (req.url.split('?')[0] === '/webhooks/github') {
+      done(null, body);
+      return;
+    }
     try {
-      const parsed = JSON.parse((body as Buffer).toString('utf8')) as unknown;
-      (req as unknown as Record<string, unknown>)['rawBody'] = body;
-      done(null, parsed);
+      done(null, JSON.parse((body as Buffer).toString('utf8')));
     } catch (err) {
       done(err as Error);
     }
@@ -87,7 +98,7 @@ app.post('/webhooks/github', async (req, reply) => {
     return reply.status(400).send({ error: 'Missing or invalid required GitHub webhook headers' });
   }
 
-  // ── Step 2: HMAC verification ─────────────────────────────────────────────
+  // ── Step 2: HMAC verification (runs before JSON.parse) ────────────────────
   const rawBody = (req as unknown as Record<string, unknown>)['rawBody'] as Buffer | undefined;
   if (!rawBody) {
     return reply.status(415).send({ error: 'Expected application/json webhook payload' });
@@ -97,6 +108,13 @@ app.post('/webhooks/github', async (req, reply) => {
     return reply.status(401).send({ error: 'Invalid webhook signature' });
   }
 
+  let parsedBody: Record<string, unknown>;
+  try {
+    parsedBody = JSON.parse(rawBody.toString('utf8')) as Record<string, unknown>;
+  } catch {
+    return reply.status(400).send({ error: 'Malformed JSON body' });
+  }
+
   // ── Step 3: Route by event type ───────────────────────────────────────────
 
   if (eventType === 'ping') {
@@ -104,15 +122,12 @@ app.post('/webhooks/github', async (req, reply) => {
   }
 
   if (eventType === 'installation' || eventType === 'installation_repositories') {
-    await handleInstallationEvent(req.body as Record<string, unknown>);
+    await handleInstallationEvent(parsedBody);
     return reply.send({ received: true });
   }
 
   if (eventType === 'pull_request') {
-    const result = await handlePullRequestEvent(
-      req.body as Record<string, unknown>,
-      deliveryId,
-    );
+    const result = await handlePullRequestEvent(parsedBody, deliveryId);
     return reply.send(result);
   }
 
@@ -175,6 +190,16 @@ async function handlePullRequestEvent(
 
   // 'closed' PRs are handled by the Phase 4 reconciler
   if (payload.action === 'closed') {
+    return { received: true, ignored: true };
+  }
+
+  // Reject PRs originating from external or deleted forks so untrusted code never runs in BuildKit
+  const headRepo = payload.pull_request.head.repo;
+  if (headRepo === null || (headRepo !== undefined && headRepo.id !== payload.repository.id)) {
+    app.log.warn(
+      { headRepoId: headRepo?.id ?? null, baseRepoId: payload.repository.id },
+      'Ignoring pull_request from external or deleted fork',
+    );
     return { received: true, ignored: true };
   }
 

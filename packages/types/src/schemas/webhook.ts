@@ -16,6 +16,13 @@ export const GitHubRefSchema = z.object({
     .transform((s) => s.toLowerCase()),
   ref: z.string().max(255),
   label: z.string().max(512).optional(),
+  repo: z
+    .object({
+      id: z.number().int().positive(),
+      full_name: z.string().max(260).optional(),
+    })
+    .nullable()
+    .optional(),
 });
 
 export const GitHubRepositorySchema = z.object({
