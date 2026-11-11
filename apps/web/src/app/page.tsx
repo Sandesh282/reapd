@@ -16,6 +16,7 @@ import {
 } from '../lib/api';
 
 const POLL_INTERVAL_MS = 3000;
+const POLL_TIMEOUT_MS = 10_000;
 const FILTER_DEBOUNCE_MS = 250;
 
 export default function DeploymentsListPage(): React.ReactElement {
@@ -53,12 +54,16 @@ export default function DeploymentsListPage(): React.ReactElement {
       }
 
       inFlight = true;
+      const reqSignal =
+        typeof AbortSignal.any === 'function' && typeof AbortSignal.timeout === 'function'
+          ? AbortSignal.any([controller.signal, AbortSignal.timeout(POLL_TIMEOUT_MS)])
+          : controller.signal;
       try {
         const list = await fetchDeployments({
           ...(debouncedRepo.trim() ? { repo: debouncedRepo.trim() } : {}),
           ...(parsedPr !== undefined ? { pr: parsedPr } : {}),
           limit: 50,
-          signal: controller.signal,
+          signal: reqSignal,
         });
         if (!active) return;
         setDeployments(list);

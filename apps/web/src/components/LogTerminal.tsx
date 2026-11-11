@@ -191,7 +191,7 @@ export default function LogTerminal({
     <div className="terminal-card">
       <div className="terminal-header">
         <div className="terminal-title">
-          <span>Build Log Stream (`logs:build:{deploymentId.slice(0, 8)}…`)</span>
+          <span>Build Log Stream (logs:build:{deploymentId.slice(0, 8)}…)</span>
           <span className="terminal-meta">{lineCount} lines</span>
         </div>
         <div className="terminal-status">
@@ -214,12 +214,6 @@ export default function LogTerminal({
           )}
         </div>
       </div>
-
-      {connState === 'expired' && lineCount === 0 && (
-        <div className="logs-expired-banner">
-          Build logs for this deployment have expired from Redis (24-hour stream TTL).
-        </div>
-      )}
 
       <div
         ref={containerRef}

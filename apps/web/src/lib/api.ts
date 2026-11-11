@@ -72,7 +72,7 @@ export function formatPreviewHost(previewUrl: string, fallbackSubdomain?: string
   try {
     return new URL(previewUrl).host;
   } catch {
-    return fallbackSubdomain ? `${fallbackSubdomain}.preview.localhost` : previewUrl;
+    return previewUrl || fallbackSubdomain || '—';
   }
 }
 
