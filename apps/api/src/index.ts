@@ -32,6 +32,8 @@ try {
 // ── Config ────────────────────────────────────────────────────────────────────
 
 const PORT = Number(process.env['PORT'] ?? 3001);
+// Loopback by default; set HOST=0.0.0.0 explicitly to expose the API (e.g. inside a container).
+const HOST = process.env['HOST'] ?? '127.0.0.1';
 const WEBHOOK_SECRET = process.env['GITHUB_WEBHOOK_SECRET'] ?? '';
 const REDIS_URL = process.env['REDIS_URL'] ?? 'redis://localhost:6379';
 const BUILD_QUEUE_NAME = process.env['REAPD_BUILD_QUEUE'] ?? 'build';
@@ -343,8 +345,8 @@ function verifySignature(rawBody: Buffer, sigHeader: string, secret: string): bo
 // ── Boot ──────────────────────────────────────────────────────────────────────
 
 try {
-  await app.listen({ port: PORT, host: '0.0.0.0' });
-  console.log(`🚀 API server listening on :${PORT}`);
+  await app.listen({ port: PORT, host: HOST });
+  console.log(`🚀 API server listening on ${HOST}:${PORT}`);
 } catch (err) {
   app.log.error(err);
   process.exit(1);
