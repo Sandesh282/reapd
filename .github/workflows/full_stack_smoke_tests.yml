@@ -82,6 +82,10 @@ jobs:
       - name: Boot Docker Compose stack & apply PostgreSQL 17 schema
         run: |
           docker compose -f infra/docker-compose.yml up -d --wait
+          if ss -ltnH | awk '{print $4}' | grep -E '^(0\.0\.0\.0|\*|\[::\]):(80|443|8080|5432|6379|2375)$'; then
+            echo "❌ One or more published stack ports are listening on all interfaces instead of 127.0.0.1"
+            exit 1
+          fi
           docker exec -i reapd-postgres psql -U reapd -d reapd < packages/db/src/migrations/0001_initial_schema.sql
 
       - name: Run ${{ matrix.gate.script }}

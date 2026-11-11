@@ -21,9 +21,9 @@ services:
     container_name: reapd-traefik
     restart: unless-stopped
     ports:
-      - "80:80"        # HTTP (redirects → HTTPS)
-      - "443:443"      # HTTPS wildcard *.preview.localhost
-      - "8080:8080"    # Traefik dashboard (dev only)
+      - "127.0.0.1:80:80"        # HTTP (redirects → HTTPS), loopback only
+      - "127.0.0.1:443:443"      # HTTPS wildcard *.preview.localhost, loopback only
+      - "127.0.0.1:8080:8080"    # Traefik dashboard (dev only, loopback)
     volumes:
       - ./traefik/traefik.yml:/etc/traefik/traefik.yml:ro
       - ./traefik/dynamic:/etc/traefik/dynamic:ro
@@ -82,7 +82,7 @@ services:
       POSTGRES_PASSWORD: reapd_dev_password
       POSTGRES_DB: reapd
     ports:
-      - "5432:5432"    # Exposed for local psql / Drizzle Studio access
+      - "127.0.0.1:5432:5432"    # Loopback only: local psql / Drizzle Studio access
     volumes:
       - postgres_data:/var/lib/postgresql/data
     networks:
@@ -101,7 +101,7 @@ services:
     restart: unless-stopped
     command: redis-server --maxmemory 256mb --maxmemory-policy noeviction --save ""
     ports:
-      - "6379:6379"    # Exposed for local redis-cli / BullMQ access
+      - "127.0.0.1:6379:6379"    # Loopback only (no password in dev): local redis-cli / BullMQ access
     networks:
       - control-internal
     healthcheck:
