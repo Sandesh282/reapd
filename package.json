@@ -2,6 +2,7 @@
   "name": "reapd",
   "version": "0.0.1",
   "private": true,
+  "packageManager": "npm@11.19.0",
   "description": "Ephemeral PR preview & automated smoke-testing platform",
   "workspaces": [
     "apps/*",
