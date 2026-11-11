@@ -248,7 +248,7 @@ test('createLogSink handles a 1,500-line synchronous stdout burst with zero drop
   assert.equal(fake.xadds[1499]?.text, 'burst-line-1500');
 });
 
-test('createLogSink drops oldest lines when maxQueueSize is exceeded and surfaces both rejected and tuple-level pipeline.exec() errors without throwing', async () => {
+test('createLogSink drops oldest lines when maxQueueSize is exceeded and surfaces both rejected and tuple-level pipeline.exec() errors without throwing', async (t) => {
   const deploymentId = '00000000-0000-0000-0000-000000000502';
   const fake = createFakeRedis({ delayMs: 25 });
   const sink = createLogSink({
@@ -265,13 +265,19 @@ test('createLogSink drops oldest lines when maxQueueSize is exceeded and surface
 
   const texts = fake.xadds.map((x) => x.text);
   assert.ok(
-    texts.some((t) => t.includes('log line(s) dropped due to backpressure')),
+    texts.some((line) => line.includes('log line(s) dropped due to backpressure')),
     'expected backpressure drop notice in stream',
   );
   assert.equal(texts.at(-1), 'line-6', 'newest lines must be preserved when oldest are dropped');
 
-  // Verify tuple-level OOM errors (`[[Error("OOM..."), null]]`) and rejected promises are caught & rate-limited
-  const tupleErrorFake = createFakeRedis({ tupleErrorCount: 5, failExecCount: 2 });
+  // Verify tuple-level OOM errors (`[[Error("OOM..."), null]]`) and rejected promises are caught,
+  // rate-limited during batch flushes, and always reported with suppressed count on `end()`.
+  const warnings: string[] = [];
+  t.mock.method(console, 'warn', (...args: unknown[]) => {
+    warnings.push(args.map(String).join(' '));
+  });
+
+  const tupleErrorFake = createFakeRedis({ tupleErrorCount: 5 });
   const resilientSink = createLogSink({
     deploymentId,
     redis: tupleErrorFake.client,
@@ -282,4 +288,48 @@ test('createLogSink drops oldest lines when maxQueueSize is exceeded and surface
   }
   await assert.doesNotReject(() => resilientSink.flush());
   await assert.doesNotReject(() => resilientSink.end('FAILED'));
+
+  assert.equal(warnings.length, 2, 'expected 1 rate-limited batch warning + 1 unthrottled end-marker warning');
+  assert.match(warnings[0] ?? '', /OOM command not allowed/, 'first batch warning must surface tuple-level OOM error');
+  assert.match(
+    warnings[1] ?? '',
+    /Failed to write end marker \(FAILED\).*OOM command not allowed.*\(\+3 earlier warning\(s\) suppressed\)/,
+    'end() warning must bypass rate limiter and report suppressed batch warning count',
+  );
+});
+
+test('createLogSink handles Redis ready timeout gracefully and fast-fails subsequent flushes without re-waiting', async (t) => {
+  const deploymentId = '00000000-0000-0000-0000-000000000504';
+  const warnings: string[] = [];
+  t.mock.method(console, 'warn', (...args: unknown[]) => {
+    warnings.push(args.map(String).join(' '));
+  });
+
+  // Fake stays in 'connecting' forever (`readyAfterMs` omitted)
+  const stuckFake = createFakeRedis({ initialStatus: 'connecting' });
+  const sink = createLogSink({
+    deploymentId,
+    redis: stuckFake.client,
+    readyTimeoutMs: 30,
+  });
+
+  sink.write('system', 'stdout', 'line-1');
+  sink.write('system', 'stdout', 'line-2');
+  await assert.doesNotReject(() => sink.flush());
+  assert.equal(stuckFake.xadds.length, 0, 'no entries should be written when Redis never reaches ready');
+
+  // Subsequent flush + end should fail immediately via `readyTimedOut` without waiting another 30ms each
+  const startMs = Date.now();
+  sink.write('system', 'stdout', 'line-3');
+  await assert.doesNotReject(() => sink.flush());
+  await assert.doesNotReject(() => sink.end('FAILED'));
+  const elapsedMs = Date.now() - startMs;
+
+  assert.ok(elapsedMs < 25, `expected fast-fail after initial ready timeout, took ${elapsedMs}ms`);
+  assert.equal(warnings.length, 2);
+  assert.match(warnings[0] ?? '', /Redis not ready \(dropped 2 line\(s\)\)/);
+  assert.match(
+    warnings[1] ?? '',
+    /Failed to write end marker \(FAILED\).*remains unavailable.*\(\+1 earlier warning\(s\) suppressed\)/,
+  );
 });

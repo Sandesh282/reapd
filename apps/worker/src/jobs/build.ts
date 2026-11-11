@@ -121,6 +121,7 @@ export async function buildJobHandler(job: Job<BuildJobPayload>): Promise<void> 
 
     // Initialize log sink ONLY after QUEUED → BUILDING succeeds so early-return jobs
     // on already-terminal deployments never create an empty stream key in Redis.
+    // `createLogSink` falls back to a no-op sink with a warning if Redis config is missing/invalid.
     sink = createLogSink({ deploymentId, redisUrl });
     sink.write(
       'system',

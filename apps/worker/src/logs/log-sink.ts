@@ -151,6 +151,10 @@ function assertPipelineExecSucceeded(res: PipelineExecResult): void {
  * injected unit-test clients that do not expose `.status`). Because the sink uses
  * `enableOfflineQueue: false`, sending `pipeline.exec()` before the TCP + AUTH handshake
  * finishes would otherwise reject and drop the very first build log lines.
+ *
+ * Intentionally does NOT reject on the first `error` event: ioredis retries transient first-connect
+ * errors after ~50ms, so letting `timeoutMs` bound the wait preserves buffered boot lines across
+ * brief connection hiccups.
  */
 async function waitForRedisReady(client: LogRedisClient, timeoutMs: number): Promise<void> {
   if (!client.status || client.status === 'ready' || !client.once) {
@@ -166,18 +170,12 @@ async function waitForRedisReady(client: LogRedisClient, timeoutMs: number): Pro
       cleanup();
       resolve();
     };
-    const onError = (err: unknown): void => {
-      cleanup();
-      reject(err instanceof Error ? err : new Error(String(err)));
-    };
     const cleanup = (): void => {
       clearTimeout(timer);
       client.off?.('ready', onReady);
-      client.off?.('error', onError);
     };
 
     client.once?.('ready', onReady);
-    client.once?.('error', onError);
   });
 }
 
@@ -202,17 +200,36 @@ export function createLogSink(opts: CreateLogSinkOptions): LogSink {
   } else {
     const resolvedUrl = opts.redisUrl ?? process.env['REDIS_URL'];
     if (!resolvedUrl) {
-      throw new Error('createLogSink requires `redisUrl` or `REDIS_URL` environment variable');
+      console.warn(
+        `⚠️  [log-sink] REDIS_URL is not set for ${deploymentId} — disabling build log sink`,
+      );
+      return {
+        write: () => {},
+        flush: async () => {},
+        end: async () => {},
+      };
     }
-    const ioredis = new Redis(resolvedUrl, {
-      enableOfflineQueue: false,
-      maxRetriesPerRequest: 1,
-      commandTimeout: 3000,
-      lazyConnect: false,
-    });
-    // Attach a no-op error listener so transient connection errors never crash the process as unhandled
-    ioredis.on('error', () => {});
-    redis = ioredis;
+    try {
+      const ioredis = new Redis(resolvedUrl, {
+        enableOfflineQueue: false,
+        maxRetriesPerRequest: 1,
+        commandTimeout: 3000,
+        lazyConnect: false,
+      });
+      // Attach a no-op error listener so transient connection errors never crash the process as unhandled
+      ioredis.on('error', () => {});
+      redis = ioredis;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.warn(
+        `⚠️  [log-sink] Failed to initialize Redis client for ${deploymentId}: ${redactSecrets(msg)}`,
+      );
+      return {
+        write: () => {},
+        flush: async () => {},
+        end: async () => {},
+      };
+    }
   }
 
   const queue: PendingLogLine[] = [];
@@ -222,6 +239,9 @@ export function createLogSink(opts: CreateLogSinkOptions): LogSink {
   let microtaskScheduled = false;
   let lastWarnAt = 0;
   let suppressedWarnings = 0;
+  // Once a connection readiness wait times out, skip waiting on subsequent flushes unless
+  // the client recovers (`status === 'ready'`), avoiding repeated 3s stalls per build phase.
+  let readyTimedOut = false;
 
   function warnRateLimited(context: string, err: unknown): void {
     const now = Date.now();
@@ -236,11 +256,27 @@ export function createLogSink(opts: CreateLogSinkOptions): LogSink {
     }
   }
 
+  async function ensureRedisReady(): Promise<void> {
+    if (redis.status === 'ready') {
+      readyTimedOut = false;
+      return;
+    }
+    if (readyTimedOut) {
+      throw new Error(`Redis log sink remains unavailable after earlier timeout (status=${redis.status})`);
+    }
+    try {
+      await waitForRedisReady(redis, readyTimeoutMs);
+    } catch (err) {
+      readyTimedOut = true;
+      throw err;
+    }
+  }
+
   async function drainLoop(): Promise<void> {
     try {
       while (queue.length > 0 || droppedCount > 0) {
         try {
-          await waitForRedisReady(redis, readyTimeoutMs);
+          await ensureRedisReady();
         } catch (err) {
           // Discard the current backlog so we don't spin infinitely when Redis is down on boot
           const lost = queue.length + droppedCount;
@@ -352,7 +388,7 @@ export function createLogSink(opts: CreateLogSinkOptions): LogSink {
 
     try {
       await flush();
-      await waitForRedisReady(redis, readyTimeoutMs);
+      await ensureRedisReady();
 
       const endText = formatBuildLogEndMarker(finalStatus);
       const pipe = redis.pipeline();
@@ -375,7 +411,12 @@ export function createLogSink(opts: CreateLogSinkOptions): LogSink {
       const execResult = await pipe.exec();
       assertPipelineExecSucceeded(execResult);
     } catch (err) {
-      warnRateLimited(`Failed to write end marker (${finalStatus})`, err);
+      // Always emit the end-marker failure (bypassing the 5s rate limiter) and flush any
+      // suppressed warning count so an outage never hides the missing terminal stream marker.
+      const msg = err instanceof Error ? err.message : String(err);
+      const suffix = suppressedWarnings > 0 ? ` (+${suppressedWarnings} earlier warning(s) suppressed)` : '';
+      suppressedWarnings = 0;
+      console.warn(`⚠️  [log-sink] Failed to write end marker (${finalStatus}) for ${deploymentId}: ${msg}${suffix}`);
     } finally {
       if (ownsRedis) {
         await redis.quit().catch(() => {

@@ -261,6 +261,11 @@ if [[ "$STREAM_LEN" -lt 4 ]] || [[ "$STREAM_TTL" -le 21600 ]] || [[ "$FIRST_ENTR
   echo "❌ FAIL: expected Redis build stream $STREAM_KEY to preserve first '-> BUILDING' line ($FIRST_ENTRY), have ttl > 21600 ($STREAM_TTL), and end with 'end:LIVE' ($LAST_ENTRY)"
   exit 1
 fi
+if grep -q '\[log-sink\]' "$WORKER_LOG"; then
+  echo "❌ FAIL: unexpected [log-sink] warning in worker log during healthy build"
+  cat "$WORKER_LOG"
+  exit 1
+fi
 echo "📡 Redis stream $STREAM_KEY verified (len=$STREAM_LEN, mem=${STREAM_MEM}B, ttl=${STREAM_TTL}s, first='-> BUILDING', tail='end:LIVE')"
 
 echo "✅ PASS: Phase 3 verification gate complete (HMAC -> idempotency -> BullMQ -> BuildKit -> Traefik LIVE -> audit trail)"
