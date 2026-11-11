@@ -14,6 +14,7 @@ import { startReconciler } from './reconciler/index.js';
 export * from './builder/git-clone.js';
 export * from './builder/image-builder.js';
 export * from './jobs/build.js';
+export * from './logs/log-sink.js';
 export * from './reconciler/index.js';
 
 function checkIsMainModule(): boolean {

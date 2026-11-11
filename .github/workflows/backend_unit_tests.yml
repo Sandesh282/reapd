@@ -36,6 +36,7 @@ jobs:
             "packages/docker-client/src/log-demux.test.ts"
             "packages/db/src/repositories/deployments.test.ts"
             "apps/worker/src/builder/git-clone.test.ts"
+            "apps/worker/src/logs/log-sink.test.ts"
             "apps/worker/src/reconciler/reconciler.test.ts"
           )
           for f in "${REQUIRED_TESTS[@]}"; do
