@@ -188,6 +188,10 @@ void test('runPlaywrightSmokeCheck records PASSED, FAILED, TIMED_OUT, SKIPPED, a
     timeoutMs: 30,
     probePage: async ({ signal }): Promise<SmokeCheckProbeResult> => {
       await new Promise<void>((_, reject) => {
+        if (signal.aborted) {
+          reject(new Error('Navigation timeout exceeded'));
+          return;
+        }
         signal.addEventListener('abort', () => reject(new Error('Navigation timeout exceeded')), {
           once: true,
         });

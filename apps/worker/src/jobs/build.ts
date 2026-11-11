@@ -411,7 +411,7 @@ export async function buildJobHandler(job: Job<BuildJobPayload>): Promise<void> 
     finalBuildStatus = 'FAILED';
     if (sink) {
       sink.write('system', 'stderr', `[reapd] Build failed: ${reason}`);
-      await sink.end('FAILED');
+      await sink.flush();
     }
 
     const failTrans = await transitionDeploymentStatus(db, {
@@ -422,6 +422,10 @@ export async function buildJobHandler(job: Job<BuildJobPayload>): Promise<void> 
       console.warn(`⚠️  Failed to record FAILED status for ${deploymentId}:`, dbErr);
       return null;
     });
+
+    if (sink) {
+      await sink.end('FAILED');
+    }
 
     if (deployment && failTrans?.finalStatus === 'FAILED') {
       await bestEffortPostStickyPrComment({

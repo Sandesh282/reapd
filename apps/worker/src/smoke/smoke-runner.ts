@@ -470,7 +470,11 @@ export async function runPlaywrightSmokeCheck(
   const startMs = Date.now();
   const timeoutMs = opts.timeoutMs ?? DEFAULT_SMOKE_TIMEOUT_MS;
   const settleWaitMs = opts.settleWaitMs ?? DEFAULT_SETTLE_WAIT_MS;
-  const timeoutSignal = AbortSignal.timeout(timeoutMs);
+  const timeoutAc = new AbortController();
+  const timeoutTimer = setTimeout(() => {
+    timeoutAc.abort(new Error('Smoke check timeout exceeded'));
+  }, timeoutMs);
+  const timeoutSignal = timeoutAc.signal;
   const combinedSignal = opts.signal
     ? AbortSignal.any([opts.signal, timeoutSignal])
     : timeoutSignal;
@@ -558,5 +562,7 @@ export async function runPlaywrightSmokeCheck(
       consoleErrorCount: 0,
       failureMessage,
     };
+  } finally {
+    clearTimeout(timeoutTimer);
   }
 }
