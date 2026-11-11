@@ -7,19 +7,22 @@
     "build": "next build",
     "start": "next start",
     "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test 'src/**/*.test.ts'",
     "lint": "next lint"
   },
   "dependencies": {
+    "@reapd/types": "*",
+    "@xterm/addon-fit": "^0.11.0",
+    "@xterm/xterm": "^6.0.0",
     "next": "^15.0.4",
     "react": "^19.0.0",
-    "react-dom": "^19.0.0",
-    "@reapd/types": "*"
+    "react-dom": "^19.0.0"
   },
   "devDependencies": {
+    "@types/node": "^22.10.1",
     "@types/react": "^19.0.1",
     "@types/react-dom": "^19.0.1",
-    "typescript": "^5.7.2",
-    "@types/node": "^22.10.1"
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
   }
 }
-
