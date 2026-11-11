@@ -271,10 +271,10 @@ export function createLogSink(opts: CreateLogSinkOptions): LogSink {
       readyTimedOut = false;
       return;
     }
-    const errSuffix = lastRedisError ? `, lastError=${lastRedisError}` : '';
     if (readyTimedOut) {
+      const detail = lastRedisError ? `, lastError=${lastRedisError}` : '';
       throw new Error(
-        `Redis log sink remains unavailable after earlier timeout (status=${redis.status}${errSuffix})`,
+        `Redis log sink remains unavailable after earlier timeout (status=${redis.status}${detail})`,
       );
     }
     try {
@@ -282,7 +282,8 @@ export function createLogSink(opts: CreateLogSinkOptions): LogSink {
     } catch (err) {
       readyTimedOut = true;
       const baseMsg = err instanceof Error ? err.message : String(err);
-      throw new Error(`${baseMsg}${errSuffix}`);
+      const detail = lastRedisError ? `, lastError=${lastRedisError}` : '';
+      throw new Error(`${baseMsg}${detail}`);
     }
   }
 

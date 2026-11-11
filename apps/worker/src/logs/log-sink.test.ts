@@ -325,14 +325,16 @@ test('createLogSink handles Redis ready timeout gracefully, includes lastRedisEr
     warnings.push(args.map(String).join(' '));
   });
 
-  // Fake stays in 'connecting' forever (`readyAfterMs` omitted) and emits an auth error with a Redis URL secret
+  // Fake stays in 'connecting' forever (`readyAfterMs` omitted) and emits an auth error mid-wait (after 50ms)
   const stuckFake = createFakeRedis({ initialStatus: 'connecting' });
   const sink = createLogSink({
     deploymentId,
     redis: stuckFake.client,
     readyTimeoutMs: 200,
   });
-  stuckFake.emitError(new Error('NOAUTH Authentication required at redis://:supersecretpass@127.0.0.1:6379'));
+  setTimeout(() => {
+    stuckFake.emitError(new Error('NOAUTH Authentication required at redis://:supersecretpass@127.0.0.1:6379'));
+  }, 50);
 
   sink.write('system', 'stdout', 'line-1');
   sink.write('system', 'stdout', 'line-2');
