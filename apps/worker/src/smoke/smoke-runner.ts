@@ -3,26 +3,44 @@
 //
 // Navigates to the preview URL during the `TESTING` state and verifies:
 //   1. HTTP response status < 400
-//   2. Non-empty root DOM node (`document.body` contains visible/non-empty content)
+//   2. Non-empty rendered root DOM (`innerText.trim().length > 0` or rendered visual media
+//      element `img|canvas|svg|video|iframe`, so a blank SPA shell with only `<div id="root"></div><script>`
+//      fails as intended)
 //   3. Zero uncaught `pageerror` exceptions and zero `console.error` events
 //
 // Design invariants:
-//   - Respects the job's `AbortSignal` (`ac.signal`) so a supersede cancel signal
-//     immediately aborts an in-flight browser check and tears down the browser.
-//   - Uses `--host-resolver-rules=MAP *.localhost 127.0.0.1` and `ignoreHTTPSErrors: true`
-//     when launching headless Chromium so `https://pr-N.preview.localhost` resolves
-//     deterministically across macOS and Linux CI.
-//   - Injectable `browserCheck` seam for fast, deterministic unit tests and environments
-//     where a Chromium binary is not installed.
+//   - Secret redaction BEFORE truncation (`redactSecrets` on every console/page error and exception
+//     message before slicing to 200 chars and joining to 500 chars) so page-logged tokens can never
+//     leak into `test_runs.failure_message`, `deployments.failure_reason`, or the unauthenticated API.
+//   - Graceful `SKIPPED` handling via `SmokeUnavailableError`: if no Chromium binary is installed
+//     on the host (or `chromium.launch` fails before any page navigation), the smoke check records
+//     `status: 'SKIPPED'` rather than failing the user's deployment. Provision Chromium via
+//     `npx playwright install chromium` or `PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH`.
+//   - SSRF / loopback request guard (`page.route('**/*', ...)`): aborts any subresource or fetch
+//     request targeting a hostname other than the preview's own hostname so PR-authored JS cannot
+//     probe loopback control-plane services (`127.0.0.1:3001`, Postgres, Redis, socket-proxy).
+//   - Conditional `--no-sandbox`: enabled only when running as root (`process.getuid?.() === 0`)
+//     or when `REAPD_CHROMIUM_NO_SANDBOX=1` is explicitly set.
 
 import { existsSync } from 'node:fs';
-import { chromium } from 'playwright-core';
+import { chromium, type Browser } from 'playwright-core';
 import { AbortError } from '@reapd/docker-client';
 import type { TestRunStatus } from '@reapd/types';
+import { redactSecrets } from '../logs/log-sink.js';
+
+export class SmokeUnavailableError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'SmokeUnavailableError';
+  }
+}
 
 export interface SmokeCheckProbeResult {
   httpStatus: number;
-  hasNonEmptyRootDom: boolean;
+  /** Rendered visible text (`document.body.innerText`) or fallback text content */
+  renderedText: string;
+  /** Whether the body contains a visual media/canvas element (`img,canvas,svg,video,iframe`) */
+  hasVisualElement: boolean;
   consoleErrors: string[];
   pageErrors: string[];
 }
@@ -50,7 +68,10 @@ export interface SmokeTestRunSummary {
 }
 
 const DEFAULT_SMOKE_TIMEOUT_MS = 15_000;
-const DEFAULT_SETTLE_WAIT_MS = 150;
+const DEFAULT_SETTLE_WAIT_MS = 350;
+const BROWSER_CLOSE_TIMEOUT_MS = 3_000;
+const PER_ERROR_MAX_CHARS = 200;
+const FAILURE_MESSAGE_MAX_CHARS = 500;
 
 const SYSTEM_CHROMIUM_CANDIDATES = [
   '/usr/bin/google-chrome-stable',
@@ -61,11 +82,19 @@ const SYSTEM_CHROMIUM_CANDIDATES = [
   '/Applications/Chromium.app/Contents/MacOS/Chromium',
 ];
 
+/** Redacts secrets BEFORE truncating a single error string to `maxChars`. */
+export function sanitizeSmokeErrorText(raw: string, maxChars: number = PER_ERROR_MAX_CHARS): string {
+  const redacted = redactSecrets(raw).replace(/\s+/g, ' ').trim();
+  if (redacted.length <= maxChars) return redacted;
+  return `${redacted.slice(0, maxChars)}...`;
+}
+
 /** Resolves a Chromium/Chrome executable path (Playwright bundled or system-installed). */
 export function resolveChromiumExecutablePath(): string | undefined {
   const fromEnv = process.env['PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH']?.trim();
-  if (fromEnv && existsSync(fromEnv)) {
-    return fromEnv;
+  if (fromEnv) {
+    if (existsSync(fromEnv)) return fromEnv;
+    return undefined;
   }
   try {
     const pwDefault = chromium.executablePath();
@@ -83,13 +112,31 @@ export function resolveChromiumExecutablePath(): string | undefined {
   return undefined;
 }
 
+/** Bounds `browser.close()` with a 3s timer so a wedged Chromium process never hangs the worker. */
+async function closeBrowserBounded(browser: Browser): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  try {
+    await Promise.race([
+      browser.close(),
+      new Promise<void>((resolve) => {
+        timer = setTimeout(resolve, BROWSER_CLOSE_TIMEOUT_MS);
+      }),
+    ]);
+  } catch {
+    // ignore close errors
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 /**
  * Default Playwright Chromium page probe:
- *   - Launches headless Chromium with `--host-resolver-rules=MAP *.localhost 127.0.0.1`
- *   - Collects `console.error` and `pageerror` events
- *   - Navigates to `previewUrl` (`waitUntil: 'domcontentloaded'`)
- *   - Checks `document.body.innerHTML.trim().length > 0`
- *   - Guaranteed `browser.close()` in `finally` and immediate teardown on `signal` abort
+ *   - Throws `SmokeUnavailableError` if no Chromium executable exists or `chromium.launch` fails
+ *   - Uses `--host-resolver-rules=MAP *.localhost 127.0.0.1`
+ *   - Enforces same-host request policy via `page.route` so preview JS cannot
+ *     issue requests to loopback control-plane ports (`127.0.0.1:3001`, etc.)
+ *   - Waits for `load` + `settleWaitMs` so React/SPA hydration errors are captured
+ *   - Evaluates rendered `innerText` and visual media elements rather than raw `<script>` markup
  */
 export async function probeWithPlaywrightChromium(opts: {
   previewUrl: string;
@@ -102,19 +149,34 @@ export async function probeWithPlaywrightChromium(opts: {
   }
 
   const executablePath = resolveChromiumExecutablePath();
-  const browser = await chromium.launch({
-    headless: true,
-    ...(executablePath ? { executablePath } : {}),
-    args: [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage',
-      '--host-resolver-rules=MAP *.localhost 127.0.0.1, MAP *.preview.localhost 127.0.0.1',
-    ],
-  });
+  if (!executablePath) {
+    throw new SmokeUnavailableError(
+      'No Chromium executable found (install via `npx playwright install chromium` or set PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH)',
+    );
+  }
+
+  const isRoot = typeof process.getuid === 'function' && process.getuid() === 0;
+  const forceNoSandbox = process.env['REAPD_CHROMIUM_NO_SANDBOX'] === '1' || isRoot;
+  const launchArgs = [
+    '--disable-dev-shm-usage',
+    '--host-resolver-rules=MAP *.localhost 127.0.0.1',
+    ...(forceNoSandbox ? ['--no-sandbox', '--disable-setuid-sandbox'] : []),
+  ];
+
+  let browser: Browser;
+  try {
+    browser = await chromium.launch({
+      headless: true,
+      executablePath,
+      args: launchArgs,
+    });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    throw new SmokeUnavailableError(`Failed to launch Chromium: ${sanitizeSmokeErrorText(msg)}`);
+  }
 
   const onAbort = (): void => {
-    void browser.close().catch(() => {});
+    void closeBrowserBounded(browser);
   };
   opts.signal.addEventListener('abort', onAbort, { once: true });
 
@@ -123,26 +185,46 @@ export async function probeWithPlaywrightChromium(opts: {
       throw new AbortError('Smoke test aborted after browser launch');
     }
 
+    const expectedHost = new URL(opts.previewUrl).hostname.toLowerCase();
     const context = await browser.newContext({
       ignoreHTTPSErrors: true,
     });
     const page = await context.newPage();
+
+    // Block cross-host / loopback SSRF requests initiated by preview page scripts
+    await page.route('**/*', async (route) => {
+      const reqUrl = route.request().url();
+      if (reqUrl.startsWith('data:') || reqUrl.startsWith('blob:') || reqUrl.startsWith('about:')) {
+        await route.continue();
+        return;
+      }
+      try {
+        const parsed = new URL(reqUrl);
+        if (parsed.hostname.toLowerCase() === expectedHost) {
+          await route.continue();
+          return;
+        }
+      } catch {
+        // fall through to abort
+      }
+      await route.abort('blockedbyclient');
+    });
 
     const consoleErrors: string[] = [];
     const pageErrors: string[] = [];
 
     page.on('console', (msg) => {
       if (msg.type() === 'error') {
-        consoleErrors.push(msg.text());
+        consoleErrors.push(sanitizeSmokeErrorText(msg.text()));
       }
     });
 
     page.on('pageerror', (err) => {
-      pageErrors.push(err.message || String(err));
+      pageErrors.push(sanitizeSmokeErrorText(err.message || String(err)));
     });
 
     const response = await page.goto(opts.previewUrl, {
-      waitUntil: 'domcontentloaded',
+      waitUntil: 'load',
       timeout: opts.timeoutMs,
     });
 
@@ -165,29 +247,45 @@ export async function probeWithPlaywrightChromium(opts: {
     }
 
     const httpStatus = response ? response.status() : 599;
-    const hasNonEmptyRootDom = await page.evaluate(() => {
-      const doc = (globalThis as unknown as { document?: { body?: { innerHTML?: string } } }).document;
-      const html = doc?.body?.innerHTML ?? '';
-      return html.trim().length > 0;
+    const domSnapshot = await page.evaluate(() => {
+      const doc = (
+        globalThis as unknown as {
+          document?: {
+            body?: {
+              innerText?: string;
+              querySelector?: (sel: string) => unknown;
+            };
+          };
+        }
+      ).document;
+      const body = doc?.body;
+      const renderedText = (body?.innerText ?? '').trim();
+      const hasVisualElement = Boolean(
+        body?.querySelector?.('img,canvas,svg,video,iframe'),
+      );
+      return { renderedText, hasVisualElement };
     });
 
     return {
       httpStatus,
-      hasNonEmptyRootDom,
+      renderedText: domSnapshot.renderedText,
+      hasVisualElement: domSnapshot.hasVisualElement,
       consoleErrors,
       pageErrors,
     };
   } finally {
     opts.signal.removeEventListener('abort', onAbort);
-    await browser.close().catch(() => {});
+    await closeBrowserBounded(browser);
   }
 }
 
 /**
  * Evaluates a `SmokeCheckProbeResult` against PRD §6.4 criteria:
  *   1. `httpStatus < 400`
- *   2. `hasNonEmptyRootDom === true`
+ *   2. Rendered content present (`renderedText.trim().length > 0 || hasVisualElement === true`)
  *   3. `pageErrors.length === 0 && consoleErrors.length === 0`
+ *
+ * All error messages are redacted BEFORE per-item and total truncation.
  */
 export function evaluateSmokeProbe(probe: SmokeCheckProbeResult): {
   passed: boolean;
@@ -200,14 +298,16 @@ export function evaluateSmokeProbe(probe: SmokeCheckProbeResult): {
   if (probe.httpStatus >= 400) {
     reasons.push(`HTTP status ${probe.httpStatus} (expected < 400)`);
   }
-  if (!probe.hasNonEmptyRootDom) {
-    reasons.push('Empty root DOM node (document.body had no content)');
+  const hasRenderedContent =
+    probe.renderedText.trim().length > 0 || probe.hasVisualElement;
+  if (!hasRenderedContent) {
+    reasons.push('Empty rendered root DOM (document.body had no visible text or media)');
   }
   for (const err of probe.pageErrors) {
-    reasons.push(`Uncaught pageerror: ${err}`);
+    reasons.push(`Uncaught pageerror: ${sanitizeSmokeErrorText(err)}`);
   }
   for (const err of probe.consoleErrors) {
-    reasons.push(`console.error: ${err}`);
+    reasons.push(`console.error: ${sanitizeSmokeErrorText(err)}`);
   }
 
   if (reasons.length === 0) {
@@ -221,13 +321,13 @@ export function evaluateSmokeProbe(probe: SmokeCheckProbeResult): {
   return {
     passed: false,
     consoleErrorCount,
-    failureMessage: reasons.join('; ').slice(0, 500),
+    failureMessage: reasons.join('; ').slice(0, FAILURE_MESSAGE_MAX_CHARS),
   };
 }
 
 /**
  * Executes the Phase 6 smoke test against `previewUrl`.
- * Returns a `SmokeTestRunSummary` (`PASSED`, `FAILED`, or `TIMED_OUT`).
+ * Returns a `SmokeTestRunSummary` (`PASSED`, `FAILED`, `TIMED_OUT`, or `SKIPPED`).
  * Rethrows `AbortError` when cancelled via `opts.signal` so the worker's
  * superseding handler marks the deployment `SUPERSEDED` instead of `FAILED`.
  */
@@ -294,14 +394,27 @@ export async function runPlaywrightSmokeCheck(
     }
 
     const durationMs = Math.max(1, Date.now() - startMs);
-    const msg = err instanceof Error ? err.message : String(err);
+
+    if (err instanceof SmokeUnavailableError) {
+      const skipMsg = sanitizeSmokeErrorText(err.message, FAILURE_MESSAGE_MAX_CHARS);
+      opts.onLog?.('stdout', `[reapd] Smoke check SKIPPED: ${skipMsg}`);
+      return {
+        status: 'SKIPPED',
+        durationMs,
+        consoleErrorCount: 0,
+        failureMessage: skipMsg,
+      };
+    }
+
+    const rawMsg = err instanceof Error ? err.message : String(err);
+    const sanitizedMsg = sanitizeSmokeErrorText(rawMsg, 400);
     const isTimeout =
-      timeoutSignal.aborted || /timeout|timed out/i.test(msg);
+      timeoutSignal.aborted || /timeout|timed out/i.test(rawMsg);
 
     const status: TestRunStatus = isTimeout ? 'TIMED_OUT' : 'FAILED';
-    const failureMessage = `Smoke check ${status === 'TIMED_OUT' ? 'timed out' : 'error'}: ${msg}`.slice(
+    const failureMessage = `Smoke check ${status === 'TIMED_OUT' ? 'timed out' : 'error'}: ${sanitizedMsg}`.slice(
       0,
-      500,
+      FAILURE_MESSAGE_MAX_CHARS,
     );
 
     opts.onLog?.('stderr', `[reapd] ${failureMessage}`);
@@ -313,4 +426,3 @@ export async function runPlaywrightSmokeCheck(
     };
   }
 }
-

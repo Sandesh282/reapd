@@ -94,7 +94,9 @@ export async function buildJobHandler(job: Job<BuildJobPayload>): Promise<void> 
       throw new UnrecoverableError(`Deployment not found: ${deploymentId}`);
     }
 
-    const { subdomain, commitSha, generation, owner, name, installationId } = deployment;
+    const { subdomain, previewUrl, commitSha, generation, owner, name, installationId } =
+      deployment;
+    const basePreviewUrl = previewUrl.replace(/\/+$/, '');
     const shortSha = commitSha.slice(0, 7);
     // Include generation in the image tag so two generations building the same SHA
     // never delete each other's image tag during cleanup.
@@ -231,7 +233,7 @@ export async function buildJobHandler(job: Job<BuildJobPayload>): Promise<void> 
       subdomain,
     });
 
-    const healthUrl = `https://${subdomain}.preview.localhost/health`;
+    const healthUrl = `${basePreviewUrl}/health`;
     sink.write('system', 'stdout', `[reapd] Probing health endpoint ${healthUrl}...`);
     try {
       await pollUntilHealthy(healthUrl, ac.signal, { maxWaitMs: 30_000 });
@@ -257,11 +259,10 @@ export async function buildJobHandler(job: Job<BuildJobPayload>): Promise<void> 
       return;
     }
 
-    const previewUrl = `https://${subdomain}.preview.localhost`;
     let smokeResult;
     try {
       smokeResult = await runPlaywrightSmokeCheck({
-        previewUrl,
+        previewUrl: basePreviewUrl,
         signal: ac.signal,
         onLog: (stream, line) => {
           console.log(`[smoke:${subdomain}] ${redactSecrets(line)}`);
@@ -283,7 +284,7 @@ export async function buildJobHandler(job: Job<BuildJobPayload>): Promise<void> 
       console.warn(`⚠️  Failed to record test_run for ${deploymentId}:`, dbErr);
     });
 
-    if (smokeResult.status !== 'PASSED') {
+    if (smokeResult.status === 'FAILED' || smokeResult.status === 'TIMED_OUT') {
       await forceRemoveContainer(docker, container.id).catch(() => {});
       throw new Error(
         smokeResult.failureMessage ?? `Playwright smoke check ${smokeResult.status}`,
@@ -308,9 +309,9 @@ export async function buildJobHandler(job: Job<BuildJobPayload>): Promise<void> 
       return;
     }
 
-    sink.write('system', 'stdout', `[reapd] Preview LIVE at https://${subdomain}.preview.localhost`);
+    sink.write('system', 'stdout', `[reapd] Preview LIVE at ${basePreviewUrl}`);
     finalBuildStatus = 'LIVE';
-    console.log(`🟢 LIVE: https://${subdomain}.preview.localhost (deployment ${deploymentId})`);
+    console.log(`🟢 LIVE: ${basePreviewUrl} (deployment ${deploymentId})`);
   } catch (err) {
     if (err instanceof AbortError || (err instanceof Error && err.name === 'AbortError')) {
       const isShutdown = ac.signal.reason === 'worker_shutdown';

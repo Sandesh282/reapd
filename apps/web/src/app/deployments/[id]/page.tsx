@@ -182,7 +182,9 @@ export default function DeploymentDetailPage(): React.ReactElement {
                   >
                     {deployment.testRun.status} ({formatDurationMs(deployment.testRun.durationMs)}
                     {deployment.testRun.consoleErrorCount > 0
-                      ? ` · ${deployment.testRun.consoleErrorCount} console err`
+                      ? ` · ${deployment.testRun.consoleErrorCount} error${
+                          deployment.testRun.consoleErrorCount === 1 ? '' : 's'
+                        }`
                       : ''}
                     )
                   </span>

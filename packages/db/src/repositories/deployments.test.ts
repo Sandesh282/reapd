@@ -333,6 +333,18 @@ test('transitionDeploymentStatus: stale generation, terminal early-exit, LIVE re
     assert.equal(detailWithTest.testRun.status, 'PASSED');
     assert.equal(detailWithTest.testRun.durationMs, 310);
 
+    // Also verify TIMED_OUT and SKIPPED enum values round-trip cleanly in PostgreSQL
+    for (const status of ['TIMED_OUT', 'SKIPPED'] as const) {
+      const r = await upsertTestRun(db, {
+        deploymentId: reopenDeployId,
+        status,
+        durationMs: 15,
+        consoleErrorCount: 0,
+        failureMessage: `status=${status}`,
+      });
+      assert.equal(r.status, status);
+    }
+
     const missingDetail = await getDeploymentByIdWithEvents(db, '00000000-0000-0000-0000-000000000000');
     assert.equal(missingDetail, null);
 

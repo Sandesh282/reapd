@@ -48,7 +48,7 @@ export const TestRunSchema = z.object({
   traceR2Key: z.string().max(255).nullable(),
   screenshotR2Key: z.string().max(255).nullable(),
   failureMessage: z.string().nullable(),
-  createdAt: z.date(),
+  createdAt: z.union([z.string().datetime(), z.date()]),
 });
 
 export type TestRun = z.infer<typeof TestRunSchema>;

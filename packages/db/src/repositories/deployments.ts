@@ -171,6 +171,7 @@ export interface DeploymentWithRepo {
   commitSha: string;
   generation: number;
   subdomain: string;
+  previewUrl: string;
   status: DeploymentStatus;
   prNumber: number;
   branchName: string;
@@ -225,6 +226,7 @@ export async function getDeploymentWithRepo(
     commitSha: row.commit_sha.trim(),
     generation: row.generation,
     subdomain: row.subdomain,
+    previewUrl: `https://${row.subdomain}.preview.localhost`,
     status: row.status,
     prNumber: row.pr_number,
     branchName: row.branch_name,
