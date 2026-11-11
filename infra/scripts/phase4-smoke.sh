@@ -43,7 +43,7 @@ cleanup() {
   rm -rf "$TMP_REPO" "$API_LOG" "$WORKER_LOG"
   docker rm -f -v "$ZOMBIE_CONTAINER_NAME" >/dev/null 2>&1 || true
   (cd "$ROOT" && npm run reapd -- down --pr "$TEST_PR_NUMBER" >/dev/null 2>&1) || true
-  docker exec -i reapd-redis sh -c "redis-cli --scan --pattern 'bull:$TEST_QUEUE*' | xargs -r redis-cli del" >/dev/null 2>&1 || true
+  docker exec -i reapd-redis sh -c "redis-cli --scan --pattern 'bull:$TEST_QUEUE*' | xargs -r redis-cli del; redis-cli --scan --pattern 'logs:build:*' | xargs -r redis-cli del" >/dev/null 2>&1 || true
   docker exec -i reapd-postgres psql -U reapd -d reapd -q <<SQL >/dev/null 2>&1 || true
 DELETE FROM webhook_deliveries WHERE delivery_id IN (
   '$DELIVERY_INSTALL', '$DELIVERY_GEN1', '$DELIVERY_GEN2', '$DELIVERY_GEN3', '$DELIVERY_CLOSE'

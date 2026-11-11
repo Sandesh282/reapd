@@ -35,7 +35,7 @@ cleanup() {
   fi
   rm -rf "$TMP_REPO" "$API_LOG" "$WORKER_LOG"
   (cd "$ROOT" && npm run reapd -- down --pr "$TEST_PR_NUMBER" >/dev/null 2>&1) || true
-  docker exec -i reapd-redis sh -c "redis-cli --scan --pattern 'bull:$TEST_QUEUE*' | xargs -r redis-cli del" >/dev/null 2>&1 || true
+  docker exec -i reapd-redis sh -c "redis-cli --scan --pattern 'bull:$TEST_QUEUE*' | xargs -r redis-cli del; redis-cli --scan --pattern 'logs:build:*' | xargs -r redis-cli del" >/dev/null 2>&1 || true
   docker exec -i reapd-postgres psql -U reapd -d reapd -q <<SQL >/dev/null 2>&1 || true
 DELETE FROM webhook_deliveries WHERE delivery_id IN ('$DELIVERY_INSTALL', '$DELIVERY_PR');
 DELETE FROM repositories WHERE github_repo_id = $TEST_REPO_ID;
@@ -233,5 +233,17 @@ if [[ "$EVENTS" != "QUEUED->BUILDING->STARTING->TESTING->LIVE" ]]; then
   echo "❌ FAIL: unexpected audit trail: $EVENTS"
   exit 1
 fi
+
+DEPLOY_ID="$(docker exec -i reapd-postgres psql -U reapd -d reapd -tAq -c \
+  "SELECT id FROM deployments WHERE subdomain = 'pr-$TEST_PR_NUMBER' LIMIT 1;")"
+STREAM_KEY="logs:build:$DEPLOY_ID"
+STREAM_LEN="$(docker exec -i reapd-redis redis-cli XLEN "$STREAM_KEY")"
+STREAM_TTL="$(docker exec -i reapd-redis redis-cli TTL "$STREAM_KEY")"
+LAST_ENTRY="$(docker exec -i reapd-redis redis-cli XREVRANGE "$STREAM_KEY" + - COUNT 1)"
+if [[ "$STREAM_LEN" -lt 4 ]] || [[ "$STREAM_TTL" -le 0 ]] || [[ "$LAST_ENTRY" != *"end:LIVE"* ]]; then
+  echo "❌ FAIL: expected Redis build stream $STREAM_KEY to have entries ($STREAM_LEN), positive TTL ($STREAM_TTL), and end:LIVE marker ($LAST_ENTRY)"
+  exit 1
+fi
+echo "📡 Redis stream $STREAM_KEY verified (len=$STREAM_LEN, ttl=${STREAM_TTL}s, tail=end:LIVE)"
 
 echo "✅ PASS: Phase 3 verification gate complete (HMAC -> idempotency -> BullMQ -> BuildKit -> Traefik LIVE -> audit trail)"
