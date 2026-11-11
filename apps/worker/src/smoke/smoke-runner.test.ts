@@ -7,11 +7,42 @@ import test from 'node:test';
 import { AbortError } from '@reapd/docker-client';
 import {
   evaluateSmokeProbe,
+  isAllowedSmokeRequestUrl,
   runPlaywrightSmokeCheck,
   sanitizeSmokeErrorText,
   SmokeUnavailableError,
   type SmokeCheckProbeResult,
 } from './smoke-runner.js';
+
+void test('isAllowedSmokeRequestUrl enforces exact preview origin for *.localhost and blocks loopback/private IPs while allowing public assets', () => {
+  const origin = 'https://pr-42.preview.localhost';
+
+  // Same origin -> allowed
+  assert.equal(isAllowedSmokeRequestUrl('https://pr-42.preview.localhost/', origin), true);
+  assert.equal(isAllowedSmokeRequestUrl('https://pr-42.preview.localhost/assets/app.js', origin), true);
+  assert.equal(isAllowedSmokeRequestUrl('data:image/png;base64,AAAA', origin), true);
+  assert.equal(isAllowedSmokeRequestUrl('blob:https://pr-42.preview.localhost/123', origin), true);
+
+  // Same hostname but different port or scheme (e.g. probing API :3001, Postgres :5432, Redis :6379) -> blocked!
+  assert.equal(isAllowedSmokeRequestUrl('http://pr-42.preview.localhost:3001/api/deployments', origin), false);
+  assert.equal(isAllowedSmokeRequestUrl('https://pr-42.preview.localhost:3001/health', origin), false);
+  assert.equal(isAllowedSmokeRequestUrl('http://pr-42.preview.localhost:6379/', origin), false);
+
+  // Other *.localhost or localhost origins -> blocked
+  assert.equal(isAllowedSmokeRequestUrl('http://localhost:3001/api/deployments', origin), false);
+  assert.equal(isAllowedSmokeRequestUrl('https://pr-99.preview.localhost/', origin), false);
+
+  // Private / loopback / link-local IP literals -> blocked
+  assert.equal(isAllowedSmokeRequestUrl('http://127.0.0.1:3001/', origin), false);
+  assert.equal(isAllowedSmokeRequestUrl('http://[::1]:3001/', origin), false);
+  assert.equal(isAllowedSmokeRequestUrl('http://169.254.169.254/latest/meta-data/', origin), false);
+  assert.equal(isAllowedSmokeRequestUrl('http://10.0.0.1/', origin), false);
+  assert.equal(isAllowedSmokeRequestUrl('http://192.168.1.1/', origin), false);
+
+  // Public external assets (fonts, CDNs) -> allowed
+  assert.equal(isAllowedSmokeRequestUrl('https://fonts.googleapis.com/css2?family=Inter', origin), true);
+  assert.equal(isAllowedSmokeRequestUrl('https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css', origin), true);
+});
 
 void test('evaluateSmokeProbe fails script-only blank SPA bodies and passes rendered text or visual media', () => {
   // 1. Healthy rendered text

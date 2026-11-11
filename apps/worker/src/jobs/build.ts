@@ -334,7 +334,12 @@ export async function buildJobHandler(job: Job<BuildJobPayload>): Promise<void> 
       console.warn(`⚠️  Failed to record test_run for ${deploymentId}:`, dbErr);
     });
 
-    if (smokeResult.status === 'FAILED' || smokeResult.status === 'TIMED_OUT') {
+    const smokeRequired = process.env['REAPD_SMOKE_REQUIRED'] === '1';
+    if (
+      smokeResult.status === 'FAILED' ||
+      smokeResult.status === 'TIMED_OUT' ||
+      (smokeRequired && smokeResult.status === 'SKIPPED')
+    ) {
       await forceRemoveContainer(docker, container.id).catch(() => {});
       throw new Error(
         smokeResult.failureMessage ?? `Playwright smoke check ${smokeResult.status}`,

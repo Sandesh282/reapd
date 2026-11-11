@@ -16,13 +16,16 @@
 //     on the host (or `chromium.launch` fails before any page navigation), the smoke check records
 //     `status: 'SKIPPED'` rather than failing the user's deployment. Provision Chromium via
 //     `npx playwright install chromium` or `PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH`.
-//   - SSRF / loopback request guard (`page.route('**/*', ...)`): aborts any subresource or fetch
-//     request targeting a hostname other than the preview's own hostname so PR-authored JS cannot
-//     probe loopback control-plane services (`127.0.0.1:3001`, Postgres, Redis, socket-proxy).
+//   - SSRF / loopback request guard (`context.route` + `isAllowedSmokeRequestUrl`): allows the
+//     preview's own origin (`scheme + host + port`) and external public assets (fonts/CDNs), while
+//     aborting requests to any other `localhost` / `*.localhost` origin, non-443/80 port on the
+//     preview hostname (e.g. `http://pr-1.preview.localhost:3001`), or private/loopback IP literal.
+//     Filters out Chromium's synthetic `ERR_BLOCKED_BY_CLIENT` console noise from blocked requests.
 //   - Conditional `--no-sandbox`: enabled only when running as root (`process.getuid?.() === 0`)
 //     or when `REAPD_CHROMIUM_NO_SANDBOX=1` is explicitly set.
 
 import { existsSync } from 'node:fs';
+import { isIP } from 'node:net';
 import { chromium, type Browser } from 'playwright-core';
 import { AbortError } from '@reapd/docker-client';
 import type { TestRunStatus } from '@reapd/types';
@@ -87,6 +90,77 @@ export function sanitizeSmokeErrorText(raw: string, maxChars: number = PER_ERROR
   const redacted = redactSecrets(raw).replace(/\s+/g, ' ').trim();
   if (redacted.length <= maxChars) return redacted;
   return `${redacted.slice(0, maxChars)}...`;
+}
+
+function isPrivateOrLoopbackIp(host: string): boolean {
+  const bare = host.startsWith('[') && host.endsWith(']') ? host.slice(1, -1) : host;
+  const ver = isIP(bare);
+  if (ver === 4) {
+    const parts = bare.split('.').map(Number);
+    const [a = 0, b = 0] = parts;
+    return (
+      a === 0 ||
+      a === 10 ||
+      a === 127 ||
+      (a === 169 && b === 254) ||
+      (a === 172 && b >= 16 && b <= 31) ||
+      (a === 192 && b === 168)
+    );
+  }
+  if (ver === 6) {
+    const lower = bare.toLowerCase();
+    return (
+      lower === '::1' ||
+      lower === '::' ||
+      lower.startsWith('fc') ||
+      lower.startsWith('fd') ||
+      lower.startsWith('fe80:') ||
+      lower.startsWith('::ffff:127.') ||
+      lower.startsWith('::ffff:10.') ||
+      lower.startsWith('::ffff:192.168.')
+    );
+  }
+  return false;
+}
+
+/**
+ * Pure request-policy helper for the Playwright smoke context:
+ *   - Allows `data:`, `blob:`, and `about:` URLs
+ *   - Allows requests whose full `origin` (`protocol + host + port`) matches `previewOrigin`
+ *   - Blocks any other `localhost` / `*.localhost` / `.local` request (including `http://pr-1.preview.localhost:3001`)
+ *   - Blocks loopback, RFC1918, and link-local IP literals (`127.0.0.1`, `[::1]`, `169.254.169.254`, etc.)
+ *   - Allows public HTTPS/HTTP subresources (Google Fonts, CDNs, images) so real apps don't fail smoke checks
+ */
+export function isAllowedSmokeRequestUrl(reqUrl: string, previewOrigin: string): boolean {
+  if (
+    reqUrl.startsWith('data:') ||
+    reqUrl.startsWith('blob:') ||
+    reqUrl.startsWith('about:')
+  ) {
+    return true;
+  }
+  let parsed: URL;
+  try {
+    parsed = new URL(reqUrl);
+  } catch {
+    return false;
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    return false;
+  }
+  if (parsed.origin.toLowerCase() === previewOrigin.toLowerCase()) {
+    return true;
+  }
+  const host = parsed.hostname.toLowerCase();
+  if (
+    host === 'localhost' ||
+    host.endsWith('.localhost') ||
+    host.endsWith('.local') ||
+    isPrivateOrLoopbackIp(host)
+  ) {
+    return false;
+  }
+  return true;
 }
 
 /** Resolves a Chromium/Chrome executable path (Playwright bundled or system-installed). */
@@ -185,29 +259,25 @@ export async function probeWithPlaywrightChromium(opts: {
       throw new AbortError('Smoke test aborted after browser launch');
     }
 
-    const expectedHost = new URL(opts.previewUrl).hostname.toLowerCase();
+    const expectedOrigin = new URL(opts.previewUrl).origin.toLowerCase();
     const context = await browser.newContext({
       ignoreHTTPSErrors: true,
+      serviceWorkers: 'block',
     });
     const page = await context.newPage();
 
-    // Block cross-host / loopback SSRF requests initiated by preview page scripts
-    await page.route('**/*', async (route) => {
+    // Block loopback / private-IP SSRF requests initiated by any page or popup in the context
+    await context.route('**/*', async (route) => {
       const reqUrl = route.request().url();
-      if (reqUrl.startsWith('data:') || reqUrl.startsWith('blob:') || reqUrl.startsWith('about:')) {
-        await route.continue();
-        return;
-      }
       try {
-        const parsed = new URL(reqUrl);
-        if (parsed.hostname.toLowerCase() === expectedHost) {
+        if (isAllowedSmokeRequestUrl(reqUrl, expectedOrigin)) {
           await route.continue();
-          return;
+        } else {
+          await route.abort('blockedbyclient');
         }
       } catch {
-        // fall through to abort
+        // Ignore errors when the browser/context is closing on abort
       }
-      await route.abort('blockedbyclient');
     });
 
     const consoleErrors: string[] = [];
@@ -215,7 +285,12 @@ export async function probeWithPlaywrightChromium(opts: {
 
     page.on('console', (msg) => {
       if (msg.type() === 'error') {
-        consoleErrors.push(sanitizeSmokeErrorText(msg.text()));
+        const text = msg.text();
+        // Ignore Chromium's synthetic network error emitted when context.route aborts a blocked request
+        if (text.includes('ERR_BLOCKED_BY_CLIENT')) {
+          return;
+        }
+        consoleErrors.push(sanitizeSmokeErrorText(text));
       }
     });
 
