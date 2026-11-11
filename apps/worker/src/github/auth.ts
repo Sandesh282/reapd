@@ -7,16 +7,29 @@ import { readFile } from 'node:fs/promises';
 import { isAbsolute, resolve } from 'node:path';
 
 const REPO_ROOT = resolve(import.meta.dirname, '../../../../');
+const DEFAULT_GITHUB_API_BASE_URL = 'https://api.github.com';
 
 export interface MintInstallationTokenOptions {
   installationId: number;
   /** Repository name (e.g. "reapd") to scope the installation token to */
   repoName: string;
+  /** Optional GitHub App permissions (defaults to `{ contents: 'read' }`) */
+  permissions?: Record<string, 'read' | 'write'>;
+  /** Optional API base URL override for smoke/unit tests (defaults to `GITHUB_API_URL` or `https://api.github.com`) */
+  apiBaseUrl?: string;
   signal?: AbortSignal;
 }
 
+/** Resolves the GitHub REST API base URL (without trailing slash). */
+export function getGitHubApiBaseUrl(override?: string): string {
+  const envUrl =
+    process.env['NODE_ENV'] !== 'production' ? process.env['GITHUB_API_URL'] : undefined;
+  const raw = override ?? envUrl ?? DEFAULT_GITHUB_API_BASE_URL;
+  return raw.replace(/\/+$/, '');
+}
+
 /**
- * Mints a read-only, single-repo installation access token for `installationId`
+ * Mints a scoped, single-repo installation access token for `installationId`
  * if `GITHUB_APP_ID` and `GITHUB_PRIVATE_KEY_PATH` (or `GITHUB_PRIVATE_KEY`) are configured.
  * Returns `undefined` when credentials are not configured (e.g. local smoke test).
  */
@@ -45,8 +58,11 @@ export async function getInstallationToken(
     ? AbortSignal.any([opts.signal, timeoutSignal])
     : timeoutSignal;
 
+  const baseUrl = getGitHubApiBaseUrl(opts.apiBaseUrl);
+  const permissions = opts.permissions ?? { contents: 'read' };
+
   const response = await fetch(
-    `https://api.github.com/app/installations/${opts.installationId}/access_tokens`,
+    `${baseUrl}/app/installations/${opts.installationId}/access_tokens`,
     {
       method: 'POST',
       headers: {
@@ -58,7 +74,7 @@ export async function getInstallationToken(
       },
       body: JSON.stringify({
         repositories: [opts.repoName],
-        permissions: { contents: 'read' },
+        permissions,
       }),
       signal: combinedSignal,
     }

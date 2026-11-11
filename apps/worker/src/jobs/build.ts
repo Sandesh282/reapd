@@ -11,8 +11,11 @@ import {
   db,
   DeploymentNotFoundError,
   getDeploymentWithRepo,
+  getPullRequestStickyCommentState,
+  setPullRequestStickyCommentId,
   transitionDeploymentStatus,
   upsertTestRun,
+  type DeploymentWithRepo,
 } from '@reapd/db';
 import {
   AbortError,
@@ -27,8 +30,9 @@ import type { BuildLogEndStatus, DeploymentStatus } from '@reapd/types';
 import { cloneRepoAtSha } from '../builder/git-clone.js';
 import { buildDockerImage } from '../builder/image-builder.js';
 import { getInstallationToken } from '../github/auth.js';
+import { upsertPrComment } from '../github/pr-comment.js';
 import { createLogSink, type LogSink, redactSecrets } from '../logs/log-sink.js';
-import { runPlaywrightSmokeCheck } from '../smoke/smoke-runner.js';
+import { runPlaywrightSmokeCheck, type SmokeTestRunSummary } from '../smoke/smoke-runner.js';
 
 export interface BuildJobPayload {
   deploymentId: string;
@@ -67,6 +71,51 @@ function toBuildLogEndStatus(status: DeploymentStatus): BuildLogEndStatus {
   return 'FAILED';
 }
 
+async function bestEffortPostStickyPrComment(params: {
+  deployment: DeploymentWithRepo;
+  status: 'LIVE' | 'FAILED';
+  buildDurationMs: number | null;
+  smokeResult: SmokeTestRunSummary | null;
+  failureReason?: string | null;
+  sink: LogSink | null;
+  signal: AbortSignal;
+}): Promise<void> {
+  const { deployment, status, buildDurationMs, smokeResult, failureReason, sink, signal } = params;
+  try {
+    const res = await upsertPrComment({
+      deploymentId: deployment.id,
+      pullRequestId: deployment.pullRequestId,
+      prNumber: deployment.prNumber,
+      owner: deployment.owner,
+      repo: deployment.name,
+      installationId: deployment.installationId,
+      commitSha: deployment.commitSha,
+      generation: deployment.generation,
+      status,
+      previewUrl: deployment.previewUrl.replace(/\/+$/, ''),
+      buildDurationMs,
+      ...(failureReason ? { failureReason } : {}),
+      smoke: smokeResult,
+      getStickyState: (prId) => getPullRequestStickyCommentState(db, prId),
+      setStickyCommentId: (prId, commentId, gen) =>
+        setPullRequestStickyCommentId(db, prId, commentId, gen),
+      signal,
+    });
+    if (res.action === 'created' || res.action === 'updated') {
+      sink?.write(
+        'system',
+        'stdout',
+        `[reapd] Sticky PR comment ${res.action} on PR #${deployment.prNumber} (comment_id=${res.commentId})`,
+      );
+    }
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.warn(
+      `⚠️  Failed to upsert sticky PR comment for deployment ${deployment.id} (PR #${deployment.prNumber}): ${redactSecrets(msg)}`,
+    );
+  }
+}
+
 export async function buildJobHandler(job: Job<BuildJobPayload>): Promise<void> {
   const redisUrl = process.env['REDIS_URL'];
   if (!redisUrl) {
@@ -78,6 +127,9 @@ export async function buildJobHandler(job: Job<BuildJobPayload>): Promise<void> 
   const sub = new Redis(redisUrl);
   let sink: LogSink | null = null;
   let finalBuildStatus: BuildLogEndStatus = 'FAILED';
+  let deployment: DeploymentWithRepo | null = null;
+  let buildDurationMs: number | null = null;
+  let smokeResult: SmokeTestRunSummary | null = null;
 
   try {
     // ── Subscribe to cancel channel BEFORE reading state or starting work ────
@@ -89,7 +141,7 @@ export async function buildJobHandler(job: Job<BuildJobPayload>): Promise<void> 
     });
     await sub.subscribe(`cancel:deploy:${deploymentId}`);
 
-    const deployment = await getDeploymentWithRepo(db, deploymentId);
+    deployment = await getDeploymentWithRepo(db, deploymentId);
     if (!deployment) {
       throw new UnrecoverableError(`Deployment not found: ${deploymentId}`);
     }
@@ -154,7 +206,6 @@ export async function buildJobHandler(job: Job<BuildJobPayload>): Promise<void> 
       },
     });
 
-    let buildDurationMs = 0;
     try {
       sink.write('system', 'stdout', `[reapd] Building image ${imageTag} with BuildKit...`);
       const built = await buildDockerImage({
@@ -259,7 +310,6 @@ export async function buildJobHandler(job: Job<BuildJobPayload>): Promise<void> 
       return;
     }
 
-    let smokeResult;
     try {
       smokeResult = await runPlaywrightSmokeCheck({
         previewUrl: basePreviewUrl,
@@ -309,6 +359,15 @@ export async function buildJobHandler(job: Job<BuildJobPayload>): Promise<void> 
       return;
     }
 
+    await bestEffortPostStickyPrComment({
+      deployment,
+      status: 'LIVE',
+      buildDurationMs,
+      smokeResult,
+      sink,
+      signal: ac.signal,
+    });
+
     sink.write('system', 'stdout', `[reapd] Preview LIVE at ${basePreviewUrl}`);
     finalBuildStatus = 'LIVE';
     console.log(`🟢 LIVE: ${basePreviewUrl} (deployment ${deploymentId})`);
@@ -348,13 +407,26 @@ export async function buildJobHandler(job: Job<BuildJobPayload>): Promise<void> 
       await sink.flush();
     }
 
-    await transitionDeploymentStatus(db, {
+    const failTrans = await transitionDeploymentStatus(db, {
       deploymentId,
       toStatus: 'FAILED',
       reason,
     }).catch((dbErr: unknown) => {
       console.warn(`⚠️  Failed to record FAILED status for ${deploymentId}:`, dbErr);
+      return null;
     });
+
+    if (deployment && failTrans?.finalStatus === 'FAILED') {
+      await bestEffortPostStickyPrComment({
+        deployment,
+        status: 'FAILED',
+        buildDurationMs,
+        smokeResult,
+        failureReason: reason,
+        sink,
+        signal: ac.signal,
+      });
+    }
 
     throw err;
   } finally {
