@@ -168,6 +168,7 @@ export async function transitionDeploymentStatus(
 
 export interface DeploymentWithRepo {
   id: string;
+  pullRequestId: string;
   commitSha: string;
   generation: number;
   subdomain: string;
@@ -175,6 +176,7 @@ export interface DeploymentWithRepo {
   status: DeploymentStatus;
   prNumber: number;
   branchName: string;
+  stickyCommentId: number | null;
   owner: string;
   name: string;
   installationId: number;
@@ -190,24 +192,28 @@ export async function getDeploymentWithRepo(
 ): Promise<DeploymentWithRepo | null> {
   const rows = await db.execute<{
     id: string;
+    pull_request_id: string;
     commit_sha: string;
     generation: number;
     subdomain: string;
     status: DeploymentStatus;
     pr_number: number;
     branch_name: string;
+    sticky_comment_id: number | string | null;
     owner: string;
     name: string;
     installation_id: number;
   }>(sql`
     SELECT
       d.id,
+      d.pull_request_id,
       d.commit_sha,
       d.generation,
       d.subdomain,
       d.status,
       pr.pr_number,
       pr.branch_name,
+      pr.sticky_comment_id,
       r.owner,
       r.name,
       r.installation_id
@@ -223,6 +229,7 @@ export async function getDeploymentWithRepo(
 
   return {
     id: row.id,
+    pullRequestId: row.pull_request_id,
     commitSha: row.commit_sha.trim(),
     generation: row.generation,
     subdomain: row.subdomain,
@@ -230,10 +237,69 @@ export async function getDeploymentWithRepo(
     status: row.status,
     prNumber: row.pr_number,
     branchName: row.branch_name,
+    stickyCommentId:
+      row.sticky_comment_id !== null && row.sticky_comment_id !== undefined
+        ? Number(row.sticky_comment_id)
+        : null,
     owner: row.owner,
     name: row.name,
     installationId: Number(row.installation_id),
   };
+}
+
+/**
+ * Reads the parent PR's current `sticky_comment_id` and `latest_generation`
+ * so the worker only updates the sticky PR comment if its `generation` is still
+ * the latest generation on the PR (preventing an older slow-failing generation from
+ * overwriting a newer generation's comment).
+ */
+export async function getPullRequestStickyCommentState(
+  db: DrizzleClient,
+  pullRequestId: string
+): Promise<{ stickyCommentId: number | null; latestGeneration: number } | null> {
+  const rows = await db.execute<{
+    sticky_comment_id: number | string | null;
+    latest_generation: number;
+  }>(sql`
+    SELECT sticky_comment_id, latest_generation
+    FROM pull_requests
+    WHERE id = ${pullRequestId}
+    LIMIT 1
+  `);
+  const row = rows[0];
+  if (!row) return null;
+  return {
+    stickyCommentId:
+      row.sticky_comment_id !== null && row.sticky_comment_id !== undefined
+        ? Number(row.sticky_comment_id)
+        : null,
+    latestGeneration: Number(row.latest_generation),
+  };
+}
+
+/**
+ * Stores or updates `pull_requests.sticky_comment_id` after creating a new sticky comment on GitHub.
+ * When `expectedGeneration` is supplied, the update only takes effect if `latest_generation <= expectedGeneration`
+ * so a late-finishing older generation cannot overwrite a newer generation's comment ID.
+ */
+export async function setPullRequestStickyCommentId(
+  db: DrizzleClient,
+  pullRequestId: string,
+  stickyCommentId: number | null,
+  expectedGeneration?: number
+): Promise<boolean> {
+  const genGuard =
+    expectedGeneration !== undefined
+      ? sql`AND latest_generation <= ${expectedGeneration}`
+      : sql``;
+  const rows = await db.execute<{ id: string }>(sql`
+    UPDATE pull_requests
+    SET sticky_comment_id = ${stickyCommentId}
+    WHERE id = ${pullRequestId}
+      ${genGuard}
+    RETURNING id
+  `);
+  return rows.length > 0;
 }
 
 /**
