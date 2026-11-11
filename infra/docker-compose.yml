@@ -88,7 +88,7 @@ services:
     networks:
       - control-internal
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U reapd -d reapd"]
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U reapd -d reapd"]
       interval: 5s
       timeout: 5s
       retries: 10
