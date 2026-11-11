@@ -94,6 +94,7 @@ const DEFAULT_MAX_BATCH_SIZE = 100;
 const DEFAULT_READY_TIMEOUT_MS = 3000;
 const MAX_CONSECUTIVE_BATCH_FAILURES = 2;
 const WARN_RATE_LIMIT_MS = 5000;
+const MAX_REDACTION_INPUT_CHARS = 64 * 1024;
 const TRUNCATED_SUFFIX = ' ... [truncated]';
 
 /**
@@ -110,7 +111,9 @@ export function redactSecrets(input: string): string {
     .replace(/(gh[pousr]_[A-Za-z0-9_]{8,}|github_pat_[A-Za-z0-9_]{8,})/g, '[REDACTED_GITHUB_TOKEN]')
     .replace(/(Authorization\s*:\s*)(?:Basic|Bearer|token)\s+[^\s"']+/gi, '$1[REDACTED]')
     .replace(/\b(Basic|Bearer)\s+[A-Za-z0-9+/=_.-]{16,}/g, '$1 [REDACTED]')
-    .replace(/(\b[a-z][a-z0-9+.-]*:\/\/[^/\s:@]*:)[^@\s/]+(@)/gi, '$1[REDACTED]$2');
+    // Scheme length is bounded ({0,31}) so a long dotted/dashed run (e.g. minified output) cannot
+    // trigger quadratic rescans from every `\b` start position.
+    .replace(/(\b[a-z][a-z0-9+.-]{0,31}:\/\/[^/\s:@]*:)[^@\s/]+(@)/gi, '$1[REDACTED]$2');
 }
 
 /**
@@ -121,7 +124,10 @@ export function sanitizeAndTruncateLine(
   rawText: string,
   maxBytes: number = LOG_LINE_MAX_BYTES,
 ): string {
-  const redacted = redactSecrets(rawText).replace(/\r/g, '');
+  // Hard cap BEFORE regex redaction: bytes beyond this are discarded by truncation anyway, and
+  // bounding the input keeps worst-case regex cost predictable for pathological single-line output.
+  const bounded = rawText.length > MAX_REDACTION_INPUT_CHARS ? rawText.slice(0, MAX_REDACTION_INPUT_CHARS) : rawText;
+  const redacted = redactSecrets(bounded).replace(/\r/g, '');
   if (Buffer.byteLength(redacted, 'utf8') <= maxBytes) {
     return redacted;
   }

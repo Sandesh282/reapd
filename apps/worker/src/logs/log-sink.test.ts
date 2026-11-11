@@ -171,6 +171,16 @@ test('redactSecrets strips GitHub tokens, Authorization headers, Basic/Bearer cr
   assert.ok(truncated.endsWith(' ... [truncated]'), 'truncated line must end with marker');
 });
 
+test('redactSecrets/sanitizeAndTruncateLine stay fast on pathological long dotted lines (no quadratic regex rescans)', () => {
+  const startMs = Date.now();
+  for (const filler of ['a.', 'a-', 'a+']) {
+    sanitizeAndTruncateLine(filler.repeat(500_000));
+    redactSecrets(filler.repeat(100_000));
+  }
+  const elapsedMs = Date.now() - startMs;
+  assert.ok(elapsedMs < 1000, `pathological long-line redaction took ${elapsedMs}ms`);
+});
+
 test('parseBuildLogEndMarker requires source === "system" and rejects forged git/build lines', () => {
   assert.equal(
     parseBuildLogEndMarker({ source: 'system', text: 'end:LIVE' }),
