@@ -69,9 +69,27 @@ trap cleanup EXIT
 # ── 1. Generate temporary 2048-bit RSA private key & start mock GitHub API ───
 openssl genrsa -out "$TMP_KEY" 2048 2>/dev/null
 
-node - "$MOCK_GH_PORT" >"$MOCK_GH_LOG" 2>&1 <<'NODE_EOF' &
+node - "$MOCK_GH_PORT" "$TMP_KEY" >"$MOCK_GH_LOG" 2>&1 <<'NODE_EOF' &
 const http = require('node:http');
+const crypto = require('node:crypto');
+const fs = require('node:fs');
 const port = Number(process.argv[2]);
+const privKeyPem = fs.readFileSync(process.argv[3], 'utf8');
+const pubKey = crypto.createPublicKey(privKeyPem);
+
+function verifyGitHubAppJwt(authHeader) {
+  const m = /^Bearer\s+([A-Za-z0-9_-]+)\.([A-Za-z0-9_-]+)\.([A-Za-z0-9_-]+)$/.exec(authHeader || '');
+  if (!m) return false;
+  const [, headerB64, payloadB64, sigB64] = m;
+  const verifier = crypto.createVerify('RSA-SHA256');
+  verifier.update(`${headerB64}.${payloadB64}`);
+  verifier.end();
+  if (!verifier.verify(pubKey, Buffer.from(sigB64, 'base64url'))) {
+    return false;
+  }
+  const payload = JSON.parse(Buffer.from(payloadB64, 'base64url').toString('utf8'));
+  return payload.iss === '6001' && typeof payload.exp === 'number' && payload.exp > Math.floor(Date.now() / 1000);
+}
 
 let nextCommentId = 9001;
 const comments = new Map();
@@ -98,25 +116,33 @@ const server = http.createServer((req, res) => {
       return res.end(JSON.stringify({ deleted: id }));
     }
 
+    const parsedBody = raw ? JSON.parse(raw) : null;
     requests.push({
       method: req.method,
       url,
       auth: req.headers['authorization'] || '',
-      body: raw ? JSON.parse(raw) : null,
+      body: parsedBody,
     });
 
     if (req.method === 'POST' && /^\/app\/installations\/\d+\/access_tokens$/.test(url)) {
+      if (!verifyGitHubAppJwt(req.headers['authorization'])) {
+        res.writeHead(401, { 'content-type': 'application/json' });
+        return res.end(JSON.stringify({ message: 'Invalid RS256 GitHub App JWT' }));
+      }
+      if (!parsedBody || !parsedBody.permissions || parsedBody.permissions.pull_requests !== 'write') {
+        res.writeHead(422, { 'content-type': 'application/json' });
+        return res.end(JSON.stringify({ message: 'Expected permissions.pull_requests = write' }));
+      }
       res.writeHead(201, { 'content-type': 'application/json' });
       return res.end(JSON.stringify({ token: 'ghs_mock_phase6_installation_token_123456' }));
     }
 
     const postMatch = /^\/repos\/[^/]+\/[^/]+\/issues\/(\d+)\/comments$/.exec(url);
     if (req.method === 'POST' && postMatch) {
-      const parsed = JSON.parse(raw);
       const id = nextCommentId++;
-      comments.set(id, parsed.body);
+      comments.set(id, parsedBody.body);
       res.writeHead(201, { 'content-type': 'application/json' });
-      return res.end(JSON.stringify({ id, body: parsed.body }));
+      return res.end(JSON.stringify({ id, body: parsedBody.body }));
     }
 
     const patchMatch = /^\/repos\/[^/]+\/[^/]+\/issues\/comments\/(\d+)$/.exec(url);
@@ -126,10 +152,17 @@ const server = http.createServer((req, res) => {
         res.writeHead(404, { 'content-type': 'application/json' });
         return res.end(JSON.stringify({ message: 'Not Found' }));
       }
-      const parsed = JSON.parse(raw);
-      comments.set(id, parsed.body);
+      comments.set(id, parsedBody.body);
       res.writeHead(200, { 'content-type': 'application/json' });
-      return res.end(JSON.stringify({ id, body: parsed.body }));
+      return res.end(JSON.stringify({ id, body: parsedBody.body }));
+    }
+
+    const deleteMatch = /^\/repos\/[^/]+\/[^/]+\/issues\/comments\/(\d+)$/.exec(url);
+    if (req.method === 'DELETE' && deleteMatch) {
+      const id = Number(deleteMatch[1]);
+      comments.delete(id);
+      res.writeHead(204);
+      return res.end();
     }
 
     res.writeHead(404, { 'content-type': 'application/json' });
@@ -230,6 +263,7 @@ fi
 echo "👷 Starting BullMQ worker with Playwright smoke runner + sticky PR commenter..."
 REAPD_REPO_URL_OVERRIDE="$TMP_REPO" \
 REAPD_BUILD_QUEUE="$TEST_QUEUE" \
+REAPD_SMOKE_REQUIRED="1" \
 GITHUB_APP_ID="6001" \
 GITHUB_PRIVATE_KEY_PATH="$TMP_KEY" \
 GITHUB_API_URL="http://127.0.0.1:$MOCK_GH_PORT" \
@@ -324,6 +358,23 @@ wait_for_deployment_status() {
   return 1
 }
 
+wait_for_sticky_comment_id() {
+  local deploy_id="$1"
+  local expected_id="$2"
+  local cur=""
+  for _ in {1..80}; do
+    cur="$(docker exec -i reapd-postgres psql -U reapd -d reapd -tAq -c \
+      "SELECT COALESCE(pr.sticky_comment_id::text, '') FROM pull_requests pr JOIN deployments d ON d.pull_request_id = pr.id WHERE d.id = '$deploy_id';")"
+    if [[ "$cur" == "$expected_id" ]]; then
+      return 0
+    fi
+    sleep 0.25
+  done
+  echo "❌ FAIL: timed out waiting for pull_requests.sticky_comment_id = $expected_id (last='$cur')"
+  cat "$WORKER_LOG"
+  return 1
+}
+
 # ── 4. Scenario 1: Healthy commit -> LIVE + test_runs PASSED + sticky POST ───
 echo "🟢 Triggering Generation 1 (healthy app) on PR #$PR_NUM..."
 send_pr_webhook "$DELIVERY_GEN1" "opened" "$SHA_HEALTHY"
@@ -332,6 +383,7 @@ DEPLOY_GEN1_ID="$(docker exec -i reapd-postgres psql -U reapd -d reapd -tAq -c \
   "SELECT id FROM deployments WHERE subdomain = 'pr-$PR_NUM' AND generation = 1 LIMIT 1;")"
 
 wait_for_deployment_status "$DEPLOY_GEN1_ID" "LIVE"
+wait_for_sticky_comment_id "$DEPLOY_GEN1_ID" "9001"
 
 node - "http://127.0.0.1:$API_PORT" "http://127.0.0.1:$MOCK_GH_PORT" "$DEPLOY_GEN1_ID" <<'NODE_EOF'
 const assert = require('node:assert/strict');
@@ -364,13 +416,6 @@ const [apiBase, mockGhBase, deployId] = process.argv.slice(2);
 });
 NODE_EOF
 
-STICKY_DB_ID="$(docker exec -i reapd-postgres psql -U reapd -d reapd -tAq -c \
-  "SELECT pr.sticky_comment_id FROM pull_requests pr JOIN deployments d ON d.pull_request_id = pr.id WHERE d.id = '$DEPLOY_GEN1_ID';")"
-if [[ "$STICKY_DB_ID" != "9001" ]]; then
-  echo "❌ FAIL: expected pull_requests.sticky_comment_id = 9001 in Postgres, got '$STICKY_DB_ID'"
-  exit 1
-fi
-
 # ── 5. Scenario 2: Broken JS commit -> FAILED + container rolled back + sticky PATCH
 echo "💥 Triggering Generation 2 (runtime console.error + uncaught error) on PR #$PR_NUM..."
 send_pr_webhook "$DELIVERY_GEN2" "synchronize" "$SHA_BROKEN_JS"
@@ -379,9 +424,6 @@ DEPLOY_GEN2_ID="$(docker exec -i reapd-postgres psql -U reapd -d reapd -tAq -c \
   "SELECT id FROM deployments WHERE subdomain = 'pr-$PR_NUM' AND generation = 2 LIMIT 1;")"
 
 wait_for_deployment_status "$DEPLOY_GEN2_ID" "FAILED"
-
-# Wait briefly for best-effort sticky comment PATCH + SSE end marker
-sleep 0.5
 
 if docker ps -a --format '{{.Names}}' | grep -qx "reapd-pr-$PR_NUM"; then
   echo "❌ FAIL: preview container reapd-pr-$PR_NUM should have been force-removed after Playwright smoke failure"
@@ -405,8 +447,16 @@ const [apiBase, mockGhBase, deployId] = process.argv.slice(2);
   const eventStates = deployment.events.map((e) => e.toStatus).join('->');
   assert.equal(eventStates, 'QUEUED->BUILDING->STARTING->TESTING->FAILED');
 
-  const ghRes = await fetch(`${mockGhBase}/_test/state`);
-  const ghState = await ghRes.json();
+  // Poll mock GitHub server until the asynchronous PATCH lands (up to 15s)
+  let ghState = null;
+  for (let i = 0; i < 60; i++) {
+    const ghRes = await fetch(`${mockGhBase}/_test/state`);
+    ghState = await ghRes.json();
+    const patches = ghState.requests.filter((r) => r.method === 'PATCH' && r.url.endsWith('/issues/comments/9001'));
+    if (patches.length >= 1) break;
+    await new Promise((r) => setTimeout(r, 250));
+  }
+
   const postComments = ghState.requests.filter((r) => r.method === 'POST' && r.url.endsWith('/issues/601/comments'));
   const patchComments = ghState.requests.filter((r) => r.method === 'PATCH' && r.url.endsWith('/issues/comments/9001'));
   assert.equal(postComments.length, 1, 'Must still have only 1 POST (no duplicate comment created)');
@@ -431,13 +481,7 @@ DEPLOY_GEN3_ID="$(docker exec -i reapd-postgres psql -U reapd -d reapd -tAq -c \
   "SELECT id FROM deployments WHERE subdomain = 'pr-$PR_NUM' AND generation = 3 LIMIT 1;")"
 
 wait_for_deployment_status "$DEPLOY_GEN3_ID" "LIVE"
-
-STICKY_DB_ID_3="$(docker exec -i reapd-postgres psql -U reapd -d reapd -tAq -c \
-  "SELECT pr.sticky_comment_id FROM pull_requests pr JOIN deployments d ON d.pull_request_id = pr.id WHERE d.id = '$DEPLOY_GEN3_ID';")"
-if [[ "$STICKY_DB_ID_3" != "9002" ]]; then
-  echo "❌ FAIL: expected pull_requests.sticky_comment_id to update to 9002 after 404 fallback, got '$STICKY_DB_ID_3'"
-  exit 1
-fi
+wait_for_sticky_comment_id "$DEPLOY_GEN3_ID" "9002"
 echo "✅ Generation 3 verified: 404 on deleted comment #9001 automatically fell back to POST (#9002)"
 
 echo "✅ PASS: Phase 6 verification gate complete (Playwright smoke PASSED/FAILED + rollback + sticky PR comment POST/PATCH/404-fallback)"

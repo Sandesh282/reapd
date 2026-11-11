@@ -354,7 +354,7 @@ test('transitionDeploymentStatus: stale generation, terminal early-exit, LIVE re
     // ── 8b. Sticky PR comment state & generation-guarded update ──────────────
     const deployWithRepo = await getDeploymentWithRepo(db, reopenDeployId);
     assert.ok(deployWithRepo);
-    assert.equal(deployWithRepo.stickyCommentId, null);
+    assert.ok(deployWithRepo.pullRequestId);
 
     const initialSticky = await getPullRequestStickyCommentState(db, deployWithRepo.pullRequestId);
     assert.ok(initialSticky);
@@ -362,17 +362,18 @@ test('transitionDeploymentStatus: stale generation, terminal early-exit, LIVE re
     // `closeRes` incremented `latest_generation` by +1 when closing the PR
     assert.equal(initialSticky.latestGeneration, deployWithRepo.generation + 1);
 
-    // Setting sticky_comment_id at current latest_generation succeeds
+    // Setting sticky_comment_id at current latest_generation succeeds (use > 2^31 to verify BIGINT)
+    const bigGitHubCommentId = 3_000_000_001;
     const setOk = await setPullRequestStickyCommentId(
       db,
       deployWithRepo.pullRequestId,
-      44001,
+      bigGitHubCommentId,
       initialSticky.latestGeneration,
     );
     assert.equal(setOk, true);
 
     const afterSet = await getPullRequestStickyCommentState(db, deployWithRepo.pullRequestId);
-    assert.equal(afterSet?.stickyCommentId, 44001);
+    assert.equal(afterSet?.stickyCommentId, bigGitHubCommentId);
 
     // Attempting to overwrite with a stale expectedGeneration (< latest_generation) is rejected
     const staleSet = await setPullRequestStickyCommentId(
@@ -383,7 +384,11 @@ test('transitionDeploymentStatus: stale generation, terminal early-exit, LIVE re
     );
     assert.equal(staleSet, false);
     const afterStale = await getPullRequestStickyCommentState(db, deployWithRepo.pullRequestId);
-    assert.equal(afterStale?.stickyCommentId, 44001, 'Stale generation must not overwrite sticky_comment_id');
+    assert.equal(
+      afterStale?.stickyCommentId,
+      bigGitHubCommentId,
+      'Stale generation must not overwrite sticky_comment_id',
+    );
 
     // ── 9. Installation / repo removal: returns in-flight IDs and guards by installationId
     const dUninstall = randomUUID();

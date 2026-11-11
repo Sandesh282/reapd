@@ -72,13 +72,23 @@ export interface UpsertPrCommentResult {
 
 const DEFAULT_DASHBOARD_BASE_URL = 'http://localhost:3000';
 
-function escapeMarkdownCell(input: string, maxLen = 240): string {
+/**
+ * Formats untrusted failure text safely inside a fenced code block (choosing a fence
+ * one backtick longer than any backtick run in the text) after running `redactSecrets`
+ * and neutralizing `@` mentions (`@\u200b`).
+ */
+function formatFencedFailureReason(input: string, maxLen = 320): string {
   const redacted = redactSecrets(input)
     .replace(/\r?\n+/g, ' ')
-    .replace(/\|/g, '\\|')
+    .replace(/@/g, '@\u200b')
     .trim();
-  if (redacted.length <= maxLen) return redacted;
-  return `${redacted.slice(0, maxLen)}...`;
+  const sliced = redacted.length <= maxLen ? redacted : `${redacted.slice(0, maxLen)}...`;
+  let longestTicks = 0;
+  for (const m of sliced.matchAll(/`+/g)) {
+    if (m[0].length > longestTicks) longestTicks = m[0].length;
+  }
+  const fence = '`'.repeat(Math.max(3, longestTicks + 1));
+  return `${fence}text\n${sliced}\n${fence}`;
 }
 
 function formatDurationCell(ms: number | null | undefined): string {
@@ -141,7 +151,8 @@ export function formatPrCommentMarkdown(input: FormatPrCommentInput): string {
 
   if (input.status === 'FAILED' && input.failureReason) {
     lines.push('');
-    lines.push(`> **Failure reason:** ${escapeMarkdownCell(input.failureReason, 320)}`);
+    lines.push('**Failure reason:**');
+    lines.push(formatFencedFailureReason(input.failureReason, 320));
   }
 
   return lines.join('\n');
@@ -173,7 +184,7 @@ export async function upsertPrComment(
     (await getInstallationToken({
       installationId: opts.installationId,
       repoName: opts.repo,
-      permissions: { pull_requests: 'write', issues: 'write' },
+      permissions: { pull_requests: 'write' },
       ...(opts.apiBaseUrl ? { apiBaseUrl: opts.apiBaseUrl } : {}),
       ...(opts.signal ? { signal: opts.signal } : {}),
     }));
@@ -257,7 +268,25 @@ export async function upsertPrComment(
     throw new Error('GitHub issue comment response did not include a numeric id');
   }
 
-  await opts.setStickyCommentId(opts.pullRequestId, created.id, opts.generation);
+  const saved = await opts.setStickyCommentId(opts.pullRequestId, created.id, opts.generation);
+  if (saved === false) {
+    // A newer generation arrived between our initial generation check and the POST completing.
+    // Delete the newly created comment on GitHub so we never leave an orphaned duplicate comment.
+    const deleteUrl = `${baseUrl}/repos/${encodeURIComponent(opts.owner)}/${encodeURIComponent(
+      opts.repo,
+    )}/issues/comments/${created.id}`;
+    await fetchFn(deleteUrl, {
+      method: 'DELETE',
+      headers,
+      signal: combinedSignal,
+    }).catch(() => {});
+    return {
+      action: 'skipped',
+      commentId: null,
+      reason: 'superseded while posting',
+    };
+  }
+
   return {
     action: 'created',
     commentId: created.id,

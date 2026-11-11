@@ -176,7 +176,6 @@ export interface DeploymentWithRepo {
   status: DeploymentStatus;
   prNumber: number;
   branchName: string;
-  stickyCommentId: number | null;
   owner: string;
   name: string;
   installationId: number;
@@ -199,7 +198,6 @@ export async function getDeploymentWithRepo(
     status: DeploymentStatus;
     pr_number: number;
     branch_name: string;
-    sticky_comment_id: number | string | null;
     owner: string;
     name: string;
     installation_id: number;
@@ -213,7 +211,6 @@ export async function getDeploymentWithRepo(
       d.status,
       pr.pr_number,
       pr.branch_name,
-      pr.sticky_comment_id,
       r.owner,
       r.name,
       r.installation_id
@@ -237,10 +234,6 @@ export async function getDeploymentWithRepo(
     status: row.status,
     prNumber: row.pr_number,
     branchName: row.branch_name,
-    stickyCommentId:
-      row.sticky_comment_id !== null && row.sticky_comment_id !== undefined
-        ? Number(row.sticky_comment_id)
-        : null,
     owner: row.owner,
     name: row.name,
     installationId: Number(row.installation_id),

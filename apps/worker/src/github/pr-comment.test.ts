@@ -41,7 +41,7 @@ describe('formatPrCommentMarkdown', () => {
     );
   });
 
-  it('redacts secrets and escapes Markdown pipes in FAILED comment failureReason', () => {
+  it('redacts secrets, neutralizes @mentions, and wraps failureReason in a safe dynamic fence', () => {
     const fakeToken = `ghs_${'A'.repeat(36)}`;
     const md = formatPrCommentMarkdown({
       deploymentId: '22222222-3333-4444-5555-666666666666',
@@ -51,7 +51,7 @@ describe('formatPrCommentMarkdown', () => {
       status: 'FAILED',
       previewUrl: 'https://pr-42.preview.localhost',
       buildDurationMs: 820,
-      failureReason: `Console error (1): leaked ${fakeToken} | pipe_hazard\nsecond_line`,
+      failureReason: `Console error (1): leaked ${fakeToken} \`\`\` inline_fence @octocat\nsecond_line`,
       smoke: {
         status: 'FAILED',
         durationMs: 410,
@@ -64,7 +64,8 @@ describe('formatPrCommentMarkdown', () => {
     assert.match(md, /\| \*\*Playwright Smoke\*\* \| ❌ `FAILED` \(410ms, 1 error\) \|/);
     assert.ok(!md.includes(fakeToken), 'GitHub token in failureReason must be redacted');
     assert.match(md, /\[REDACTED_GITHUB_TOKEN\]/);
-    assert.match(md, /\\\| pipe_hazard second_line/, 'Pipes and newlines must be escaped');
+    assert.ok(!md.includes('@octocat'), '@mentions must be broken with zero-width space');
+    assert.match(md, /````text\n.*\n````/, 'Must use a 4-backtick fence when text contains 3 backticks');
   });
 });
 
@@ -223,5 +224,88 @@ describe('upsertPrComment', () => {
     assert.equal(res.action, 'skipped');
     assert.match(res.reason ?? '', /stale generation/);
     assert.equal(fetchCalled, false, 'Stale generation must not call GitHub REST API');
+  });
+
+  it('DELETEs the newly created comment and returns skipped when setStickyCommentId returns false (superseded while posting)', async () => {
+    const calls: { url: string; method: string }[] = [];
+
+    const res = await upsertPrComment({
+      deploymentId: 'dep-race',
+      pullRequestId: 'pr-uuid-1',
+      prNumber: 601,
+      owner: 'Sandesh282',
+      repo: 'reapd',
+      installationId: 55501,
+      commitSha: 'a'.repeat(40),
+      generation: 1,
+      status: 'LIVE',
+      previewUrl: 'https://pr-601.preview.localhost',
+      authToken: 'test-token',
+      apiBaseUrl: 'http://127.0.0.1:19999',
+      getStickyState: async () => ({ stickyCommentId: null, latestGeneration: 1 }),
+      setStickyCommentId: async () => false,
+      fetchImpl: (async (url: string | URL | Request, init?: RequestInit) => {
+        const method = init?.method ?? 'GET';
+        calls.push({ url: String(url), method });
+        if (method === 'POST') {
+          return new Response(JSON.stringify({ id: 9055 }), { status: 201 });
+        }
+        return new Response(null, { status: 204 });
+      }) as typeof fetch,
+    });
+
+    assert.equal(res.action, 'skipped');
+    assert.equal(res.commentId, null);
+    assert.equal(res.reason, 'superseded while posting');
+    assert.equal(calls.length, 2);
+    assert.equal(calls[0]?.method, 'POST');
+    assert.equal(calls[1]?.method, 'DELETE');
+    assert.equal(calls[1]?.url, 'http://127.0.0.1:19999/repos/Sandesh282/reapd/issues/comments/9055');
+  });
+
+  it('throws on non-404 PATCH failure (e.g. 500) and non-OK POST failure (e.g. 403)', async () => {
+    await assert.rejects(
+      () =>
+        upsertPrComment({
+          deploymentId: 'dep-err-patch',
+          pullRequestId: 'pr-uuid-1',
+          prNumber: 601,
+          owner: 'Sandesh282',
+          repo: 'reapd',
+          installationId: 55501,
+          commitSha: 'a'.repeat(40),
+          generation: 1,
+          status: 'LIVE',
+          previewUrl: 'https://pr-601.preview.localhost',
+          authToken: 'test-token',
+          getStickyState: async () => ({ stickyCommentId: 9001, latestGeneration: 1 }),
+          setStickyCommentId: async () => true,
+          fetchImpl: (async () =>
+            new Response('Internal Server Error', { status: 500 })) as typeof fetch,
+        }),
+      /Failed to PATCH GitHub PR comment 9001 \(HTTP 500\)/,
+    );
+
+    await assert.rejects(
+      () =>
+        upsertPrComment({
+          deploymentId: 'dep-err-post',
+          pullRequestId: 'pr-uuid-1',
+          prNumber: 601,
+          owner: 'Sandesh282',
+          repo: 'reapd',
+          installationId: 55501,
+          commitSha: 'a'.repeat(40),
+          generation: 1,
+          status: 'LIVE',
+          previewUrl: 'https://pr-601.preview.localhost',
+          authToken: 'test-token',
+          getStickyState: async () => ({ stickyCommentId: null, latestGeneration: 1 }),
+          setStickyCommentId: async () => true,
+          fetchImpl: (async () =>
+            new Response('Resource not accessible by integration', { status: 403 })) as typeof fetch,
+        }),
+      /Failed to POST GitHub PR comment on PR #601 \(HTTP 403\)/,
+    );
   });
 });

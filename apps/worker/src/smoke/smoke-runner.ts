@@ -16,11 +16,14 @@
 //     on the host (or `chromium.launch` fails before any page navigation), the smoke check records
 //     `status: 'SKIPPED'` rather than failing the user's deployment. Provision Chromium via
 //     `npx playwright install chromium` or `PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH`.
-//   - SSRF / loopback request guard (`context.route` + `isAllowedSmokeRequestUrl`): allows the
-//     preview's own origin (`scheme + host + port`) and external public assets (fonts/CDNs), while
-//     aborting requests to any other `localhost` / `*.localhost` origin, non-443/80 port on the
-//     preview hostname (e.g. `http://pr-1.preview.localhost:3001`), or private/loopback IP literal.
-//     Filters out Chromium's synthetic `ERR_BLOCKED_BY_CLIENT` console noise from blocked requests.
+//   - Best-effort SSRF / loopback request guard (`context.route` + `isAllowedSmokeRequestUrl`,
+//     defense in depth): allows the preview's own origin (`scheme + host + port`) and external
+//     public assets (fonts/CDNs), while aborting requests to any other `localhost` / `*.localhost`
+//     origin, single-label or `.internal`/`.lan` hostnames, non-443/80 ports on the preview
+//     hostname (e.g. `http://pr-1.preview.localhost:3001`), or private/loopback IPv4/IPv6 literals
+//     (including hex-serialized IPv4-mapped IPv6 `[::ffff:7f00:1]`). Note: hostname-based filtering
+//     cannot block WebSockets or static/rebound DNS records resolving to `127.0.0.1` (e.g. `nip.io`);
+//     OS-level network isolation in Phase 7 is the authoritative boundary.
 //   - Conditional `--no-sandbox`: enabled only when running as root (`process.getuid?.() === 0`)
 //     or when `REAPD_CHROMIUM_NO_SANDBOX=1` is explicitly set.
 
@@ -60,6 +63,7 @@ export interface RunSmokeCheckOptions {
     signal: AbortSignal;
     timeoutMs: number;
     settleWaitMs: number;
+    onLog?: (stream: 'stdout' | 'stderr', line: string) => void;
   }) => Promise<SmokeCheckProbeResult>;
 }
 
@@ -92,43 +96,64 @@ export function sanitizeSmokeErrorText(raw: string, maxChars: number = PER_ERROR
   return `${redacted.slice(0, maxChars)}...`;
 }
 
+function isPrivateV4Octets(a: number, b: number, _c: number, _d: number): boolean {
+  return (
+    a === 0 ||
+    a === 10 ||
+    a === 127 ||
+    (a === 100 && b >= 64 && b <= 127) ||
+    (a === 169 && b === 254) ||
+    (a === 172 && b >= 16 && b <= 31) ||
+    (a === 192 && b === 168)
+  );
+}
+
 function isPrivateOrLoopbackIp(host: string): boolean {
   const bare = host.startsWith('[') && host.endsWith(']') ? host.slice(1, -1) : host;
   const ver = isIP(bare);
   if (ver === 4) {
-    const parts = bare.split('.').map(Number);
-    const [a = 0, b = 0] = parts;
-    return (
-      a === 0 ||
-      a === 10 ||
-      a === 127 ||
-      (a === 169 && b === 254) ||
-      (a === 172 && b >= 16 && b <= 31) ||
-      (a === 192 && b === 168)
-    );
+    const [a = 0, b = 0, c = 0, d = 0] = bare.split('.').map(Number);
+    return isPrivateV4Octets(a, b, c, d);
   }
   if (ver === 6) {
     const lower = bare.toLowerCase();
-    return (
+    if (
       lower === '::1' ||
       lower === '::' ||
       lower.startsWith('fc') ||
       lower.startsWith('fd') ||
-      lower.startsWith('fe80:') ||
-      lower.startsWith('::ffff:127.') ||
-      lower.startsWith('::ffff:10.') ||
-      lower.startsWith('::ffff:192.168.')
-    );
+      /^fe[89ab][0-9a-f]:/.test(lower)
+    ) {
+      return true;
+    }
+    // WHATWG URL serializes IPv4-mapped IPv6 (`[::ffff:127.0.0.1]`) as hex groups (`::ffff:7f00:1`)
+    const hexMapped = /^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/.exec(lower);
+    if (hexMapped) {
+      const hi = parseInt(hexMapped[1]!, 16);
+      const lo = parseInt(hexMapped[2]!, 16);
+      return isPrivateV4Octets((hi >> 8) & 0xff, hi & 0xff, (lo >> 8) & 0xff, lo & 0xff);
+    }
+    const dottedMapped = /^::ffff:(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(lower);
+    if (dottedMapped) {
+      return isPrivateV4Octets(
+        Number(dottedMapped[1]),
+        Number(dottedMapped[2]),
+        Number(dottedMapped[3]),
+        Number(dottedMapped[4]),
+      );
+    }
+    return false;
   }
   return false;
 }
 
 /**
- * Pure request-policy helper for the Playwright smoke context:
+ * Pure request-policy helper for the Playwright smoke context (defense in depth):
  *   - Allows `data:`, `blob:`, and `about:` URLs
  *   - Allows requests whose full `origin` (`protocol + host + port`) matches `previewOrigin`
- *   - Blocks any other `localhost` / `*.localhost` / `.local` request (including `http://pr-1.preview.localhost:3001`)
- *   - Blocks loopback, RFC1918, and link-local IP literals (`127.0.0.1`, `[::1]`, `169.254.169.254`, etc.)
+ *   - Blocks any other `localhost` / `*.localhost` / `.local` / `.internal` / `.lan` or single-label hostname
+ *     (including `http://pr-1.preview.localhost:3001`, `host.docker.internal`, `redis`, `postgres`)
+ *   - Blocks loopback, RFC1918, CGNAT, and link-local IPv4/IPv6 literals (`127.0.0.1`, `[::1]`, `[::ffff:127.0.0.1]`, `fe80::/10`, etc.)
  *   - Allows public HTTPS/HTTP subresources (Google Fonts, CDNs, images) so real apps don't fail smoke checks
  */
 export function isAllowedSmokeRequestUrl(reqUrl: string, previewOrigin: string): boolean {
@@ -152,15 +177,34 @@ export function isAllowedSmokeRequestUrl(reqUrl: string, previewOrigin: string):
     return true;
   }
   const host = parsed.hostname.toLowerCase();
+  const isIpv6Literal = host.startsWith('[') && host.endsWith(']');
   if (
+    (!isIpv6Literal && !host.includes('.')) ||
     host === 'localhost' ||
     host.endsWith('.localhost') ||
     host.endsWith('.local') ||
+    host.endsWith('.internal') ||
+    host.endsWith('.lan') ||
     isPrivateOrLoopbackIp(host)
   ) {
     return false;
   }
   return true;
+}
+
+/**
+ * Determines whether a smoke test status should fail the deployment and trigger rollback.
+ * When `smokeRequired` is true (`REAPD_SMOKE_REQUIRED=1`), `SKIPPED` also fails closed.
+ */
+export function shouldFailSmoke(
+  status: TestRunStatus,
+  smokeRequired: boolean = process.env['REAPD_SMOKE_REQUIRED'] === '1',
+): boolean {
+  return (
+    status === 'FAILED' ||
+    status === 'TIMED_OUT' ||
+    (smokeRequired && status === 'SKIPPED')
+  );
 }
 
 /** Resolves a Chromium/Chrome executable path (Playwright bundled or system-installed). */
@@ -217,6 +261,7 @@ export async function probeWithPlaywrightChromium(opts: {
   signal: AbortSignal;
   timeoutMs: number;
   settleWaitMs: number;
+  onLog?: (stream: 'stdout' | 'stderr', line: string) => void;
 }): Promise<SmokeCheckProbeResult> {
   if (opts.signal.aborted) {
     throw new AbortError('Smoke test aborted before browser launch');
@@ -267,12 +312,25 @@ export async function probeWithPlaywrightChromium(opts: {
     const page = await context.newPage();
 
     // Block loopback / private-IP SSRF requests initiated by any page or popup in the context
+    const loggedBlockedOrigins = new Set<string>();
     await context.route('**/*', async (route) => {
       const reqUrl = route.request().url();
       try {
         if (isAllowedSmokeRequestUrl(reqUrl, expectedOrigin)) {
           await route.continue();
         } else {
+          try {
+            const blockedOrigin = new URL(reqUrl).origin;
+            if (!loggedBlockedOrigins.has(blockedOrigin)) {
+              loggedBlockedOrigins.add(blockedOrigin);
+              opts.onLog?.(
+                'stdout',
+                `[reapd] Smoke check blocked request to ${sanitizeSmokeErrorText(blockedOrigin, 120)}`,
+              );
+            }
+          } catch {
+            // ignore URL parse error on log
+          }
           await route.abort('blockedbyclient');
         }
       } catch {
@@ -430,6 +488,7 @@ export async function runPlaywrightSmokeCheck(
       signal: combinedSignal,
       timeoutMs,
       settleWaitMs,
+      ...(opts.onLog ? { onLog: opts.onLog } : {}),
     });
 
     if (opts.signal?.aborted) {

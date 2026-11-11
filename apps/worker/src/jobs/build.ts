@@ -32,7 +32,11 @@ import { buildDockerImage } from '../builder/image-builder.js';
 import { getInstallationToken } from '../github/auth.js';
 import { upsertPrComment } from '../github/pr-comment.js';
 import { createLogSink, type LogSink, redactSecrets } from '../logs/log-sink.js';
-import { runPlaywrightSmokeCheck, type SmokeTestRunSummary } from '../smoke/smoke-runner.js';
+import {
+  runPlaywrightSmokeCheck,
+  shouldFailSmoke,
+  type SmokeTestRunSummary,
+} from '../smoke/smoke-runner.js';
 
 export interface BuildJobPayload {
   deploymentId: string;
@@ -334,12 +338,7 @@ export async function buildJobHandler(job: Job<BuildJobPayload>): Promise<void> 
       console.warn(`⚠️  Failed to record test_run for ${deploymentId}:`, dbErr);
     });
 
-    const smokeRequired = process.env['REAPD_SMOKE_REQUIRED'] === '1';
-    if (
-      smokeResult.status === 'FAILED' ||
-      smokeResult.status === 'TIMED_OUT' ||
-      (smokeRequired && smokeResult.status === 'SKIPPED')
-    ) {
+    if (shouldFailSmoke(smokeResult.status)) {
       await forceRemoveContainer(docker, container.id).catch(() => {});
       throw new Error(
         smokeResult.failureMessage ?? `Playwright smoke check ${smokeResult.status}`,
@@ -364,18 +363,21 @@ export async function buildJobHandler(job: Job<BuildJobPayload>): Promise<void> 
       return;
     }
 
+    finalBuildStatus = 'LIVE';
+    sink.write('system', 'stdout', `[reapd] Preview LIVE at ${basePreviewUrl}`);
+    await sink.end('LIVE');
+    console.log(`🟢 LIVE: ${basePreviewUrl} (deployment ${deploymentId})`);
+
+    // Post sticky PR comment AFTER sealing `end:LIVE` in Redis so GitHub API latency
+    // never keeps the dashboard SSE log stream open in "Live tailing" state.
     await bestEffortPostStickyPrComment({
       deployment,
       status: 'LIVE',
       buildDurationMs,
       smokeResult,
-      sink,
+      sink: null,
       signal: ac.signal,
     });
-
-    sink.write('system', 'stdout', `[reapd] Preview LIVE at ${basePreviewUrl}`);
-    finalBuildStatus = 'LIVE';
-    console.log(`🟢 LIVE: ${basePreviewUrl} (deployment ${deploymentId})`);
   } catch (err) {
     if (err instanceof AbortError || (err instanceof Error && err.name === 'AbortError')) {
       const isShutdown = ac.signal.reason === 'worker_shutdown';
@@ -409,7 +411,7 @@ export async function buildJobHandler(job: Job<BuildJobPayload>): Promise<void> 
     finalBuildStatus = 'FAILED';
     if (sink) {
       sink.write('system', 'stderr', `[reapd] Build failed: ${reason}`);
-      await sink.flush();
+      await sink.end('FAILED');
     }
 
     const failTrans = await transitionDeploymentStatus(db, {
@@ -428,7 +430,7 @@ export async function buildJobHandler(job: Job<BuildJobPayload>): Promise<void> 
         buildDurationMs,
         smokeResult,
         failureReason: reason,
-        sink,
+        sink: null,
         signal: ac.signal,
       });
     }
