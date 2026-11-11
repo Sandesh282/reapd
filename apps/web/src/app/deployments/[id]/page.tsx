@@ -33,6 +33,7 @@ const LogTerminal = dynamic(() => import('../../../components/LogTerminal'), {
 });
 
 const DETAIL_POLL_INTERVAL_MS = 2500;
+const DETAIL_POLL_TIMEOUT_MS = 10_000;
 
 export default function DeploymentDetailPage(): React.ReactElement {
   const params = useParams<{ id: string }>();
@@ -54,10 +55,14 @@ export default function DeploymentDetailPage(): React.ReactElement {
     const load = async (): Promise<void> => {
       if (inFlight) return;
       inFlight = true;
+      const reqSignal =
+        typeof AbortSignal.any === 'function' && typeof AbortSignal.timeout === 'function'
+          ? AbortSignal.any([controller.signal, AbortSignal.timeout(DETAIL_POLL_TIMEOUT_MS)])
+          : controller.signal;
 
       try {
         const detail = await fetchDeploymentDetail(deploymentId, {
-          signal: controller.signal,
+          signal: reqSignal,
         });
         if (!active) return;
 
