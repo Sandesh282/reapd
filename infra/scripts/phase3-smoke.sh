@@ -35,6 +35,11 @@ cleanup() {
   fi
   rm -rf "$TMP_REPO" "$API_LOG" "$WORKER_LOG"
   (cd "$ROOT" && npm run reapd -- down --pr "$TEST_PR_NUMBER" >/dev/null 2>&1) || true
+  DEPLOY_IDS="$(docker exec -i reapd-postgres psql -U reapd -d reapd -tAq -c \
+    "SELECT d.id FROM deployments d JOIN pull_requests pr ON pr.id = d.pull_request_id JOIN repositories r ON r.id = pr.repo_id WHERE r.github_repo_id = $TEST_REPO_ID;" 2>/dev/null || true)"
+  for did in $DEPLOY_IDS; do
+    docker exec -i reapd-redis redis-cli del "logs:build:$did" >/dev/null 2>&1 || true
+  done
   docker exec -i reapd-redis sh -c "redis-cli --scan --pattern 'bull:$TEST_QUEUE*' | xargs -r redis-cli del" >/dev/null 2>&1 || true
   docker exec -i reapd-postgres psql -U reapd -d reapd -q <<SQL >/dev/null 2>&1 || true
 DELETE FROM webhook_deliveries WHERE delivery_id IN ('$DELIVERY_INSTALL', '$DELIVERY_PR');
@@ -233,5 +238,34 @@ if [[ "$EVENTS" != "QUEUED->BUILDING->STARTING->TESTING->LIVE" ]]; then
   echo "❌ FAIL: unexpected audit trail: $EVENTS"
   exit 1
 fi
+
+DEPLOY_ID="$(docker exec -i reapd-postgres psql -U reapd -d reapd -tAq -c \
+  "SELECT id FROM deployments WHERE subdomain = 'pr-$TEST_PR_NUMBER' LIMIT 1;")"
+STREAM_KEY="logs:build:$DEPLOY_ID"
+
+# Poll up to 10s for `finally` block's `sink.end('LIVE')` marker to land after the DB commit
+LAST_ENTRY=""
+for _ in {1..20}; do
+  LAST_ENTRY="$(docker exec -i reapd-redis redis-cli XREVRANGE "$STREAM_KEY" + - COUNT 1)"
+  if [[ "$LAST_ENTRY" == *"end:LIVE"* ]]; then
+    break
+  fi
+  sleep 0.5
+done
+
+FIRST_ENTRY="$(docker exec -i reapd-redis redis-cli XRANGE "$STREAM_KEY" - + COUNT 1)"
+STREAM_LEN="$(docker exec -i reapd-redis redis-cli XLEN "$STREAM_KEY")"
+STREAM_TTL="$(docker exec -i reapd-redis redis-cli TTL "$STREAM_KEY")"
+STREAM_MEM="$(docker exec -i reapd-redis redis-cli MEMORY USAGE "$STREAM_KEY")"
+if [[ "$STREAM_LEN" -lt 4 ]] || [[ "$STREAM_TTL" -le 21600 ]] || [[ "$FIRST_ENTRY" != *"-> BUILDING"* ]] || [[ "$LAST_ENTRY" != *"end:LIVE"* ]]; then
+  echo "❌ FAIL: expected Redis build stream $STREAM_KEY to preserve first '-> BUILDING' line ($FIRST_ENTRY), have ttl > 21600 ($STREAM_TTL), and end with 'end:LIVE' ($LAST_ENTRY)"
+  exit 1
+fi
+if grep -q '\[log-sink\]' "$WORKER_LOG"; then
+  echo "❌ FAIL: unexpected [log-sink] warning in worker log during healthy build"
+  cat "$WORKER_LOG"
+  exit 1
+fi
+echo "📡 Redis stream $STREAM_KEY verified (len=$STREAM_LEN, mem=${STREAM_MEM}B, ttl=${STREAM_TTL}s, first='-> BUILDING', tail='end:LIVE')"
 
 echo "✅ PASS: Phase 3 verification gate complete (HMAC -> idempotency -> BullMQ -> BuildKit -> Traefik LIVE -> audit trail)"

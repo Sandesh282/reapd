@@ -22,9 +22,11 @@ import {
   pollUntilHealthy,
   removeImage,
 } from '@reapd/docker-client';
+import type { BuildLogEndStatus, DeploymentStatus } from '@reapd/types';
 import { cloneRepoAtSha } from '../builder/git-clone.js';
 import { buildDockerImage } from '../builder/image-builder.js';
 import { getInstallationToken } from '../github/auth.js';
+import { createLogSink, type LogSink, redactSecrets } from '../logs/log-sink.js';
 
 export interface BuildJobPayload {
   deploymentId: string;
@@ -58,6 +60,11 @@ export function parseGenerationFromTag(repoTag: string): number | null {
   return match?.[1] ? Number(match[1]) : null;
 }
 
+function toBuildLogEndStatus(status: DeploymentStatus): BuildLogEndStatus {
+  if (status === 'LIVE' || status === 'SUPERSEDED') return status;
+  return 'FAILED';
+}
+
 export async function buildJobHandler(job: Job<BuildJobPayload>): Promise<void> {
   const redisUrl = process.env['REDIS_URL'];
   if (!redisUrl) {
@@ -67,6 +74,8 @@ export async function buildJobHandler(job: Job<BuildJobPayload>): Promise<void> 
   const ac = new AbortController();
   activeBuildControllers.set(deploymentId, ac);
   const sub = new Redis(redisUrl);
+  let sink: LogSink | null = null;
+  let finalBuildStatus: BuildLogEndStatus = 'FAILED';
 
   try {
     // ── Subscribe to cancel channel BEFORE reading state or starting work ────
@@ -110,6 +119,16 @@ export async function buildJobHandler(job: Job<BuildJobPayload>): Promise<void> 
       return;
     }
 
+    // Initialize log sink ONLY after QUEUED → BUILDING succeeds so early-return jobs
+    // on already-terminal deployments never create an empty stream key in Redis.
+    // `createLogSink` falls back to a no-op sink with a warning if Redis config is missing/invalid.
+    sink = createLogSink({ deploymentId, redisUrl });
+    sink.write(
+      'system',
+      'stdout',
+      `[reapd] Deployment ${deploymentId} (gen ${generation}, commit ${shortSha}) -> BUILDING`,
+    );
+
     const authToken = repoUrl.startsWith('https://github.com/')
       ? await getInstallationToken({
           installationId,
@@ -118,17 +137,22 @@ export async function buildJobHandler(job: Job<BuildJobPayload>): Promise<void> 
         })
       : undefined;
 
+    sink.write('system', 'stdout', `[reapd] Cloning ${owner}/${name}@${shortSha}...`);
     const cloned = await cloneRepoAtSha({
       repoUrl,
       commitSha,
       deploymentId,
       ...(authToken ? { authToken } : {}),
       signal: ac.signal,
-      onLog: (_stream, line) => console.log(`[git:${subdomain}] ${line}`),
+      onLog: (stream, line) => {
+        console.log(`[git:${subdomain}] ${redactSecrets(line)}`);
+        sink?.write('git', stream, line);
+      },
     });
 
     let buildDurationMs = 0;
     try {
+      sink.write('system', 'stdout', `[reapd] Building image ${imageTag} with BuildKit...`);
       const built = await buildDockerImage({
         contextDir: cloned.workDir,
         ...(job.data.subpath ? { subpath: job.data.subpath } : {}),
@@ -136,9 +160,13 @@ export async function buildJobHandler(job: Job<BuildJobPayload>): Promise<void> 
         deploymentId,
         subdomain,
         signal: ac.signal,
-        onLog: (_stream, line) => console.log(`[build:${subdomain}] ${line}`),
+        onLog: (stream, line) => {
+          console.log(`[build:${subdomain}] ${redactSecrets(line)}`);
+          sink?.write('build', stream, line);
+        },
       });
       buildDurationMs = built.buildDurationMs;
+      sink.write('system', 'stdout', `[reapd] Image ${imageTag} built in ${buildDurationMs}ms`);
     } finally {
       await cloned.cleanup().catch((err: unknown) => {
         const msg = err instanceof Error ? err.message : String(err);
@@ -160,8 +188,13 @@ export async function buildJobHandler(job: Job<BuildJobPayload>): Promise<void> 
     });
     if (!startTrans.transitioned) {
       await removeImage(docker, imageTag).catch(() => {});
+      finalBuildStatus = toBuildLogEndStatus(startTrans.finalStatus);
+      sink.write('system', 'stderr', `[reapd] Transition to STARTING fenced (${startTrans.finalStatus})`);
+      await sink.flush();
       return;
     }
+
+    sink.write('system', 'stdout', `[reapd] Starting preview container ${containerName}...`);
 
     if (ac.signal.aborted) {
       await removeImage(docker, imageTag).catch(() => {});
@@ -197,6 +230,7 @@ export async function buildJobHandler(job: Job<BuildJobPayload>): Promise<void> 
     });
 
     const healthUrl = `https://${subdomain}.preview.localhost/health`;
+    sink.write('system', 'stdout', `[reapd] Probing health endpoint ${healthUrl}...`);
     try {
       await pollUntilHealthy(healthUrl, ac.signal, { maxWaitMs: 30_000 });
     } catch (err) {
@@ -205,6 +239,7 @@ export async function buildJobHandler(job: Job<BuildJobPayload>): Promise<void> 
       await forceRemoveContainer(docker, container.id).catch(() => {});
       throw err;
     }
+    sink.write('system', 'stdout', `[reapd] Health check passed for ${healthUrl}`);
 
     // ── Phase 3: STARTING → TESTING (Playwright added in Phase 6) ────────────
     const testTrans = await transitionDeploymentStatus(db, {
@@ -214,27 +249,46 @@ export async function buildJobHandler(job: Job<BuildJobPayload>): Promise<void> 
     });
     if (!testTrans.transitioned) {
       await forceRemoveContainer(docker, container.id).catch(() => {});
+      finalBuildStatus = toBuildLogEndStatus(testTrans.finalStatus);
+      sink.write('system', 'stderr', `[reapd] Transition to TESTING fenced (${testTrans.finalStatus})`);
+      await sink.flush();
       return;
     }
 
     // ── Phase 4: TESTING → LIVE ──────────────────────────────────────────────
+    // Flush all pending log lines BEFORE committing `LIVE` in Postgres so when the worker
+    // itself commits `LIVE`, all build output is already in Redis (`end:LIVE` follows
+    // immediately in `finally`).
+    await sink.flush();
+
     const liveTrans = await transitionDeploymentStatus(db, {
       deploymentId,
       toStatus: 'LIVE',
     });
     if (!liveTrans.transitioned) {
       await forceRemoveContainer(docker, container.id).catch(() => {});
+      finalBuildStatus = toBuildLogEndStatus(liveTrans.finalStatus);
+      sink.write('system', 'stderr', `[reapd] Transition to LIVE fenced (${liveTrans.finalStatus})`);
+      await sink.flush();
       return;
     }
 
+    sink.write('system', 'stdout', `[reapd] Preview LIVE at https://${subdomain}.preview.localhost`);
+    finalBuildStatus = 'LIVE';
     console.log(`🟢 LIVE: https://${subdomain}.preview.localhost (deployment ${deploymentId})`);
   } catch (err) {
     if (err instanceof AbortError || (err instanceof Error && err.name === 'AbortError')) {
       const isShutdown = ac.signal.reason === 'worker_shutdown';
-      const targetStatus = isShutdown ? 'FAILED' : 'SUPERSEDED';
+      const targetStatus: BuildLogEndStatus = isShutdown ? 'FAILED' : 'SUPERSEDED';
       const abortReason = isShutdown
         ? 'Build aborted due to worker shutdown'
         : 'Aborted via cancel signal';
+
+      finalBuildStatus = targetStatus;
+      if (sink) {
+        sink.write('system', 'stderr', `[reapd] ${abortReason} -> ${targetStatus}`);
+        await sink.flush();
+      }
 
       await transitionDeploymentStatus(db, {
         deploymentId,
@@ -250,7 +304,14 @@ export async function buildJobHandler(job: Job<BuildJobPayload>): Promise<void> 
       throw err;
     }
 
-    const reason = err instanceof Error ? err.message.slice(0, 512) : String(err).slice(0, 512);
+    const rawReason = err instanceof Error ? err.message : String(err);
+    const reason = redactSecrets(rawReason).slice(0, 512);
+    finalBuildStatus = 'FAILED';
+    if (sink) {
+      sink.write('system', 'stderr', `[reapd] Build failed: ${reason}`);
+      await sink.flush();
+    }
+
     await transitionDeploymentStatus(db, {
       deploymentId,
       toStatus: 'FAILED',
@@ -261,6 +322,9 @@ export async function buildJobHandler(job: Job<BuildJobPayload>): Promise<void> 
 
     throw err;
   } finally {
+    if (sink) {
+      await sink.end(finalBuildStatus);
+    }
     activeBuildControllers.delete(deploymentId);
     await sub.unsubscribe().catch(() => {});
     await sub.quit().catch(() => {});

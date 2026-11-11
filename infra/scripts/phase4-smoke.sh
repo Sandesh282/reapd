@@ -43,6 +43,11 @@ cleanup() {
   rm -rf "$TMP_REPO" "$API_LOG" "$WORKER_LOG"
   docker rm -f -v "$ZOMBIE_CONTAINER_NAME" >/dev/null 2>&1 || true
   (cd "$ROOT" && npm run reapd -- down --pr "$TEST_PR_NUMBER" >/dev/null 2>&1) || true
+  DEPLOY_IDS="$(docker exec -i reapd-postgres psql -U reapd -d reapd -tAq -c \
+    "SELECT d.id FROM deployments d JOIN pull_requests pr ON pr.id = d.pull_request_id JOIN repositories r ON r.id = pr.repo_id WHERE r.github_repo_id = $TEST_REPO_ID;" 2>/dev/null || true)"
+  for did in $DEPLOY_IDS; do
+    docker exec -i reapd-redis redis-cli del "logs:build:$did" >/dev/null 2>&1 || true
+  done
   docker exec -i reapd-redis sh -c "redis-cli --scan --pattern 'bull:$TEST_QUEUE*' | xargs -r redis-cli del" >/dev/null 2>&1 || true
   docker exec -i reapd-postgres psql -U reapd -d reapd -q <<SQL >/dev/null 2>&1 || true
 DELETE FROM webhook_deliveries WHERE delivery_id IN (
@@ -197,7 +202,21 @@ curl -fsS -X POST "http://127.0.0.1:$API_PORT/webhooks/github" \
 # ── 3. Fire 3 rapid commits to trigger in-flight superseding ─────────────────
 echo "⚡ Firing 3 rapid commits to PR #$TEST_PR_NUMBER..."
 send_pr_webhook "$DELIVERY_GEN1" "opened" "$SHA_GEN1"
-sleep 1.5
+# Poll until Gen 1 enters an in-flight state so its log sink is guaranteed to exist before Gen 2 supersedes it
+GEN1_CUR=""
+for _ in {1..40}; do
+  GEN1_CUR="$(docker exec -i reapd-postgres psql -U reapd -d reapd -tAq -c \
+    "SELECT status FROM deployments WHERE subdomain = 'pr-$TEST_PR_NUMBER' AND generation = 1 LIMIT 1;")"
+  if [[ "$GEN1_CUR" == "BUILDING" || "$GEN1_CUR" == "STARTING" || "$GEN1_CUR" == "TESTING" ]]; then
+    break
+  fi
+  sleep 0.25
+done
+[[ "$GEN1_CUR" == "BUILDING" || "$GEN1_CUR" == "STARTING" || "$GEN1_CUR" == "TESTING" ]] || {
+  echo "❌ FAIL: gen 1 never reached an in-flight state before superseding (status=$GEN1_CUR)"
+  exit 1
+}
+sleep 0.5
 send_pr_webhook "$DELIVERY_GEN2" "synchronize" "$SHA_GEN2"
 sleep 0.5
 send_pr_webhook "$DELIVERY_GEN3" "synchronize" "$SHA_GEN3"
@@ -238,6 +257,23 @@ if ! grep -q "Cancel signal received for deployment $GEN1_ID" "$WORKER_LOG"; the
   cat "$WORKER_LOG"
   exit 1
 fi
+
+# Verify Gen 1's Redis build stream recorded `end:SUPERSEDED` with the 24h final TTL (> 21600s)
+GEN1_STREAM_KEY="logs:build:$GEN1_ID"
+GEN1_LAST_ENTRY=""
+for _ in {1..20}; do
+  GEN1_LAST_ENTRY="$(docker exec -i reapd-redis redis-cli XREVRANGE "$GEN1_STREAM_KEY" + - COUNT 1)"
+  if [[ "$GEN1_LAST_ENTRY" == *"end:SUPERSEDED"* ]]; then
+    break
+  fi
+  sleep 0.5
+done
+GEN1_TTL="$(docker exec -i reapd-redis redis-cli TTL "$GEN1_STREAM_KEY")"
+if [[ "$GEN1_LAST_ENTRY" != *"end:SUPERSEDED"* ]] || [[ "$GEN1_TTL" -le 21600 ]]; then
+  echo "❌ FAIL: expected $GEN1_STREAM_KEY to end with 'end:SUPERSEDED' ($GEN1_LAST_ENTRY) and have ttl > 21600 ($GEN1_TTL)"
+  exit 1
+fi
+echo "📡 Verified superseded stream $GEN1_STREAM_KEY ends with 'end:SUPERSEDED' (ttl=${GEN1_TTL}s)"
 
 BODY="$(curl -fsSL "https://pr-$TEST_PR_NUMBER.preview.localhost/")"
 if [[ "$BODY" != "reapd-phase4-gen3" ]]; then

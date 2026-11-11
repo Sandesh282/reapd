@@ -9,11 +9,13 @@ import { fileURLToPath } from 'node:url';
 import { Worker } from 'bullmq';
 import { Redis } from 'ioredis';
 import { abortAllActiveBuilds, buildJobHandler, type BuildJobPayload } from './jobs/build.js';
+import { redactSecrets } from './logs/log-sink.js';
 import { startReconciler } from './reconciler/index.js';
 
 export * from './builder/git-clone.js';
 export * from './builder/image-builder.js';
 export * from './jobs/build.js';
+export * from './logs/log-sink.js';
 export * from './reconciler/index.js';
 
 function checkIsMainModule(): boolean {
@@ -59,11 +61,13 @@ if (isMainModule) {
   });
 
   worker.on('failed', (job, err) => {
-    console.error(`❌ Job ${job?.id} (deployment ${job?.data.deploymentId}) failed: ${err.message}`);
+    console.error(
+      `❌ Job ${job?.id} (deployment ${job?.data.deploymentId}) failed: ${redactSecrets(err.message)}`,
+    );
   });
 
   worker.on('error', (err) => {
-    console.error('❌ BullMQ worker error:', err.message);
+    console.error('❌ BullMQ worker error:', redactSecrets(err.message));
   });
 
   const shutdown = async (): Promise<void> => {

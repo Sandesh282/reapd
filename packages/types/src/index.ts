@@ -5,4 +5,5 @@
 export * from './domain/state-machine.js';
 export * from './schemas/webhook.js';
 export * from './schemas/deployment.js';
+export * from './schemas/logs.js';
 
