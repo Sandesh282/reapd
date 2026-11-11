@@ -32,13 +32,20 @@ try {
 // ── Config ────────────────────────────────────────────────────────────────────
 
 const PORT = Number(process.env['PORT'] ?? 3001);
-// Loopback by default; set HOST=0.0.0.0 explicitly to expose the API (e.g. inside a container).
-const HOST = process.env['HOST'] ?? '127.0.0.1';
+// Loopback by default; set REAPD_API_HOST=0.0.0.0 explicitly to expose the API (e.g. inside a
+// container). Namespaced (not plain `HOST`) because other tooling commonly exports `HOST`, and
+// an empty value falls back to loopback rather than binding all interfaces.
+const HOST = process.env['REAPD_API_HOST']?.trim() || '127.0.0.1';
+const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost', '::1']);
 const WEBHOOK_SECRET = process.env['GITHUB_WEBHOOK_SECRET'] ?? '';
 const REDIS_URL = process.env['REDIS_URL'] ?? 'redis://localhost:6379';
 const BUILD_QUEUE_NAME = process.env['REAPD_BUILD_QUEUE'] ?? 'build';
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const HANDLED_PR_ACTIONS = new Set(['opened', 'synchronize', 'reopened', 'closed']);
+
+if (!LOOPBACK_HOSTS.has(HOST)) {
+  console.warn(`⚠️  API is binding to non-loopback host "${HOST}" — read endpoints are unauthenticated`);
+}
 
 if (!WEBHOOK_SECRET) {
   console.warn('⚠️  GITHUB_WEBHOOK_SECRET is not set — all webhooks will fail HMAC verification');
