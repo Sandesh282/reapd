@@ -374,5 +374,263 @@ export async function getActiveDeploymentIds(
   return { activeBuildOrLiveIds, activeContainerIds };
 }
 
+export interface DeploymentSummaryItem {
+  id: string;
+  pullRequestId: string;
+  repoFullName: string;
+  repoOwner: string;
+  repoName: string;
+  prNumber: number;
+  branchName: string;
+  isOpen: boolean;
+  commitSha: string;
+  generation: number;
+  subdomain: string;
+  previewUrl: string;
+  status: DeploymentStatus;
+  buildDurationMs: number | null;
+  failureReason: string | null;
+  expiresAt: string;
+  updatedAt: string;
+  createdAt: string;
+}
+
+export interface ListRecentDeploymentsFilter {
+  repo?: string;
+  prNumber?: number;
+  limit?: number;
+}
+
+export interface DeploymentEventItem {
+  id: string;
+  deploymentId: string;
+  fromStatus: DeploymentStatus | null;
+  toStatus: DeploymentStatus;
+  reason: string | null;
+  createdAt: string;
+}
+
+export interface DeploymentDetailWithEvents extends DeploymentSummaryItem {
+  containerId: string | null;
+  imageTag: string | null;
+  logArchiveKey: string | null;
+  events: DeploymentEventItem[];
+}
+
+const DEFAULT_DEPLOYMENTS_LIMIT = 50;
+const MAX_DEPLOYMENTS_LIMIT = 100;
+
+function toIsoString(val: Date | string): string {
+  return val instanceof Date ? val.toISOString() : new Date(val).toISOString();
+}
+
+/**
+ * Lists recent deployments ordered by `created_at DESC, generation DESC` with optional
+ * repository (`owner/name` or `name`) and PR number filters.
+ * Server-side `limit` is clamped to `[1, 100]` (default 50).
+ */
+export async function listRecentDeployments(
+  db: DrizzleClient,
+  filter?: ListRecentDeploymentsFilter
+): Promise<DeploymentSummaryItem[]> {
+  const rawLimit = filter?.limit ?? DEFAULT_DEPLOYMENTS_LIMIT;
+  const clampedLimit = Math.min(
+    MAX_DEPLOYMENTS_LIMIT,
+    Math.max(1, Number.isFinite(rawLimit) ? Math.trunc(rawLimit) : DEFAULT_DEPLOYMENTS_LIMIT)
+  );
+
+  const repoTrimmed = filter?.repo?.trim();
+  const repoClause = repoTrimmed
+    ? repoTrimmed.includes('/')
+      ? sql`AND LOWER(r.owner || '/' || r.name) = LOWER(${repoTrimmed})`
+      : sql`AND LOWER(r.name) = LOWER(${repoTrimmed})`
+    : sql``;
+
+  const prClause =
+    filter?.prNumber !== undefined && Number.isInteger(filter.prNumber) && filter.prNumber > 0
+      ? sql`AND pr.pr_number = ${filter.prNumber}`
+      : sql``;
+
+  const rows = await db.execute<{
+    id: string;
+    pull_request_id: string;
+    repo_owner: string;
+    repo_name: string;
+    pr_number: number;
+    branch_name: string;
+    is_open: boolean;
+    commit_sha: string;
+    generation: number;
+    subdomain: string;
+    status: DeploymentStatus;
+    build_duration_ms: number | null;
+    failure_reason: string | null;
+    expires_at: Date | string;
+    updated_at: Date | string;
+    created_at: Date | string;
+  }>(sql`
+    SELECT
+      d.id,
+      d.pull_request_id,
+      r.owner       AS repo_owner,
+      r.name        AS repo_name,
+      pr.pr_number,
+      pr.branch_name,
+      pr.is_open,
+      d.commit_sha,
+      d.generation,
+      d.subdomain,
+      d.status,
+      d.build_duration_ms,
+      d.failure_reason,
+      d.expires_at,
+      d.updated_at,
+      d.created_at
+    FROM deployments d
+    JOIN pull_requests pr ON pr.id = d.pull_request_id
+    JOIN repositories  r  ON r.id  = pr.repo_id
+    WHERE TRUE
+      ${repoClause}
+      ${prClause}
+    ORDER BY d.created_at DESC, d.generation DESC
+    LIMIT ${clampedLimit}
+  `);
+
+  return rows.map((row) => ({
+    id: row.id,
+    pullRequestId: row.pull_request_id,
+    repoFullName: `${row.repo_owner}/${row.repo_name}`,
+    repoOwner: row.repo_owner,
+    repoName: row.repo_name,
+    prNumber: row.pr_number,
+    branchName: row.branch_name,
+    isOpen: row.is_open,
+    commitSha: row.commit_sha.trim(),
+    generation: row.generation,
+    subdomain: row.subdomain,
+    previewUrl: `https://${row.subdomain}.preview.localhost`,
+    status: row.status,
+    buildDurationMs: row.build_duration_ms,
+    failureReason: row.failure_reason,
+    expiresAt: toIsoString(row.expires_at),
+    updatedAt: toIsoString(row.updated_at),
+    createdAt: toIsoString(row.created_at),
+  }));
+}
+
+/**
+ * Fetches a single deployment joined with its parent PR, repository, and ordered
+ * `deployment_events` timeline (`created_at ASC, id ASC`).
+ * Returns `null` if the deployment does not exist.
+ */
+export async function getDeploymentByIdWithEvents(
+  db: DrizzleClient,
+  deploymentId: string
+): Promise<DeploymentDetailWithEvents | null> {
+  const rows = await db.execute<{
+    id: string;
+    pull_request_id: string;
+    repo_owner: string;
+    repo_name: string;
+    pr_number: number;
+    branch_name: string;
+    is_open: boolean;
+    commit_sha: string;
+    generation: number;
+    subdomain: string;
+    status: DeploymentStatus;
+    container_id: string | null;
+    image_tag: string | null;
+    build_duration_ms: number | null;
+    failure_reason: string | null;
+    log_archive_key: string | null;
+    expires_at: Date | string;
+    updated_at: Date | string;
+    created_at: Date | string;
+  }>(sql`
+    SELECT
+      d.id,
+      d.pull_request_id,
+      r.owner       AS repo_owner,
+      r.name        AS repo_name,
+      pr.pr_number,
+      pr.branch_name,
+      pr.is_open,
+      d.commit_sha,
+      d.generation,
+      d.subdomain,
+      d.status,
+      d.container_id,
+      d.image_tag,
+      d.build_duration_ms,
+      d.failure_reason,
+      d.log_archive_key,
+      d.expires_at,
+      d.updated_at,
+      d.created_at
+    FROM deployments d
+    JOIN pull_requests pr ON pr.id = d.pull_request_id
+    JOIN repositories  r  ON r.id  = pr.repo_id
+    WHERE d.id = ${deploymentId}
+    LIMIT 1
+  `);
+
+  const row = rows[0];
+  if (!row) return null;
+
+  const eventRows = await db.execute<{
+    id: string;
+    deployment_id: string;
+    from_status: DeploymentStatus | null;
+    to_status: DeploymentStatus;
+    reason: string | null;
+    created_at: Date | string;
+  }>(sql`
+    SELECT
+      id,
+      deployment_id,
+      from_status,
+      to_status,
+      reason,
+      created_at
+    FROM deployment_events
+    WHERE deployment_id = ${deploymentId}
+    ORDER BY created_at ASC, id ASC
+  `);
+
+  return {
+    id: row.id,
+    pullRequestId: row.pull_request_id,
+    repoFullName: `${row.repo_owner}/${row.repo_name}`,
+    repoOwner: row.repo_owner,
+    repoName: row.repo_name,
+    prNumber: row.pr_number,
+    branchName: row.branch_name,
+    isOpen: row.is_open,
+    commitSha: row.commit_sha.trim(),
+    generation: row.generation,
+    subdomain: row.subdomain,
+    previewUrl: `https://${row.subdomain}.preview.localhost`,
+    status: row.status,
+    containerId: row.container_id,
+    imageTag: row.image_tag,
+    buildDurationMs: row.build_duration_ms,
+    failureReason: row.failure_reason,
+    logArchiveKey: row.log_archive_key,
+    expiresAt: toIsoString(row.expires_at),
+    updatedAt: toIsoString(row.updated_at),
+    createdAt: toIsoString(row.created_at),
+    events: eventRows.map((ev) => ({
+      id: ev.id,
+      deploymentId: ev.deployment_id,
+      fromStatus: ev.from_status,
+      toStatus: ev.to_status,
+      reason: ev.reason,
+      createdAt: toIsoString(ev.created_at),
+    })),
+  };
+}
+
+
 
 
