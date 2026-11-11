@@ -419,8 +419,14 @@ export async function buildJobHandler(job: Job<BuildJobPayload>): Promise<void> 
       return null;
     });
 
+    if (failTrans) {
+      finalBuildStatus = toBuildLogEndStatus(failTrans.finalStatus);
+    }
+
+    // Seal the build log stream AFTER committing the DB status and BEFORE calling GitHub
+    // (`sink.end()` is idempotent via its internal `ended` flag, so the `finally` call is a no-op).
     if (sink) {
-      await sink.end('FAILED');
+      await sink.end(finalBuildStatus);
     }
 
     if (deployment && failTrans?.finalStatus === 'FAILED') {

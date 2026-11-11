@@ -282,12 +282,20 @@ export async function upsertPrComment(
       method: 'DELETE',
       headers,
       signal: combinedSignal,
-    }).catch((delErr: unknown) => {
-      const msg = delErr instanceof Error ? delErr.message : String(delErr);
-      console.warn(
-        `⚠️  Failed to DELETE superseded PR comment ${created.id} on PR #${opts.prNumber}: ${redactSecrets(msg)}`,
-      );
-    });
+    })
+      .then((delRes) => {
+        if (!delRes.ok) {
+          console.warn(
+            `⚠️  Failed to DELETE superseded PR comment ${created.id} on PR #${opts.prNumber} (HTTP ${delRes.status})`,
+          );
+        }
+      })
+      .catch((delErr: unknown) => {
+        const msg = delErr instanceof Error ? delErr.message : String(delErr);
+        console.warn(
+          `⚠️  Failed to DELETE superseded PR comment ${created.id} on PR #${opts.prNumber}: ${redactSecrets(msg)}`,
+        );
+      });
     return {
       action: 'skipped',
       commentId: null,

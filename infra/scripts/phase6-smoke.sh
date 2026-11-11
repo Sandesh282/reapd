@@ -406,6 +406,11 @@ const [apiBase, mockGhBase, deployId] = process.argv.slice(2);
   const ghState = await ghRes.json();
   const postComments = ghState.requests.filter((r) => r.method === 'POST' && r.url.endsWith('/issues/601/comments'));
   const patchComments = ghState.requests.filter((r) => r.method === 'PATCH');
+  const tokenMints = ghState.requests.filter((r) => r.method === 'POST' && /^\/app\/installations\/\d+\/access_tokens$/.test(r.url));
+  assert.ok(
+    tokenMints.some((r) => r.body && r.body.permissions && r.body.permissions.pull_requests === 'write'),
+    'Must mint installation token with permissions.pull_requests = write',
+  );
   assert.equal(postComments.length, 1, 'Generation 1 must POST exactly 1 sticky comment');
   assert.equal(patchComments.length, 0, 'Generation 1 must not PATCH');
   assert.equal(ghState.comments.length, 1);
