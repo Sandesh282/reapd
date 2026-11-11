@@ -7,11 +7,67 @@ import test from 'node:test';
 import { AbortError } from '@reapd/docker-client';
 import {
   evaluateSmokeProbe,
+  isAllowedSmokeRequestUrl,
   runPlaywrightSmokeCheck,
   sanitizeSmokeErrorText,
+  shouldFailSmoke,
   SmokeUnavailableError,
   type SmokeCheckProbeResult,
 } from './smoke-runner.js';
+
+void test('isAllowedSmokeRequestUrl enforces exact preview origin for *.localhost and blocks loopback/private IPs while allowing public assets', () => {
+  const origin = 'https://pr-42.preview.localhost';
+
+  // Same origin -> allowed
+  assert.equal(isAllowedSmokeRequestUrl('https://pr-42.preview.localhost/', origin), true);
+  assert.equal(isAllowedSmokeRequestUrl('https://pr-42.preview.localhost/assets/app.js', origin), true);
+  assert.equal(isAllowedSmokeRequestUrl('data:image/png;base64,AAAA', origin), true);
+  assert.equal(isAllowedSmokeRequestUrl('blob:https://pr-42.preview.localhost/123', origin), true);
+
+  // Same hostname but different port or scheme (e.g. probing API :3001, Postgres :5432, Redis :6379) -> blocked!
+  assert.equal(isAllowedSmokeRequestUrl('http://pr-42.preview.localhost:3001/api/deployments', origin), false);
+  assert.equal(isAllowedSmokeRequestUrl('https://pr-42.preview.localhost:3001/health', origin), false);
+  assert.equal(isAllowedSmokeRequestUrl('http://pr-42.preview.localhost:6379/', origin), false);
+
+  // Other *.localhost, localhost, trailing-dot, single-label, or .internal/.lan origins -> blocked
+  assert.equal(isAllowedSmokeRequestUrl('http://localhost:3001/api/deployments', origin), false);
+  assert.equal(isAllowedSmokeRequestUrl('http://localhost.:3001/api/deployments', origin), false);
+  assert.equal(isAllowedSmokeRequestUrl('https://pr-99.preview.localhost/', origin), false);
+  assert.equal(isAllowedSmokeRequestUrl('https://pr-99.preview.localhost./', origin), false);
+  assert.equal(isAllowedSmokeRequestUrl('http://redis:6379/', origin), false);
+  assert.equal(isAllowedSmokeRequestUrl('http://redis.:6379/', origin), false);
+  assert.equal(isAllowedSmokeRequestUrl('http://postgres:5432/', origin), false);
+  assert.equal(isAllowedSmokeRequestUrl('http://host.docker.internal:3001/', origin), false);
+  assert.equal(isAllowedSmokeRequestUrl('http://service.lan/', origin), false);
+
+  // Private / loopback / link-local IPv4 & IPv6 literals (including hex-serialized IPv4-mapped IPv6) -> blocked
+  assert.equal(isAllowedSmokeRequestUrl('http://127.0.0.1:3001/', origin), false);
+  assert.equal(isAllowedSmokeRequestUrl('http://[::1]:3001/', origin), false);
+  assert.equal(isAllowedSmokeRequestUrl('http://[::ffff:127.0.0.1]:3001/', origin), false);
+  assert.equal(isAllowedSmokeRequestUrl('http://[::ffff:7f00:1]:3001/', origin), false);
+  assert.equal(isAllowedSmokeRequestUrl('http://[::ffff:10.0.0.1]:8080/', origin), false);
+  assert.equal(isAllowedSmokeRequestUrl('http://[::ffff:192.168.1.1]/', origin), false);
+  assert.equal(isAllowedSmokeRequestUrl('http://[fe80::1]/', origin), false);
+  assert.equal(isAllowedSmokeRequestUrl('http://[febf::1]/', origin), false);
+  assert.equal(isAllowedSmokeRequestUrl('http://169.254.169.254/latest/meta-data/', origin), false);
+  assert.equal(isAllowedSmokeRequestUrl('http://10.0.0.1/', origin), false);
+  assert.equal(isAllowedSmokeRequestUrl('http://100.64.0.1/', origin), false);
+  assert.equal(isAllowedSmokeRequestUrl('http://192.168.1.1/', origin), false);
+
+  // Public external assets (fonts, CDNs, public IPv4-mapped IPv6) -> allowed
+  assert.equal(isAllowedSmokeRequestUrl('https://fonts.googleapis.com/css2?family=Inter', origin), true);
+  assert.equal(isAllowedSmokeRequestUrl('https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css', origin), true);
+  assert.equal(isAllowedSmokeRequestUrl('https://[::ffff:8.8.8.8]/', origin), true);
+});
+
+void test('shouldFailSmoke fails on FAILED and TIMED_OUT and respects smokeRequired for SKIPPED', () => {
+  assert.equal(shouldFailSmoke('PASSED', false), false);
+  assert.equal(shouldFailSmoke('PASSED', true), false);
+  assert.equal(shouldFailSmoke('FAILED', false), true);
+  assert.equal(shouldFailSmoke('TIMED_OUT', false), true);
+  assert.equal(shouldFailSmoke('SKIPPED', false), false);
+  assert.equal(shouldFailSmoke('SKIPPED', true), true);
+});
 
 void test('evaluateSmokeProbe fails script-only blank SPA bodies and passes rendered text or visual media', () => {
   // 1. Healthy rendered text
@@ -135,6 +191,10 @@ void test('runPlaywrightSmokeCheck records PASSED, FAILED, TIMED_OUT, SKIPPED, a
     timeoutMs: 30,
     probePage: async ({ signal }): Promise<SmokeCheckProbeResult> => {
       await new Promise<void>((_, reject) => {
+        if (signal.aborted) {
+          reject(new Error('Navigation timeout exceeded'));
+          return;
+        }
         signal.addEventListener('abort', () => reject(new Error('Navigation timeout exceeded')), {
           once: true,
         });

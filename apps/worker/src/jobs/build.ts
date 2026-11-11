@@ -11,8 +11,11 @@ import {
   db,
   DeploymentNotFoundError,
   getDeploymentWithRepo,
+  getPullRequestStickyCommentState,
+  setPullRequestStickyCommentId,
   transitionDeploymentStatus,
   upsertTestRun,
+  type DeploymentWithRepo,
 } from '@reapd/db';
 import {
   AbortError,
@@ -27,8 +30,13 @@ import type { BuildLogEndStatus, DeploymentStatus } from '@reapd/types';
 import { cloneRepoAtSha } from '../builder/git-clone.js';
 import { buildDockerImage } from '../builder/image-builder.js';
 import { getInstallationToken } from '../github/auth.js';
+import { upsertPrComment } from '../github/pr-comment.js';
 import { createLogSink, type LogSink, redactSecrets } from '../logs/log-sink.js';
-import { runPlaywrightSmokeCheck } from '../smoke/smoke-runner.js';
+import {
+  runPlaywrightSmokeCheck,
+  shouldFailSmoke,
+  type SmokeTestRunSummary,
+} from '../smoke/smoke-runner.js';
 
 export interface BuildJobPayload {
   deploymentId: string;
@@ -67,6 +75,48 @@ function toBuildLogEndStatus(status: DeploymentStatus): BuildLogEndStatus {
   return 'FAILED';
 }
 
+async function bestEffortPostStickyPrComment(params: {
+  deployment: DeploymentWithRepo;
+  status: 'LIVE' | 'FAILED';
+  buildDurationMs: number | null;
+  smokeResult: SmokeTestRunSummary | null;
+  failureReason?: string | null;
+  signal: AbortSignal;
+}): Promise<void> {
+  const { deployment, status, buildDurationMs, smokeResult, failureReason, signal } = params;
+  try {
+    const res = await upsertPrComment({
+      deploymentId: deployment.id,
+      pullRequestId: deployment.pullRequestId,
+      prNumber: deployment.prNumber,
+      owner: deployment.owner,
+      repo: deployment.name,
+      installationId: deployment.installationId,
+      commitSha: deployment.commitSha,
+      generation: deployment.generation,
+      status,
+      previewUrl: deployment.previewUrl.replace(/\/+$/, ''),
+      buildDurationMs,
+      ...(failureReason ? { failureReason } : {}),
+      smoke: smokeResult,
+      getStickyState: (prId) => getPullRequestStickyCommentState(db, prId),
+      setStickyCommentId: (prId, commentId, gen) =>
+        setPullRequestStickyCommentId(db, prId, commentId, gen),
+      signal,
+    });
+    if (res.action === 'created' || res.action === 'updated') {
+      console.log(
+        `💬 Sticky PR comment ${res.action} on PR #${deployment.prNumber} (comment_id=${res.commentId})`,
+      );
+    }
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.warn(
+      `⚠️  Failed to upsert sticky PR comment for deployment ${deployment.id} (PR #${deployment.prNumber}): ${redactSecrets(msg)}`,
+    );
+  }
+}
+
 export async function buildJobHandler(job: Job<BuildJobPayload>): Promise<void> {
   const redisUrl = process.env['REDIS_URL'];
   if (!redisUrl) {
@@ -78,6 +128,9 @@ export async function buildJobHandler(job: Job<BuildJobPayload>): Promise<void> 
   const sub = new Redis(redisUrl);
   let sink: LogSink | null = null;
   let finalBuildStatus: BuildLogEndStatus = 'FAILED';
+  let deployment: DeploymentWithRepo | null = null;
+  let buildDurationMs: number | null = null;
+  let smokeResult: SmokeTestRunSummary | null = null;
 
   try {
     // ── Subscribe to cancel channel BEFORE reading state or starting work ────
@@ -89,7 +142,7 @@ export async function buildJobHandler(job: Job<BuildJobPayload>): Promise<void> 
     });
     await sub.subscribe(`cancel:deploy:${deploymentId}`);
 
-    const deployment = await getDeploymentWithRepo(db, deploymentId);
+    deployment = await getDeploymentWithRepo(db, deploymentId);
     if (!deployment) {
       throw new UnrecoverableError(`Deployment not found: ${deploymentId}`);
     }
@@ -154,7 +207,6 @@ export async function buildJobHandler(job: Job<BuildJobPayload>): Promise<void> 
       },
     });
 
-    let buildDurationMs = 0;
     try {
       sink.write('system', 'stdout', `[reapd] Building image ${imageTag} with BuildKit...`);
       const built = await buildDockerImage({
@@ -259,7 +311,6 @@ export async function buildJobHandler(job: Job<BuildJobPayload>): Promise<void> 
       return;
     }
 
-    let smokeResult;
     try {
       smokeResult = await runPlaywrightSmokeCheck({
         previewUrl: basePreviewUrl,
@@ -284,7 +335,7 @@ export async function buildJobHandler(job: Job<BuildJobPayload>): Promise<void> 
       console.warn(`⚠️  Failed to record test_run for ${deploymentId}:`, dbErr);
     });
 
-    if (smokeResult.status === 'FAILED' || smokeResult.status === 'TIMED_OUT') {
+    if (shouldFailSmoke(smokeResult.status)) {
       await forceRemoveContainer(docker, container.id).catch(() => {});
       throw new Error(
         smokeResult.failureMessage ?? `Playwright smoke check ${smokeResult.status}`,
@@ -309,9 +360,20 @@ export async function buildJobHandler(job: Job<BuildJobPayload>): Promise<void> 
       return;
     }
 
-    sink.write('system', 'stdout', `[reapd] Preview LIVE at ${basePreviewUrl}`);
     finalBuildStatus = 'LIVE';
+    sink.write('system', 'stdout', `[reapd] Preview LIVE at ${basePreviewUrl}`);
+    await sink.end('LIVE');
     console.log(`🟢 LIVE: ${basePreviewUrl} (deployment ${deploymentId})`);
+
+    // Post sticky PR comment AFTER sealing `end:LIVE` in Redis so GitHub API latency
+    // never keeps the dashboard SSE log stream open in "Live tailing" state.
+    await bestEffortPostStickyPrComment({
+      deployment,
+      status: 'LIVE',
+      buildDurationMs,
+      smokeResult,
+      signal: ac.signal,
+    });
   } catch (err) {
     if (err instanceof AbortError || (err instanceof Error && err.name === 'AbortError')) {
       const isShutdown = ac.signal.reason === 'worker_shutdown';
@@ -348,13 +410,35 @@ export async function buildJobHandler(job: Job<BuildJobPayload>): Promise<void> 
       await sink.flush();
     }
 
-    await transitionDeploymentStatus(db, {
+    const failTrans = await transitionDeploymentStatus(db, {
       deploymentId,
       toStatus: 'FAILED',
       reason,
     }).catch((dbErr: unknown) => {
       console.warn(`⚠️  Failed to record FAILED status for ${deploymentId}:`, dbErr);
+      return null;
     });
+
+    if (failTrans) {
+      finalBuildStatus = toBuildLogEndStatus(failTrans.finalStatus);
+    }
+
+    // Seal the build log stream AFTER committing the DB status and BEFORE calling GitHub
+    // (`sink.end()` is idempotent via its internal `ended` flag, so the `finally` call is a no-op).
+    if (sink) {
+      await sink.end(finalBuildStatus);
+    }
+
+    if (deployment && failTrans?.finalStatus === 'FAILED') {
+      await bestEffortPostStickyPrComment({
+        deployment,
+        status: 'FAILED',
+        buildDurationMs,
+        smokeResult,
+        failureReason: reason,
+        signal: ac.signal,
+      });
+    }
 
     throw err;
   } finally {
