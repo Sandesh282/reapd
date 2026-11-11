@@ -135,8 +135,8 @@ jobs:
 
       - name: Verify every published compose port is bound to loopback
         run: |
-          docker compose -f infra/docker-compose.yml config --format json \
-            | jq -e '[.services[].ports[]? | select(.host_ip != "127.0.0.1")] | length == 0' \
+          cfg="$(docker compose -f infra/docker-compose.yml config --format json)"
+          jq -e '[.services[].ports[]? | select(.host_ip != "127.0.0.1")] | length == 0' <<<"$cfg" \
             || { echo "❌ A published port in infra/docker-compose.yml is not bound to 127.0.0.1"; exit 1; }
 
       - name: Verify all Drizzle schema tables match 0001_initial_schema.sql

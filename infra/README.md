@@ -22,14 +22,20 @@ bash infra/scripts/cli-smoke.sh
 
 | Service | Local port (loopback only) | Purpose |
 |---|---|---|
-| Traefik | 127.0.0.1:80, 443, 8080 | Reverse proxy + TLS termination |
+| Traefik | 127.0.0.1:80, 127.0.0.1:443, 127.0.0.1:8080 | Reverse proxy + TLS termination |
 | Docker Socket Proxy | 127.0.0.1:2375 | Restricted Docker API access |
 | PostgreSQL 17 | 127.0.0.1:5432 | Primary relational database |
 | Redis 7 | 127.0.0.1:6379 | BullMQ job queue + log streams |
 
-All published ports bind to `127.0.0.1` (enforced in CI). The API also listens on loopback by
-default (`REAPD_API_HOST`). If you tunnel webhooks (ngrok / cloudflared), point the tunnel at
-`127.0.0.1:3001`.
+All published ports bind to `127.0.0.1` in `docker-compose.yml` (enforced in CI). The API also
+listens on loopback by default (`REAPD_API_HOST`). If you tunnel webhooks (ngrok / cloudflared),
+point the tunnel at `127.0.0.1:3001`.
+
+> **macOS / Docker Desktop caveat:** Docker Desktop binds *privileged* host ports (below 1024,
+> i.e. Traefik's 80 and 443) on all interfaces regardless of the `127.0.0.1` prefix. Verified with
+> `lsof -iTCP:443 -sTCP:LISTEN` (shows `*:443`) and `nc -zv <your-LAN-ip> 443` (open). Ports
+> 5432, 6379, 8080 and 2375 are correctly loopback-only. On untrusted networks, enable the macOS
+> firewall or stop the stack. On Linux the loopback bind applies to all five ports.
 
 ### Networks
 
