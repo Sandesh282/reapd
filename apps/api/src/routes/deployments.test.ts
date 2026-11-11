@@ -335,6 +335,7 @@ test('GET /api/deployments/:id/logs falls back to DB terminal status when worker
       getDeploymentByIdWithEvents: async () => makeDeploymentDetail({ status: 'FAILED' }),
       createSseRedis: () => crashedStreamRedis.client,
       xreadBlockMs: 10,
+      xreadFallbackGraceMs: 10,
     },
   });
 
@@ -347,6 +348,64 @@ test('GET /api/deployments/:id/logs falls back to DB terminal status when worker
   assert.equal(frames.length, 2, 'expected 1 buffered entry + 1 DB-fallback event: end frame');
   assert.ok(frames[0]?.includes('id: 2000-0'));
   assert.equal(frames[1], 'event: end\ndata: {"status":"FAILED"}');
+
+  // Verify grace-period recovery: when DB is already SUPERSEDED at timeout, if the worker flushes
+  // its tail + `end:SUPERSEDED` during the post-DB-read grace `XREAD BLOCK`, the client receives
+  // the late tail line rather than losing it to an immediate fallback close.
+  let xreadCallNum = 0;
+  let disconnectCalls = 0;
+  const racingSuperseedingRedis: SseRedisClient = {
+    async call(cmd: string) {
+      if (cmd.toUpperCase() === 'XREAD') {
+        xreadCallNum += 1;
+        if (xreadCallNum === 1) {
+          // Initial XREAD returns the first line
+          return [['k', [['3000-0', ['source', 'system', 'stream', 'stdout', 'ts', '3000', 'text', '[reapd] -> BUILDING']]]]];
+        }
+        if (xreadCallNum === 2) {
+          // Second XREAD times out right as webhook commits SUPERSEDED in Postgres
+          return null;
+        }
+        if (xreadCallNum === 3) {
+          // Third XREAD is the post-DB-check grace BLOCK: worker flushes its abort line + end:SUPERSEDED
+          return [
+            [
+              'k',
+              [
+                ['3000-1', ['source', 'system', 'stream', 'stderr', 'ts', '3001', 'text', '[reapd] Aborted via cancel signal -> SUPERSEDED']],
+                ['3000-2', ['source', 'system', 'stream', 'stdout', 'ts', '3002', 'text', 'end:SUPERSEDED']],
+              ],
+            ],
+          ];
+        }
+        return null;
+      }
+      return 1;
+    },
+    disconnect() {
+      disconnectCalls += 1;
+    },
+  };
+
+  const graceApp = await buildApp({
+    logger: false,
+    deploymentRoutesDeps: {
+      getDeploymentByIdWithEvents: async () => makeDeploymentDetail({ status: 'SUPERSEDED' }),
+      createSseRedis: () => racingSuperseedingRedis,
+      xreadBlockMs: 10,
+      xreadFallbackGraceMs: 25,
+    },
+  });
+  const graceRes = await graceApp.inject({
+    method: 'GET',
+    url: `/api/deployments/${DEPLOY_ID_1}/logs`,
+  });
+  assert.equal(graceRes.statusCode, 200);
+  const graceFrames = graceRes.body.trim().split('\n\n');
+  assert.equal(graceFrames.length, 3, 'grace XREAD BLOCK must capture late abort line before closing');
+  assert.ok(graceFrames[1]?.includes('Aborted via cancel signal -> SUPERSEDED'));
+  assert.equal(graceFrames[2], 'event: end\ndata: {"status":"SUPERSEDED"}');
+  assert.equal(disconnectCalls, 1);
 
   // Also verify expired stream fast-path (`keyExists: false` on a completed deployment)
   const expiredStreamRedis = createFakeSseRedis({
@@ -368,6 +427,7 @@ test('GET /api/deployments/:id/logs falls back to DB terminal status when worker
   assert.equal(expiredRes.body.trim(), 'event: end\ndata: {"status":"LIVE","expired":true}');
 
   await fallbackApp.close();
+  await graceApp.close();
   await expiredApp.close();
 });
 

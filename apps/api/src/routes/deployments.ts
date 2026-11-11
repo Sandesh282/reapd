@@ -49,6 +49,7 @@ export interface DeploymentRoutesDeps {
   allowedCorsOrigins?: ReadonlySet<string>;
   maxConcurrentSseClients?: number;
   xreadBlockMs?: number;
+  xreadFallbackGraceMs?: number;
   xreadCount?: number;
   keepaliveIntervalMs?: number;
 }
@@ -57,8 +58,10 @@ const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12
 const STREAM_ID_REGEX = /^\d+-\d+$/;
 const DEFAULT_MAX_CONCURRENT_SSE = 50;
 const DEFAULT_XREAD_BLOCK_MS = 5000;
+const DEFAULT_XREAD_FALLBACK_GRACE_MS = 1000;
 const DEFAULT_XREAD_COUNT = 200;
 const DEFAULT_KEEPALIVE_INTERVAL_MS = 15_000;
+const WRITE_DRAIN_TIMEOUT_MS = 30_000;
 
 /**
  * Compares two Redis Stream IDs (`<ms>-<seq>`).
@@ -138,14 +141,27 @@ async function writeSseChunk(res: ServerResponse, chunk: string): Promise<boolea
   if (res.writableEnded || res.destroyed) return false;
   const ok = res.write(chunk);
   if (!ok && !res.writableEnded && !res.destroyed) {
-    // Abort the losing listener so repeated backpressure events don't pile up 'close' listeners.
+    // Abort the losing listener and enforce a 30s drain timeout so a half-open slow client
+    // that stops reading without closing its socket cannot hold an SSE slot forever.
     const ac = new AbortController();
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      ac.abort();
+    }, WRITE_DRAIN_TIMEOUT_MS);
     await Promise.race([
       once(res, 'drain', { signal: ac.signal }),
       once(res, 'close', { signal: ac.signal }),
     ])
       .catch(() => {})
-      .finally(() => ac.abort());
+      .finally(() => {
+        clearTimeout(timer);
+        ac.abort();
+      });
+    if (timedOut) {
+      res.destroy();
+      return false;
+    }
   }
   return !res.writableEnded && !res.destroyed;
 }
@@ -185,6 +201,7 @@ export async function registerDeploymentRoutes(
 
   const maxConcurrentSse = deps?.maxConcurrentSseClients ?? DEFAULT_MAX_CONCURRENT_SSE;
   const xreadBlockMs = deps?.xreadBlockMs ?? DEFAULT_XREAD_BLOCK_MS;
+  const xreadFallbackGraceMs = deps?.xreadFallbackGraceMs ?? DEFAULT_XREAD_FALLBACK_GRACE_MS;
   const xreadCount = deps?.xreadCount ?? DEFAULT_XREAD_COUNT;
   const keepaliveIntervalMs = deps?.keepaliveIntervalMs ?? DEFAULT_KEEPALIVE_INTERVAL_MS;
 
@@ -284,6 +301,16 @@ export async function registerDeploymentRoutes(
       }
     };
 
+    // Register `reply.raw` 'close' immediately after reserving the slot (before any `await`)
+    // so a client disconnecting during `getDeployment(id)` still releases its slot right away.
+    // (`req.raw` 'close' is intentionally NOT used because on modern Node it fires as soon as
+    // the empty GET request body is consumed.)
+    reply.raw.once('close', cleanup);
+    if (reply.raw.destroyed || reply.raw.writableEnded) {
+      cleanup();
+      return;
+    }
+
     let initialDeployment: DeploymentDetailWithEvents | null;
     try {
       initialDeployment = await getDeployment(id);
@@ -295,6 +322,10 @@ export async function registerDeploymentRoutes(
       cleanup();
       return reply.status(404).send({ error: 'Deployment not found' });
     }
+    if (closed || reply.raw.destroyed) {
+      cleanup();
+      return;
+    }
 
     try {
       sseRedis = createSseRedis();
@@ -303,11 +334,6 @@ export async function registerDeploymentRoutes(
       req.log.error({ err, deploymentId: id }, 'Failed to create SSE Redis client');
       return reply.status(503).send({ error: 'Log streaming service unavailable' });
     }
-
-    // Only `reply.raw` 'close': it fires when the response finishes or the client connection drops.
-    // `req.raw` 'close' fires once the (empty GET) request body is consumed on modern Node, which
-    // would tear the stream down immediately.
-    reply.raw.once('close', cleanup);
 
     // Hijack the response to stream raw SSE frames; set CORS headers explicitly since
     // `reply.hijack()` bypasses Fastify's normal `onSend` lifecycle hooks.
@@ -424,16 +450,29 @@ export async function registerDeploymentRoutes(
         // Dead-worker / missing-end-marker fallback: check Postgres status on timeout.
         // Because webhook-committed SUPERSEDED and reconciler-committed FAILED land in Postgres
         // BEFORE the worker writes its final fenced line + `end:<STATUS>` marker (or if the worker
-        // was SIGKILL'd and never wrote `end:<STATUS>`), we perform one final non-blocking XREAD
-        // drain before emitting `event: end`.
+        // was SIGKILL'd and never wrote `end:<STATUS>`), we perform one bounded blocking grace read
+        // (`xreadFallbackGraceMs`, default 1000ms) followed by a drain loop after observing the
+        // terminal DB status so a racing worker has time to flush its tail + `end:<STATUS>` marker.
         const current = await getDeployment(id).catch(() => null);
         if (!current || closed || !sseRedis) break;
 
         if (isBuildCompleteInDb(current.status)) {
+          let firstGraceRead = true;
           while (!closed && sseRedis) {
-            const finalBatch = (await sseRedis
-              .call('XREAD', 'COUNT', String(xreadCount), 'STREAMS', streamKey, cursor)
-              .catch(() => null)) as XreadReply;
+            const finalBatch = (await (firstGraceRead && xreadFallbackGraceMs > 0
+              ? sseRedis.call(
+                  'XREAD',
+                  'COUNT',
+                  String(xreadCount),
+                  'BLOCK',
+                  String(xreadFallbackGraceMs),
+                  'STREAMS',
+                  streamKey,
+                  cursor,
+                )
+              : sseRedis.call('XREAD', 'COUNT', String(xreadCount), 'STREAMS', streamKey, cursor)
+            ).catch(() => null)) as XreadReply;
+            firstGraceRead = false;
             if (!finalBatch) break;
             const endMarker = await drainEntries(finalBatch);
             if (endMarker) {

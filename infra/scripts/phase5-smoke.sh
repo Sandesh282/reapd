@@ -259,8 +259,16 @@ async function consumeSse(label, lastEventId) {
   // Start Client A immediately (at build start)
   const clientAPromise = consumeSse('ClientA');
 
-  // Wait ~1.2s so the build is mid-flight, then attach Client B
+  // Wait ~1.2s so the build is mid-flight, verify the deployment is still in-flight (not LIVE yet),
+  // then attach Client B so B genuinely exercises the replay-to-live-tail handoff.
   await new Promise((r) => setTimeout(r, 1200));
+  const midCheckRes = await fetch(`${apiBase}/api/deployments/${deployId}`);
+  const midCheckJson = await midCheckRes.json();
+  assert.notEqual(
+    midCheckJson.deployment.status,
+    'LIVE',
+    `Expected deployment to still be in-flight when Client B attached, got ${midCheckJson.deployment.status}`,
+  );
   const clientBPromise = consumeSse('ClientB');
 
   const [resA, resB] = await Promise.all([clientAPromise, clientBPromise]);
@@ -322,18 +330,37 @@ const [apiBase, deployId] = process.argv.slice(2);
   const res = await fetch(`${apiBase}/api/deployments/${deployId}/logs`);
   assert.equal(res.status, 200);
   const text = await res.text();
-  assert.match(text, /\[reapd\] Build failed:/, 'Failed build stream must include system failure reason line');
-  assert.match(text, /event: end\ndata: \{"status":"FAILED"\}/, 'Failed build stream must emit event: end with FAILED');
+  assert.match(
+    text,
+    /\[reapd\] Build failed:[\s\S]*event: end\ndata: \{"status":"FAILED"\}/,
+    'Failed build stream must emit system failure reason line BEFORE event: end FAILED',
+  );
 
   const detailRes = await fetch(`${apiBase}/api/deployments/${deployId}`);
   const detailJson = await detailRes.json();
   assert.equal(detailJson.deployment.status, 'FAILED');
-  console.log(`✅ Broken Dockerfile deployment ${deployId} verified (tail='end:FAILED', DB='FAILED')`);
+  console.log(`✅ Broken Dockerfile deployment ${deployId} SSE replay verified (DB='FAILED')`);
 })().catch((err) => {
   console.error(err);
   process.exit(1);
 });
 NODE_EOF
+
+FAIL_KEY="logs:build:$DEPLOY_FAIL_ID"
+FAIL_LAST=""
+for _ in {1..20}; do
+  FAIL_LAST="$(docker exec -i reapd-redis redis-cli XREVRANGE "$FAIL_KEY" + - COUNT 1)"
+  if [[ "$FAIL_LAST" == *"end:FAILED"* ]]; then
+    break
+  fi
+  sleep 0.25
+done
+FAIL_TTL="$(docker exec -i reapd-redis redis-cli TTL "$FAIL_KEY")"
+if [[ "$FAIL_LAST" != *"end:FAILED"* ]] || [[ "$FAIL_TTL" -le 21600 ]]; then
+  echo "❌ FAIL: $FAIL_KEY must end with end:FAILED ($FAIL_LAST) and ttl > 21600 ($FAIL_TTL)"
+  exit 1
+fi
+echo "📡 Verified failed build stream $FAIL_KEY ends with 'end:FAILED' (ttl=${FAIL_TTL}s)"
 
 # ── 5. Trigger PR #503, SIGKILL worker mid-build, and verify DB fallback ─────
 echo "💀 Triggering PR #$PR_CRASH, waiting for BUILDING, then SIGKILLing worker to test dead-worker SSE fallback..."
@@ -359,10 +386,17 @@ if [[ "$CRASH_CUR" != "BUILDING" ]]; then
   exit 1
 fi
 
-# Connect an SSE client while the build is in-flight, then SIGKILL the worker and fence the DB row to FAILED
+# SIGKILL the worker mid-build (so sink.end() never runs) and fence the DB row to FAILED
 kill -9 "$WORKER_PID" 2>/dev/null || true
 wait "$WORKER_PID" 2>/dev/null || true
 WORKER_PID=""
+
+CRASH_KEY="logs:build:$DEPLOY_CRASH_ID"
+CRASH_LAST="$(docker exec -i reapd-redis redis-cli XREVRANGE "$CRASH_KEY" + - COUNT 1)"
+if [[ "$CRASH_LAST" == *"end:FAILED"* ]]; then
+  echo "❌ FAIL: expected SIGKILLed worker stream $CRASH_KEY to have NO end:FAILED marker ($CRASH_LAST)"
+  exit 1
+fi
 
 # Simulate the reconciler fencing the stuck BUILDING row to FAILED in Postgres (with NO end:FAILED marker in Redis)
 docker exec -i reapd-postgres psql -U reapd -d reapd -q -c \
