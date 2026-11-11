@@ -54,6 +54,7 @@ export interface LogRedisPipeline {
 /** Minimal Redis client subset used by `createLogSink`. */
 export interface LogRedisClient {
   status?: string;
+  on?: (event: string, listener: (...args: unknown[]) => void) => unknown;
   once?: (event: string, listener: (...args: unknown[]) => void) => unknown;
   off?: (event: string, listener: (...args: unknown[]) => void) => unknown;
   pipeline: () => LogRedisPipeline;
@@ -91,6 +92,7 @@ export interface LogSink {
 const DEFAULT_MAX_QUEUE_SIZE = 5000;
 const DEFAULT_MAX_BATCH_SIZE = 100;
 const DEFAULT_READY_TIMEOUT_MS = 3000;
+const MAX_CONSECUTIVE_BATCH_FAILURES = 2;
 const WARN_RATE_LIMIT_MS = 5000;
 const TRUNCATED_SUFFIX = ' ... [truncated]';
 
@@ -98,15 +100,17 @@ const TRUNCATED_SUFFIX = ' ... [truncated]';
  * Redacts credentials and tokens from raw log text BEFORE length truncation:
  *   - GitHub tokens (`ghs_...`, `ghp_...`, `gho_...`, `ghu_...`, `ghr_...`, `github_pat_...`)
  *   - `Authorization: <scheme> <token>` headers (including `GIT_CONFIG_VALUE_*` extraheaders)
- *   - `Basic <base64>` and `Bearer <token>` credentials
- *   - URL userinfo credentials (`https://user:pass@host`)
+ *   - `Basic <base64>` and `Bearer <token>` credentials (16+ token chars, case-sensitive scheme so
+ *     ordinary build prose like "Basic configuration" is never redacted)
+ *   - URL userinfo credentials across any scheme (`https://user:pass@host`, `redis://:pass@host`,
+ *     `postgresql://user:pass@host`)
  */
 export function redactSecrets(input: string): string {
   return input
     .replace(/(gh[pousr]_[A-Za-z0-9_]{8,}|github_pat_[A-Za-z0-9_]{8,})/g, '[REDACTED_GITHUB_TOKEN]')
     .replace(/(Authorization\s*:\s*)(?:Basic|Bearer|token)\s+[^\s"']+/gi, '$1[REDACTED]')
-    .replace(/\b(Basic|Bearer)\s+[A-Za-z0-9+/=_.-]{8,}/gi, '$1 [REDACTED]')
-    .replace(/(https?:\/\/[^/\s:@]+:)[^@\s/]+(@)/gi, '$1[REDACTED]$2');
+    .replace(/\b(Basic|Bearer)\s+[A-Za-z0-9+/=_.-]{16,}/g, '$1 [REDACTED]')
+    .replace(/(\b[a-z][a-z0-9+.-]*:\/\/[^/\s:@]*:)[^@\s/]+(@)/gi, '$1[REDACTED]$2');
 }
 
 /**
@@ -217,12 +221,6 @@ export function createLogSink(opts: CreateLogSinkOptions): LogSink {
         commandTimeout: 3000,
         lazyConnect: false,
       });
-      // Capture the most recent connection/auth error (redacted) so not-ready timeouts and
-      // end-marker warnings surface the underlying cause without crashing as an unhandled event.
-      ioredis.on('error', (err: unknown) => {
-        const msg = err instanceof Error ? err.message : String(err);
-        lastRedisError = redactSecrets(msg);
-      });
       redis = ioredis;
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -236,6 +234,13 @@ export function createLogSink(opts: CreateLogSinkOptions): LogSink {
       };
     }
   }
+
+  // Capture the most recent connection/auth error (redacted) on both owned and injected clients so
+  // not-ready timeouts and end-marker warnings surface the underlying cause without crashing.
+  redis.on?.('error', (err: unknown) => {
+    const msg = err instanceof Error ? err.message : String(err);
+    lastRedisError = redactSecrets(msg);
+  });
 
   const queue: PendingLogLine[] = [];
   let droppedCount = 0;
@@ -282,6 +287,7 @@ export function createLogSink(opts: CreateLogSinkOptions): LogSink {
   }
 
   async function drainLoop(): Promise<void> {
+    let consecutiveBatchFailures = 0;
     try {
       while (queue.length > 0 || droppedCount > 0) {
         try {
@@ -337,7 +343,19 @@ export function createLogSink(opts: CreateLogSinkOptions): LogSink {
           pipe.expire(streamKey, safetyTtlSeconds);
           const execResult = await pipe.exec();
           assertPipelineExecSucceeded(execResult);
+          consecutiveBatchFailures = 0;
         } catch (err) {
+          consecutiveBatchFailures += 1;
+          if (consecutiveBatchFailures >= MAX_CONSECUTIVE_BATCH_FAILURES && (queue.length > 0 || droppedCount > 0)) {
+            const abandoned = queue.length + droppedCount;
+            queue.length = 0;
+            droppedCount = 0;
+            warnRateLimited(
+              `Failed to flush ${batch.length} log line(s) (abandoned ${abandoned} remaining queued line(s) after ${consecutiveBatchFailures} consecutive batch failures)`,
+              err,
+            );
+            break;
+          }
           warnRateLimited(`Failed to flush ${batch.length} log line(s)`, err);
         }
       }

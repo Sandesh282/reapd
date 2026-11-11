@@ -46,6 +46,7 @@ function createFakeRedis(opts?: {
   xadds: RecordedXadd[];
   expires: RecordedExpire[];
   execCalls: number;
+  emitError: (err: Error) => void;
 } {
   const xadds: RecordedXadd[] = [];
   const expires: RecordedExpire[] = [];
@@ -67,6 +68,10 @@ function createFakeRedis(opts?: {
   const client: LogRedisClient = {
     get status() {
       return state.status;
+    },
+    on(event: string, listener: (...args: unknown[]) => void) {
+      emitter.on(event, listener);
+      return client;
     },
     once(event: string, listener: (...args: unknown[]) => void) {
       emitter.once(event, listener);
@@ -128,6 +133,9 @@ function createFakeRedis(opts?: {
     get execCalls() {
       return state.execCalls;
     },
+    emitError(err: Error) {
+      emitter.emit('error', err);
+    },
   };
 }
 
@@ -140,6 +148,8 @@ test('redactSecrets strips GitHub tokens, Authorization headers, Basic/Bearer cr
     'GIT_CONFIG_VALUE_1=Authorization: Basic dXNlcjpzZWNyZXRfcGFzc3dvcmQ=',
     'Header: Bearer eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.secret',
     'Cloning https://x-access-token:ghs_supersecret@github.com/Sandesh282/reapd.git',
+    'Redis connect failed at redis://:hunter2secret@127.0.0.1:6379/0',
+    'Basic configuration loaded',
   ].join(' | ');
 
   const redacted = redactSecrets(raw);
@@ -147,7 +157,10 @@ test('redactSecrets strips GitHub tokens, Authorization headers, Basic/Bearer cr
   assert.ok(!redacted.includes(patToken), 'github_pat_ token must be redacted');
   assert.ok(!redacted.includes('dXNlcjpzZWNyZXRfcGFzc3dvcmQ='), 'Basic base64 payload must be redacted');
   assert.ok(!redacted.includes('eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9'), 'Bearer token must be redacted');
-  assert.ok(!redacted.includes('ghs_supersecret'), 'URL password must be redacted');
+  assert.ok(!redacted.includes('ghs_supersecret'), 'HTTPS URL password must be redacted');
+  assert.ok(!redacted.includes('hunter2secret'), 'redis://:password@host password must be redacted');
+  assert.ok(redacted.includes('redis://:[REDACTED]@127.0.0.1:6379/0'), 'redis:// URL structure must be preserved');
+  assert.ok(redacted.includes('Basic configuration loaded'), 'ordinary "Basic configuration" prose must not be redacted');
 
   // Redaction happens BEFORE truncation so a token spanning the maxBytes boundary cannot leak its prefix
   const prefixPadding = 'x '.repeat(35);
@@ -295,27 +308,31 @@ test('createLogSink drops oldest lines when maxQueueSize is exceeded and surface
     /simulated Redis socket rejection/,
     'first batch warning must surface rejected pipeline.exec() error',
   );
+  // After 2 consecutive batch failures (batch 1 rejected + batch 2 tuple error), the remaining 2 queued lines
+  // are abandoned immediately so a hung/OOM Redis cannot stall `flush()` across 50 sequential batches.
+  assert.equal(tupleErrorFake.execCalls, 3, 'expected 2 batch execs + 1 end-marker exec (remaining queue abandoned after 2 consecutive batch failures)');
   assert.match(
     warnings[1] ?? '',
-    /Failed to write end marker \(FAILED\).*OOM command not allowed.*\(\+3 earlier warning\(s\) suppressed\)/,
+    /Failed to write end marker \(FAILED\).*OOM command not allowed.*\(\+1 earlier warning\(s\) suppressed\)/,
     'end() warning must bypass rate limiter, surface tuple-level OOM error, and report suppressed batch warning count',
   );
 });
 
-test('createLogSink handles Redis ready timeout gracefully and fast-fails subsequent flushes without re-waiting', async (t) => {
+test('createLogSink handles Redis ready timeout gracefully, includes lastRedisError, and fast-fails subsequent flushes without re-waiting', async (t) => {
   const deploymentId = '00000000-0000-0000-0000-000000000504';
   const warnings: string[] = [];
   t.mock.method(console, 'warn', (...args: unknown[]) => {
     warnings.push(args.map(String).join(' '));
   });
 
-  // Fake stays in 'connecting' forever (`readyAfterMs` omitted)
+  // Fake stays in 'connecting' forever (`readyAfterMs` omitted) and emits an auth error with a Redis URL secret
   const stuckFake = createFakeRedis({ initialStatus: 'connecting' });
   const sink = createLogSink({
     deploymentId,
     redis: stuckFake.client,
     readyTimeoutMs: 200,
   });
+  stuckFake.emitError(new Error('NOAUTH Authentication required at redis://:supersecretpass@127.0.0.1:6379'));
 
   sink.write('system', 'stdout', 'line-1');
   sink.write('system', 'stdout', 'line-2');
@@ -331,9 +348,10 @@ test('createLogSink handles Redis ready timeout gracefully and fast-fails subseq
 
   assert.ok(elapsedMs < 100, `expected fast-fail after initial ready timeout, took ${elapsedMs}ms`);
   assert.equal(warnings.length, 2);
-  assert.match(warnings[0] ?? '', /Redis not ready \(dropped 2 line\(s\)\)/);
+  assert.match(warnings[0] ?? '', /Redis not ready \(dropped 2 line\(s\)\).*lastError=NOAUTH Authentication required at redis:\/\/:\[REDACTED\]@127\.0\.0\.1:6379/);
+  assert.ok(!warnings.join(' ').includes('supersecretpass'), 'lastRedisError must be redacted');
   assert.match(
     warnings[1] ?? '',
-    /Failed to write end marker \(FAILED\).*remains unavailable.*\(\+1 earlier warning\(s\) suppressed\)/,
+    /Failed to write end marker \(FAILED\).*remains unavailable.*lastError=NOAUTH.*\(\+1 earlier warning\(s\) suppressed\)/,
   );
 });
