@@ -17,9 +17,9 @@ Route (apps/api) → Service (apps/worker) → Domain (packages/types) → Stora
 
 ## Local Verification Before Opening a PR
 
-1. **Start infrastructure:**
+1. **Start infrastructure** (generates random local Postgres/Redis passwords into your git-ignored `.env` on first run):
    ```bash
-   docker compose -f infra/docker-compose.yml up -d
+   npm run infra:up
    ```
 2. **Run typechecks and unit/DB tests:**
    ```bash

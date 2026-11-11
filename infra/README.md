@@ -8,7 +8,9 @@ Infrastructure for the reapd local development stack and production deployment.
 # 1. Generate wildcard TLS certs for *.preview.localhost
 npm run certs:gen
 
-# 2. Start the full local stack (Traefik, Socket Proxy, PostgreSQL, Redis)
+# 2. Start the full local stack (Traefik, Socket Proxy, PostgreSQL, Redis).
+#    First run generates random Postgres/Redis passwords into your git-ignored .env
+#    (`npm run env:init`, secrets are never printed).
 npm run infra:up
 
 # 3. Apply the database schema
@@ -38,6 +40,13 @@ you tunnel webhooks (ngrok / cloudflared), point the tunnel at `127.0.0.1:3001`.
 > 5432, 6379, 8080 and 2375 are strictly loopback-only on macOS, and the API is not routed through
 > Traefik (Traefik's dashboard is on 8080 only). On untrusted networks on macOS, enable the system
 > firewall or stop the stack. On Linux, the loopback bind applies to all six ports at runtime.
+
+### Security posture (read before running untrusted PRs)
+
+This stack is **dev-only and not hardened for untrusted PR code**.
+- Postgres and Redis both require passwords (random, generated into `.env`, which is git-ignored). Never commit `.env`, `*.pem` or `*.key` files.
+- All published ports bind to loopback (see below), but preview containers can still reach host-loopback services through `host.docker.internal` on Docker Desktop, which is why those credentials matter. Remaining hardening is tracked in [#17](https://github.com/Sandesh282/reapd/issues/17) (Phase 7).
+- Build-time `RUN` steps run unsandboxed in BuildKit; only run repositories you trust.
 
 ### Networks
 

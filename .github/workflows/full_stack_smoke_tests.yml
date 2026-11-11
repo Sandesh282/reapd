@@ -79,9 +79,12 @@ jobs:
         run: |
           echo "127.0.0.1 pr-1.preview.localhost pr-2.preview.localhost pr-104.preview.localhost pr-202.preview.localhost pr-301.preview.localhost pr-401.preview.localhost" | sudo tee -a /etc/hosts
 
+      - name: Generate local credentials (.env) for Postgres & Redis
+        run: bash infra/scripts/init-env.sh
+
       - name: Boot Docker Compose stack & apply PostgreSQL 17 schema
         run: |
-          docker compose -f infra/docker-compose.yml up -d --wait
+          docker compose --env-file .env -f infra/docker-compose.yml up -d --wait
           if ss -ltnH | awk '{print $4}' | grep -E '^(0\.0\.0\.0|\*|\[::\]):(80|443|8080|5432|6379|2375)$'; then
             echo "❌ One or more published stack ports are listening on all interfaces instead of 127.0.0.1"
             exit 1
