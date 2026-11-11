@@ -35,3 +35,21 @@ export const DeploymentEventSchema = z.object({
 
 export type DeploymentEvent = z.infer<typeof DeploymentEventSchema>;
 
+export const TEST_RUN_STATUSES = ['PASSED', 'FAILED', 'TIMED_OUT', 'SKIPPED'] as const;
+export type TestRunStatus = (typeof TEST_RUN_STATUSES)[number];
+export const TestRunStatusSchema = z.enum(TEST_RUN_STATUSES);
+
+export const TestRunSchema = z.object({
+  id: z.string().uuid(),
+  deploymentId: z.string().uuid(),
+  status: TestRunStatusSchema,
+  durationMs: z.number().int().nonnegative(),
+  consoleErrorCount: z.number().int().nonnegative(),
+  traceR2Key: z.string().max(255).nullable(),
+  screenshotR2Key: z.string().max(255).nullable(),
+  failureMessage: z.string().nullable(),
+  createdAt: z.union([z.string().datetime(), z.date()]),
+});
+
+export type TestRun = z.infer<typeof TestRunSchema>;
+

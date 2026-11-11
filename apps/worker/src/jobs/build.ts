@@ -12,6 +12,7 @@ import {
   DeploymentNotFoundError,
   getDeploymentWithRepo,
   transitionDeploymentStatus,
+  upsertTestRun,
 } from '@reapd/db';
 import {
   AbortError,
@@ -27,6 +28,7 @@ import { cloneRepoAtSha } from '../builder/git-clone.js';
 import { buildDockerImage } from '../builder/image-builder.js';
 import { getInstallationToken } from '../github/auth.js';
 import { createLogSink, type LogSink, redactSecrets } from '../logs/log-sink.js';
+import { runPlaywrightSmokeCheck } from '../smoke/smoke-runner.js';
 
 export interface BuildJobPayload {
   deploymentId: string;
@@ -92,7 +94,9 @@ export async function buildJobHandler(job: Job<BuildJobPayload>): Promise<void> 
       throw new UnrecoverableError(`Deployment not found: ${deploymentId}`);
     }
 
-    const { subdomain, commitSha, generation, owner, name, installationId } = deployment;
+    const { subdomain, previewUrl, commitSha, generation, owner, name, installationId } =
+      deployment;
+    const basePreviewUrl = previewUrl.replace(/\/+$/, '');
     const shortSha = commitSha.slice(0, 7);
     // Include generation in the image tag so two generations building the same SHA
     // never delete each other's image tag during cleanup.
@@ -229,7 +233,7 @@ export async function buildJobHandler(job: Job<BuildJobPayload>): Promise<void> 
       subdomain,
     });
 
-    const healthUrl = `https://${subdomain}.preview.localhost/health`;
+    const healthUrl = `${basePreviewUrl}/health`;
     sink.write('system', 'stdout', `[reapd] Probing health endpoint ${healthUrl}...`);
     try {
       await pollUntilHealthy(healthUrl, ac.signal, { maxWaitMs: 30_000 });
@@ -241,7 +245,7 @@ export async function buildJobHandler(job: Job<BuildJobPayload>): Promise<void> 
     }
     sink.write('system', 'stdout', `[reapd] Health check passed for ${healthUrl}`);
 
-    // ── Phase 3: STARTING → TESTING (Playwright added in Phase 6) ────────────
+    // ── Phase 3: STARTING → TESTING (Playwright smoke runner) ────────────────
     const testTrans = await transitionDeploymentStatus(db, {
       deploymentId,
       toStatus: 'TESTING',
@@ -253,6 +257,38 @@ export async function buildJobHandler(job: Job<BuildJobPayload>): Promise<void> 
       sink.write('system', 'stderr', `[reapd] Transition to TESTING fenced (${testTrans.finalStatus})`);
       await sink.flush();
       return;
+    }
+
+    let smokeResult;
+    try {
+      smokeResult = await runPlaywrightSmokeCheck({
+        previewUrl: basePreviewUrl,
+        signal: ac.signal,
+        onLog: (stream, line) => {
+          console.log(`[smoke:${subdomain}] ${redactSecrets(line)}`);
+          sink?.write('system', stream, line);
+        },
+      });
+    } catch (err) {
+      await forceRemoveContainer(docker, container.id).catch(() => {});
+      throw err;
+    }
+
+    await upsertTestRun(db, {
+      deploymentId,
+      status: smokeResult.status,
+      durationMs: smokeResult.durationMs,
+      consoleErrorCount: smokeResult.consoleErrorCount,
+      failureMessage: smokeResult.failureMessage,
+    }).catch((dbErr: unknown) => {
+      console.warn(`⚠️  Failed to record test_run for ${deploymentId}:`, dbErr);
+    });
+
+    if (smokeResult.status === 'FAILED' || smokeResult.status === 'TIMED_OUT') {
+      await forceRemoveContainer(docker, container.id).catch(() => {});
+      throw new Error(
+        smokeResult.failureMessage ?? `Playwright smoke check ${smokeResult.status}`,
+      );
     }
 
     // ── Phase 4: TESTING → LIVE ──────────────────────────────────────────────
@@ -273,9 +309,9 @@ export async function buildJobHandler(job: Job<BuildJobPayload>): Promise<void> 
       return;
     }
 
-    sink.write('system', 'stdout', `[reapd] Preview LIVE at https://${subdomain}.preview.localhost`);
+    sink.write('system', 'stdout', `[reapd] Preview LIVE at ${basePreviewUrl}`);
     finalBuildStatus = 'LIVE';
-    console.log(`🟢 LIVE: https://${subdomain}.preview.localhost (deployment ${deploymentId})`);
+    console.log(`🟢 LIVE: ${basePreviewUrl} (deployment ${deploymentId})`);
   } catch (err) {
     if (err instanceof AbortError || (err instanceof Error && err.name === 'AbortError')) {
       const isShutdown = ac.signal.reason === 'worker_shutdown';

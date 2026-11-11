@@ -38,6 +38,7 @@ jobs:
             "apps/worker/src/builder/git-clone.test.ts"
             "apps/worker/src/logs/log-sink.test.ts"
             "apps/worker/src/reconciler/reconciler.test.ts"
+            "apps/worker/src/smoke/smoke-runner.test.ts"
             "apps/api/src/routes/deployments.test.ts"
           )
           for f in "${REQUIRED_TESTS[@]}"; do

@@ -7,7 +7,12 @@
 //   failures are surfaced via the system `[reapd] Build failed: ...` summary line
 //   and the deployment's `failureReason` banner.
 
-import type { BuildLogEndStatus, DeploymentStatus, LogEntry } from '@reapd/types';
+import type {
+  BuildLogEndStatus,
+  DeploymentStatus,
+  LogEntry,
+  TestRunStatus,
+} from '@reapd/types';
 
 export interface DeploymentSummaryItem {
   id: string;
@@ -39,11 +44,24 @@ export interface DeploymentEventItem {
   createdAt: string;
 }
 
+export interface TestRunSummaryItem {
+  id: string;
+  deploymentId: string;
+  status: TestRunStatus;
+  durationMs: number;
+  consoleErrorCount: number;
+  traceR2Key: string | null;
+  screenshotR2Key: string | null;
+  failureMessage: string | null;
+  createdAt: string;
+}
+
 export interface DeploymentDetailWithEvents extends DeploymentSummaryItem {
   containerId: string | null;
   imageTag: string | null;
   logArchiveKey: string | null;
   events: DeploymentEventItem[];
+  testRun?: TestRunSummaryItem | null;
 }
 
 export interface SseGapPayload {
