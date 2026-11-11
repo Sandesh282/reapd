@@ -138,10 +138,14 @@ async function writeSseChunk(res: ServerResponse, chunk: string): Promise<boolea
   if (res.writableEnded || res.destroyed) return false;
   const ok = res.write(chunk);
   if (!ok && !res.writableEnded && !res.destroyed) {
+    // Abort the losing listener so repeated backpressure events don't pile up 'close' listeners.
+    const ac = new AbortController();
     await Promise.race([
-      once(res, 'drain'),
-      once(res, 'close'),
-    ]).catch(() => {});
+      once(res, 'drain', { signal: ac.signal }),
+      once(res, 'close', { signal: ac.signal }),
+    ])
+      .catch(() => {})
+      .finally(() => ac.abort());
   }
   return !res.writableEnded && !res.destroyed;
 }
@@ -253,17 +257,13 @@ export async function registerDeploymentRoutes(
       });
     }
 
+    // Reserve the slot BEFORE any await so concurrent requests can't all pass the cap check
+    // while a slow DB lookup is in flight; every early return below must release it.
     if (activeSseCount >= maxConcurrentSse) {
       return reply.status(429).send({
         error: `Too many concurrent log streams (max ${maxConcurrentSse})`,
       });
     }
-
-    const initialDeployment = await getDeployment(id);
-    if (!initialDeployment) {
-      return reply.status(404).send({ error: 'Deployment not found' });
-    }
-
     activeSseCount += 1;
     let sseRedis: SseRedisClient | null = null;
     let closed = false;
@@ -284,6 +284,18 @@ export async function registerDeploymentRoutes(
       }
     };
 
+    let initialDeployment: DeploymentDetailWithEvents | null;
+    try {
+      initialDeployment = await getDeployment(id);
+    } catch (err) {
+      cleanup();
+      throw err;
+    }
+    if (!initialDeployment) {
+      cleanup();
+      return reply.status(404).send({ error: 'Deployment not found' });
+    }
+
     try {
       sseRedis = createSseRedis();
     } catch (err) {
@@ -292,8 +304,9 @@ export async function registerDeploymentRoutes(
       return reply.status(503).send({ error: 'Log streaming service unavailable' });
     }
 
-    req.raw.once('close', cleanup);
-    req.raw.once('aborted', cleanup);
+    // Only `reply.raw` 'close': it fires when the response finishes or the client connection drops.
+    // `req.raw` 'close' fires once the (empty GET) request body is consumed on modern Node, which
+    // would tear the stream down immediately.
     reply.raw.once('close', cleanup);
 
     // Hijack the response to stream raw SSE frames; set CORS headers explicitly since
