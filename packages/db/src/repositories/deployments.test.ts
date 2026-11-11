@@ -14,6 +14,8 @@ import {
   expireDueDeployments,
   fenceStuckDeployments,
   getActiveDeploymentIds,
+  getDeploymentByIdWithEvents,
+  listRecentDeployments,
   transitionDeploymentStatus,
 } from './deployments.js';
 import {
@@ -283,7 +285,28 @@ test('transitionDeploymentStatus: stale generation, terminal early-exit, LIVE re
     assert.equal(closeRes.newDeploymentId, undefined);
     assert.deepEqual(closeRes.expiredIds, [reopenDeployId]);
 
-    // ── 8. Installation / repo removal: returns in-flight IDs and guards by installationId
+    // ── 8. Read queries: listRecentDeployments & getDeploymentByIdWithEvents ───
+    const recentForPr = await listRecentDeployments(db, {
+      repo: 'Sandesh282/reapd-db-test',
+      prNumber: TEST_PR_NUMBER,
+      limit: 5,
+    });
+    assert.ok(recentForPr.length >= 1, 'listRecentDeployments should return deployments for repo + pr');
+    assert.equal(recentForPr[0]?.prNumber, TEST_PR_NUMBER);
+    assert.equal(recentForPr[0]?.repoFullName, 'Sandesh282/reapd-db-test');
+
+    const detail = await getDeploymentByIdWithEvents(db, reopenDeployId);
+    assert.ok(detail, 'getDeploymentByIdWithEvents should find reopenDeployId');
+    assert.equal(detail.id, reopenDeployId);
+    assert.equal(detail.status, 'EXPIRED');
+    assert.ok(detail.events.length >= 5, 'events timeline should include QUEUED->BUILDING->STARTING->TESTING->LIVE->EXPIRED');
+    assert.equal(detail.events[0]?.toStatus, 'QUEUED');
+    assert.equal(detail.events.at(-1)?.toStatus, 'EXPIRED');
+
+    const missingDetail = await getDeploymentByIdWithEvents(db, '00000000-0000-0000-0000-000000000000');
+    assert.equal(missingDetail, null);
+
+    // ── 9. Installation / repo removal: returns in-flight IDs and guards by installationId
     const dUninstall = randomUUID();
     deliveries.push(dUninstall);
     const uninstallIngest = await ingestPullRequestWebhook(db, {

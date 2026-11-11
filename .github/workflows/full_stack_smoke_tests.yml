@@ -56,6 +56,8 @@ jobs:
             script: './infra/scripts/phase3-smoke.sh'
           - label: 'Phase 4 — Rapid Superseding & Desired-State Reconciler'
             script: './infra/scripts/phase4-smoke.sh'
+          - label: 'Phase 5 — REST API & SSE Build Log Streaming'
+            script: './infra/scripts/phase5-smoke.sh'
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -77,7 +79,7 @@ jobs:
 
       - name: Configure *.preview.localhost in /etc/hosts for curl on Linux runners
         run: |
-          echo "127.0.0.1 pr-1.preview.localhost pr-2.preview.localhost pr-104.preview.localhost pr-202.preview.localhost pr-301.preview.localhost pr-401.preview.localhost" | sudo tee -a /etc/hosts
+          echo "127.0.0.1 pr-1.preview.localhost pr-2.preview.localhost pr-104.preview.localhost pr-202.preview.localhost pr-301.preview.localhost pr-401.preview.localhost pr-501.preview.localhost pr-502.preview.localhost pr-503.preview.localhost" | sudo tee -a /etc/hosts
 
       - name: Generate local credentials (.env) for Postgres & Redis
         run: bash infra/scripts/init-env.sh
