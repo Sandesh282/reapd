@@ -12,6 +12,7 @@ import {
   DeploymentNotFoundError,
   getDeploymentWithRepo,
   transitionDeploymentStatus,
+  upsertTestRun,
 } from '@reapd/db';
 import {
   AbortError,
@@ -27,6 +28,7 @@ import { cloneRepoAtSha } from '../builder/git-clone.js';
 import { buildDockerImage } from '../builder/image-builder.js';
 import { getInstallationToken } from '../github/auth.js';
 import { createLogSink, type LogSink, redactSecrets } from '../logs/log-sink.js';
+import { runPlaywrightSmokeCheck } from '../smoke/smoke-runner.js';
 
 export interface BuildJobPayload {
   deploymentId: string;
@@ -241,7 +243,7 @@ export async function buildJobHandler(job: Job<BuildJobPayload>): Promise<void> 
     }
     sink.write('system', 'stdout', `[reapd] Health check passed for ${healthUrl}`);
 
-    // ── Phase 3: STARTING → TESTING (Playwright added in Phase 6) ────────────
+    // ── Phase 3: STARTING → TESTING (Playwright smoke runner) ────────────────
     const testTrans = await transitionDeploymentStatus(db, {
       deploymentId,
       toStatus: 'TESTING',
@@ -253,6 +255,39 @@ export async function buildJobHandler(job: Job<BuildJobPayload>): Promise<void> 
       sink.write('system', 'stderr', `[reapd] Transition to TESTING fenced (${testTrans.finalStatus})`);
       await sink.flush();
       return;
+    }
+
+    const previewUrl = `https://${subdomain}.preview.localhost`;
+    let smokeResult;
+    try {
+      smokeResult = await runPlaywrightSmokeCheck({
+        previewUrl,
+        signal: ac.signal,
+        onLog: (stream, line) => {
+          console.log(`[smoke:${subdomain}] ${redactSecrets(line)}`);
+          sink?.write('system', stream, line);
+        },
+      });
+    } catch (err) {
+      await forceRemoveContainer(docker, container.id).catch(() => {});
+      throw err;
+    }
+
+    await upsertTestRun(db, {
+      deploymentId,
+      status: smokeResult.status,
+      durationMs: smokeResult.durationMs,
+      consoleErrorCount: smokeResult.consoleErrorCount,
+      failureMessage: smokeResult.failureMessage,
+    }).catch((dbErr: unknown) => {
+      console.warn(`⚠️  Failed to record test_run for ${deploymentId}:`, dbErr);
+    });
+
+    if (smokeResult.status !== 'PASSED') {
+      await forceRemoveContainer(docker, container.id).catch(() => {});
+      throw new Error(
+        smokeResult.failureMessage ?? `Playwright smoke check ${smokeResult.status}`,
+      );
     }
 
     // ── Phase 4: TESTING → LIVE ──────────────────────────────────────────────

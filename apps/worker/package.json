@@ -12,19 +12,19 @@
     "lint": "eslint src"
   },
   "dependencies": {
+    "@reapd/db": "*",
+    "@reapd/docker-client": "*",
+    "@reapd/types": "*",
     "bullmq": "^5.34.4",
     "ioredis": "^5.4.2",
-    "@reapd/types": "*",
-    "@reapd/db": "*",
-    "@reapd/docker-client": "*"
+    "playwright-core": "^1.65.0"
   },
   "devDependencies": {
+    "@types/node": "^22.10.1",
     "tsx": "^4.19.2",
-    "typescript": "^5.7.2",
-    "@types/node": "^22.10.1"
+    "typescript": "^5.7.2"
   },
   "engines": {
     "node": ">=22"
   }
 }
-
