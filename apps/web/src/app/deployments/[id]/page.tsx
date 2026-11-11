@@ -168,6 +168,30 @@ export default function DeploymentDetailPage(): React.ReactElement {
               </span>
             </div>
             <div className="meta-item">
+              <span className="meta-label">Playwright Smoke</span>
+              <span className="meta-value mono">
+                {deployment.testRun ? (
+                  <span
+                    className={`status-badge status-${
+                      deployment.testRun.status === 'PASSED'
+                        ? 'live'
+                        : deployment.testRun.status === 'SKIPPED'
+                          ? 'expired'
+                          : 'failed'
+                    }`}
+                  >
+                    {deployment.testRun.status} ({formatDurationMs(deployment.testRun.durationMs)}
+                    {deployment.testRun.consoleErrorCount > 0
+                      ? ` · ${deployment.testRun.consoleErrorCount} console err`
+                      : ''}
+                    )
+                  </span>
+                ) : (
+                  '—'
+                )}
+              </span>
+            </div>
+            <div className="meta-item">
               <span className="meta-label">Expires At</span>
               <span className="meta-value mono">
                 {new Date(deployment.expiresAt).toLocaleString()}
