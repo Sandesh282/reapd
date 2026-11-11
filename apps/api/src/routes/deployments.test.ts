@@ -61,6 +61,7 @@ function makeDeploymentDetail(
         createdAt: '2026-11-11T12:00:01.000Z',
       },
     ],
+    testRun: null,
     ...overrides,
   };
 }

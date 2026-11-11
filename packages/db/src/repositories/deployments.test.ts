@@ -17,6 +17,7 @@ import {
   getDeploymentByIdWithEvents,
   listRecentDeployments,
   transitionDeploymentStatus,
+  upsertTestRun,
 } from './deployments.js';
 import {
   deleteRepositoriesByInstallationId,
@@ -299,9 +300,38 @@ test('transitionDeploymentStatus: stale generation, terminal early-exit, LIVE re
     assert.ok(detail, 'getDeploymentByIdWithEvents should find reopenDeployId');
     assert.equal(detail.id, reopenDeployId);
     assert.equal(detail.status, 'EXPIRED');
+    assert.equal(detail.testRun, null);
     assert.ok(detail.events.length >= 5, 'events timeline should include QUEUED->BUILDING->STARTING->TESTING->LIVE->EXPIRED');
     assert.equal(detail.events[0]?.toStatus, 'QUEUED');
     assert.equal(detail.events.at(-1)?.toStatus, 'EXPIRED');
+
+    // Verify upsertTestRun inserts and updates on conflict (UNIQUE deployment_id)
+    const run1 = await upsertTestRun(db, {
+      deploymentId: reopenDeployId,
+      status: 'FAILED',
+      durationMs: 420,
+      consoleErrorCount: 2,
+      failureMessage: 'Console error: boom',
+    });
+    assert.equal(run1.status, 'FAILED');
+    assert.equal(run1.consoleErrorCount, 2);
+
+    const run2 = await upsertTestRun(db, {
+      deploymentId: reopenDeployId,
+      status: 'PASSED',
+      durationMs: 310,
+      consoleErrorCount: 0,
+      failureMessage: null,
+    });
+    assert.equal(run2.id, run1.id, 'upsertTestRun must overwrite in-place on UNIQUE (deployment_id)');
+    assert.equal(run2.status, 'PASSED');
+    assert.equal(run2.consoleErrorCount, 0);
+    assert.equal(run2.failureMessage, null);
+
+    const detailWithTest = await getDeploymentByIdWithEvents(db, reopenDeployId);
+    assert.ok(detailWithTest?.testRun);
+    assert.equal(detailWithTest.testRun.status, 'PASSED');
+    assert.equal(detailWithTest.testRun.durationMs, 310);
 
     const missingDetail = await getDeploymentByIdWithEvents(db, '00000000-0000-0000-0000-000000000000');
     assert.equal(missingDetail, null);

@@ -8,6 +8,7 @@ import {
   assertValidTransition,
   TERMINAL_STATUSES,
   type DeploymentStatus,
+  type TestRunStatus,
 } from '@reapd/types';
 import type { DrizzleClient } from '../client.js';
 
@@ -410,11 +411,34 @@ export interface DeploymentEventItem {
   createdAt: string;
 }
 
+export interface TestRunSummaryItem {
+  id: string;
+  deploymentId: string;
+  status: TestRunStatus;
+  durationMs: number;
+  consoleErrorCount: number;
+  traceR2Key: string | null;
+  screenshotR2Key: string | null;
+  failureMessage: string | null;
+  createdAt: string;
+}
+
+export interface UpsertTestRunInput {
+  deploymentId: string;
+  status: TestRunStatus;
+  durationMs: number;
+  consoleErrorCount?: number;
+  traceR2Key?: string | null;
+  screenshotR2Key?: string | null;
+  failureMessage?: string | null;
+}
+
 export interface DeploymentDetailWithEvents extends DeploymentSummaryItem {
   containerId: string | null;
   imageTag: string | null;
   logArchiveKey: string | null;
   events: DeploymentEventItem[];
+  testRun: TestRunSummaryItem | null;
 }
 
 const DEFAULT_DEPLOYMENTS_LIMIT = 50;
@@ -598,6 +622,34 @@ export async function getDeploymentByIdWithEvents(
     ORDER BY created_at ASC, id ASC
   `);
 
+  const testRunRows = await db.execute<{
+    id: string;
+    deployment_id: string;
+    status: TestRunStatus;
+    duration_ms: number;
+    console_error_count: number;
+    trace_r2_key: string | null;
+    screenshot_r2_key: string | null;
+    failure_message: string | null;
+    created_at: Date | string;
+  }>(sql`
+    SELECT
+      id,
+      deployment_id,
+      status,
+      duration_ms,
+      console_error_count,
+      trace_r2_key,
+      screenshot_r2_key,
+      failure_message,
+      created_at
+    FROM test_runs
+    WHERE deployment_id = ${deploymentId}
+    LIMIT 1
+  `);
+
+  const tr = testRunRows[0];
+
   return {
     id: row.id,
     pullRequestId: row.pull_request_id,
@@ -628,5 +680,96 @@ export async function getDeploymentByIdWithEvents(
       reason: ev.reason,
       createdAt: toIsoString(ev.created_at),
     })),
+    testRun: tr
+      ? {
+          id: tr.id,
+          deploymentId: tr.deployment_id,
+          status: tr.status,
+          durationMs: Number(tr.duration_ms),
+          consoleErrorCount: Number(tr.console_error_count),
+          traceR2Key: tr.trace_r2_key,
+          screenshotR2Key: tr.screenshot_r2_key,
+          failureMessage: tr.failure_message,
+          createdAt: toIsoString(tr.created_at),
+        }
+      : null,
   };
 }
+
+/**
+ * Upserts a `test_runs` row for a deployment (`UNIQUE (deployment_id)` per PRD v2.2 fix #4).
+ * Ensures retry runs or repeated invocations overwrite the single test_run record cleanly.
+ */
+export async function upsertTestRun(
+  db: DrizzleClient,
+  input: UpsertTestRunInput
+): Promise<TestRunSummaryItem> {
+  const durationMs = Math.max(0, Math.trunc(input.durationMs));
+  const consoleErrorCount = Math.max(0, Math.trunc(input.consoleErrorCount ?? 0));
+  const traceR2Key = input.traceR2Key ?? null;
+  const screenshotR2Key = input.screenshotR2Key ?? null;
+  const failureMessage = input.failureMessage ?? null;
+
+  const rows = await db.execute<{
+    id: string;
+    deployment_id: string;
+    status: TestRunStatus;
+    duration_ms: number;
+    console_error_count: number;
+    trace_r2_key: string | null;
+    screenshot_r2_key: string | null;
+    failure_message: string | null;
+    created_at: Date | string;
+  }>(sql`
+    INSERT INTO test_runs (
+      deployment_id,
+      status,
+      duration_ms,
+      console_error_count,
+      trace_r2_key,
+      screenshot_r2_key,
+      failure_message
+    )
+    VALUES (
+      ${input.deploymentId},
+      ${input.status}::test_run_status,
+      ${durationMs},
+      ${consoleErrorCount},
+      ${traceR2Key},
+      ${screenshotR2Key},
+      ${failureMessage}
+    )
+    ON CONFLICT (deployment_id) DO UPDATE
+      SET status              = EXCLUDED.status,
+          duration_ms         = EXCLUDED.duration_ms,
+          console_error_count = EXCLUDED.console_error_count,
+          trace_r2_key        = EXCLUDED.trace_r2_key,
+          screenshot_r2_key   = EXCLUDED.screenshot_r2_key,
+          failure_message     = EXCLUDED.failure_message,
+          created_at          = NOW()
+    RETURNING
+      id,
+      deployment_id,
+      status,
+      duration_ms,
+      console_error_count,
+      trace_r2_key,
+      screenshot_r2_key,
+      failure_message,
+      created_at
+  `);
+
+  const row = rows[0]!;
+  return {
+    id: row.id,
+    deploymentId: row.deployment_id,
+    status: row.status,
+    durationMs: Number(row.duration_ms),
+    consoleErrorCount: Number(row.console_error_count),
+    traceR2Key: row.trace_r2_key,
+    screenshotR2Key: row.screenshot_r2_key,
+    failureMessage: row.failure_message,
+    createdAt: toIsoString(row.created_at),
+  };
+}
+
