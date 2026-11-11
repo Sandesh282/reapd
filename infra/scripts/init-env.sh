@@ -1,13 +1,18 @@
 #!/usr/bin/env bash
 # Generates local-only credentials for the dev stack and writes them to the git-ignored .env.
 #
-# - Creates .env from .env.example if it does not exist.
-# - If POSTGRES_PASSWORD / REDIS_PASSWORD are missing from .env, generates random ones and rewrites
-#   DATABASE_URL / REDIS_URL to match. Existing values are never overwritten, so it is safe to re-run.
-# - If the reapd-postgres container is already running with an older password, updates the role
-#   password in place (Postgres only applies POSTGRES_PASSWORD when the data volume is first created).
+# - Creates .env from .env.example if it does not exist (mode 600).
+# - If POSTGRES_PASSWORD / REDIS_PASSWORD are missing or still the `change-me` placeholder, generates
+#   random ones. Existing real values are never overwritten, so it is safe to re-run.
+# - DATABASE_URL / REDIS_URL are rewritten only when missing or still the placeholder/default value,
+#   so custom hosts, ports or database names are preserved.
 # - Never prints the generated secrets.
+#
+# NOTE: this script only edits .env. Postgres applies POSTGRES_PASSWORD only when its data volume is
+# first created, so `infra/scripts/sync-postgres-password.sh` (run after `compose up`) reconciles an
+# existing volume with the new password.
 set -euo pipefail
+umask 077
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 ENV_FILE="$ROOT/.env"
@@ -16,19 +21,14 @@ if [[ ! -f "$ENV_FILE" ]]; then
   cp "$ROOT/.env.example" "$ENV_FILE"
   echo "📄 Created .env from .env.example"
 fi
+chmod 600 "$ENV_FILE"
 
-has_key() { grep -qE "^$1=.+" "$ENV_FILE"; }
-is_placeholder() { grep -qE "^$1=.*change-me" "$ENV_FILE"; }
-
-need_pg=false
-need_redis=false
-{ ! has_key POSTGRES_PASSWORD || is_placeholder POSTGRES_PASSWORD; } && need_pg=true
-{ ! has_key REDIS_PASSWORD || is_placeholder REDIS_PASSWORD; } && need_redis=true
-
-if ! $need_pg && ! $need_redis; then
-  echo "✅ .env already has Postgres and Redis credentials"
-  exit 0
-fi
+get_key() { grep -E "^$1=" "$ENV_FILE" | head -1 | cut -d= -f2- || true; }
+has_real_value() {
+  local v
+  v="$(get_key "$1")"
+  [[ -n "$v" && "$v" != *change-me* ]]
+}
 
 # Replaces (or appends) KEY=VALUE in .env without using sed -i (differs between macOS and Linux).
 set_key() {
@@ -40,28 +40,34 @@ set_key() {
   rm -f "$tmp"
 }
 
-get_key() { grep -E "^$1=" "$ENV_FILE" | head -1 | cut -d= -f2-; }
+changed=false
 
-if $need_pg; then
+if ! has_real_value POSTGRES_PASSWORD; then
   set_key POSTGRES_PASSWORD "$(openssl rand -hex 24)"
+  changed=true
 fi
-if $need_redis; then
+if ! has_real_value REDIS_PASSWORD; then
   set_key REDIS_PASSWORD "$(openssl rand -hex 24)"
+  changed=true
 fi
 
 PG_PASS="$(get_key POSTGRES_PASSWORD)"
 REDIS_PASS="$(get_key REDIS_PASSWORD)"
-set_key DATABASE_URL "postgres://reapd:${PG_PASS}@localhost:5432/reapd"
-set_key REDIS_URL "redis://:${REDIS_PASS}@localhost:6379"
-chmod 600 "$ENV_FILE"
-echo "🔐 Generated local Postgres/Redis credentials in .env (not printed)"
 
-# Apply to an already-initialised Postgres volume (local unix socket inside the container is trusted).
-if $need_pg && docker ps --format '{{.Names}}' 2>/dev/null | grep -qx reapd-postgres; then
-  docker exec -i reapd-postgres psql -U reapd -d reapd -q -v ON_ERROR_STOP=1 \
-    -c "ALTER USER reapd PASSWORD '${PG_PASS}'" >/dev/null
-  echo "🔁 Updated the running Postgres role password"
+# Only (re)write the connection URLs while they are missing / placeholder / the old public default.
+db_url="$(get_key DATABASE_URL)"
+if [[ -z "$db_url" || "$db_url" == *change-me* || "$db_url" == *reapd_dev_password* ]]; then
+  set_key DATABASE_URL "postgres://reapd:${PG_PASS}@localhost:5432/reapd"
+  changed=true
+fi
+redis_url="$(get_key REDIS_URL)"
+if [[ -z "$redis_url" || "$redis_url" == *change-me* || "$redis_url" == "redis://localhost:6379" ]]; then
+  set_key REDIS_URL "redis://:${REDIS_PASS}@localhost:6379"
+  changed=true
 fi
 
-echo "ℹ️  Recreate the stack so Redis picks up the new password: npm run infra:up"
-
+if $changed; then
+  echo "🔐 Generated/updated local Postgres/Redis credentials in .env (not printed)"
+else
+  echo "✅ .env already has Postgres and Redis credentials"
+fi

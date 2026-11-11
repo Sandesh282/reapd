@@ -27,12 +27,25 @@ const SHA_1 = 'a'.repeat(40);
 const SHA_2 = 'b'.repeat(40);
 const SHA_3 = 'c'.repeat(40);
 
+/**
+ * Returns false only when Postgres is genuinely unreachable (connection refused / timeout / DNS).
+ * Any other failure — notably `28P01` invalid password or `28000` auth errors — is rethrown so a
+ * stale local credential fails the run loudly instead of silently skipping DB coverage.
+ */
 async function isPostgresReachable(): Promise<boolean> {
   try {
     await db.execute(sql`SELECT 1`);
     return true;
-  } catch {
-    return false;
+  } catch (err) {
+    const e = err as { code?: string; errno?: string; cause?: { code?: string } };
+    const code = e.code ?? e.cause?.code ?? e.errno;
+    const unreachable = new Set(['ECONNREFUSED', 'ETIMEDOUT', 'ENOTFOUND', 'EHOSTUNREACH', 'CONNECT_TIMEOUT']);
+    if (code && unreachable.has(code)) return false;
+    // postgres-js wraps connection failures in an AggregateError for dual-stack localhost
+    if (err instanceof AggregateError && err.errors.every((x) => unreachable.has((x as { code?: string }).code ?? ''))) {
+      return false;
+    }
+    throw err;
   }
 }
 

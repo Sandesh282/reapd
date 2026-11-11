@@ -85,6 +85,7 @@ jobs:
       - name: Boot Docker Compose stack & apply PostgreSQL 17 schema
         run: |
           docker compose --env-file .env -f infra/docker-compose.yml up -d --wait
+          bash infra/scripts/sync-postgres-password.sh
           if ss -ltnH | awk '{print $4}' | grep -E '^(0\.0\.0\.0|\*|\[::\]):(80|443|8080|5432|6379|2375)$'; then
             echo "❌ One or more published stack ports are listening on all interfaces instead of 127.0.0.1"
             exit 1
