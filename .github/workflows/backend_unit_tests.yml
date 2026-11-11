@@ -38,6 +38,7 @@ jobs:
             "apps/worker/src/builder/git-clone.test.ts"
             "apps/worker/src/logs/log-sink.test.ts"
             "apps/worker/src/reconciler/reconciler.test.ts"
+            "apps/api/src/routes/deployments.test.ts"
           )
           for f in "${REQUIRED_TESTS[@]}"; do
             if [[ ! -f "$f" ]]; then
@@ -75,6 +76,21 @@ jobs:
 
       - name: Run @reapd/worker unit tests
         run: npm run test --workspace @reapd/worker
+
+  api_unit_tests:
+    name: Unit tests (@reapd/api)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 50
+
+      - name: Set up Node & dependencies
+        uses: ./.github/actions/setup-node-and-deps
+
+      - name: Run @reapd/api unit tests
+        run: npm run test --workspace @reapd/api
 
   postgres_db_integration_tests:
     name: PostgreSQL 17 integration tests (@reapd/db)
@@ -119,6 +135,7 @@ jobs:
       - verify_associated_test_files
       - docker_client_unit_tests
       - worker_unit_tests
+      - api_unit_tests
       - postgres_db_integration_tests
     if: always()
     runs-on: ubuntu-24.04
