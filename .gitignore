@@ -33,6 +33,8 @@ Thumbs.db
 # Docker / infra
 infra/traefik/certs/*.pem
 infra/traefik/certs/*.key
+*.pem
+*.key
 
 # Test artifacts
 playwright-report/

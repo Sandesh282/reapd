@@ -128,14 +128,14 @@ jobs:
 
       - name: Validate docker-compose.yml syntax & socket-proxy ACLs
         run: |
-          docker compose -f infra/docker-compose.yml config >/dev/null
+          docker compose --env-file .env.example -f infra/docker-compose.yml config >/dev/null
           grep -q "PRIVILEGED: 0" infra/docker-compose.yml
           grep -q "HOST: 0" infra/docker-compose.yml
           grep -q "EXEC: 0" infra/docker-compose.yml
 
       - name: Verify every published compose port is bound to loopback
         run: |
-          cfg="$(docker compose -f infra/docker-compose.yml config --format json)"
+          cfg="$(docker compose --env-file .env.example -f infra/docker-compose.yml config --format json)"
           jq -e '[.services[].ports[]? | select(.host_ip != "127.0.0.1")] | length == 0' <<<"$cfg" \
             || { echo "❌ A published port in infra/docker-compose.yml is not bound to 127.0.0.1"; exit 1; }
 

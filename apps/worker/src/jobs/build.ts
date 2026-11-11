@@ -34,7 +34,6 @@ export interface BuildJobPayload {
   subpath?: string;
 }
 
-const REDIS_URL = process.env['REDIS_URL'] ?? 'redis://localhost:6379';
 const docker = createDockerClient();
 const activeBuildControllers = new Map<string, AbortController>();
 
@@ -60,10 +59,14 @@ export function parseGenerationFromTag(repoTag: string): number | null {
 }
 
 export async function buildJobHandler(job: Job<BuildJobPayload>): Promise<void> {
+  const redisUrl = process.env['REDIS_URL'];
+  if (!redisUrl) {
+    throw new UnrecoverableError('REDIS_URL is not set — run `npm run env:init`');
+  }
   const { deploymentId } = job.data;
   const ac = new AbortController();
   activeBuildControllers.set(deploymentId, ac);
-  const sub = new Redis(REDIS_URL);
+  const sub = new Redis(redisUrl);
 
   try {
     // ── Subscribe to cancel channel BEFORE reading state or starting work ────

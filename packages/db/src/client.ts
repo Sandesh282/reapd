@@ -17,9 +17,10 @@ if (process.env['NODE_ENV'] === 'production' && !process.env['DATABASE_URL']) {
   throw new Error('DATABASE_URL must be set when NODE_ENV=production');
 }
 
-const sql = postgres(
-  process.env['DATABASE_URL'] ?? 'postgres://reapd:reapd_dev_password@localhost:5432/reapd'
-);
+// No hardcoded credential default: the old public `reapd_dev_password` no longer exists.
+// Kept import-safe without noisy warnings so unit tests that import `@reapd/db` without
+// touching Postgres run cleanly; auth errors (`28P01`) fail loudly on actual queries.
+const sql = postgres(process.env['DATABASE_URL'] ?? 'postgres://reapd@localhost:5432/reapd');
 
 export const db = drizzle(sql, { schema });
 

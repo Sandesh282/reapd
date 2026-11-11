@@ -14,9 +14,10 @@
     "lint": "turbo run lint",
     "test": "turbo run test",
     "typecheck": "turbo run typecheck",
-    "infra:up": "docker compose -f infra/docker-compose.yml up -d",
-    "infra:down": "docker compose -f infra/docker-compose.yml down",
-    "infra:logs": "docker compose -f infra/docker-compose.yml logs -f",
+    "infra:up": "bash infra/scripts/init-env.sh && docker compose --env-file .env -f infra/docker-compose.yml up -d --wait && bash infra/scripts/sync-postgres-password.sh",
+    "infra:down": "docker compose --env-file .env.example -f infra/docker-compose.yml down",
+    "infra:logs": "docker compose --env-file .env.example -f infra/docker-compose.yml logs -f",
+    "env:init": "bash infra/scripts/init-env.sh",
     "certs:gen": "bash infra/scripts/gen-certs.sh",
     "reapd": "npm run cli --workspace @reapd/worker --"
   },

@@ -35,7 +35,11 @@ if (isMainModule) {
     // .env is optional when variables are injected via the environment
   }
 
-  const redisUrl = process.env['REDIS_URL'] ?? 'redis://localhost:6379';
+  const redisUrl = process.env['REDIS_URL'];
+  if (!redisUrl) {
+    console.error('❌ REDIS_URL is not set — run `npm run env:init` to generate local credentials');
+    process.exit(1);
+  }
   const queueName = process.env['REAPD_BUILD_QUEUE'] ?? 'build';
   const redis = new Redis(redisUrl, { maxRetriesPerRequest: null });
 

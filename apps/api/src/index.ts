@@ -38,7 +38,11 @@ const PORT = Number(process.env['PORT'] ?? 3001);
 const HOST = process.env['REAPD_API_HOST']?.trim() || '127.0.0.1';
 const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost', '::1']);
 const WEBHOOK_SECRET = process.env['GITHUB_WEBHOOK_SECRET'] ?? '';
-const REDIS_URL = process.env['REDIS_URL'] ?? 'redis://localhost:6379';
+const REDIS_URL = process.env['REDIS_URL'];
+if (!REDIS_URL) {
+  console.error('❌ REDIS_URL is not set — run `npm run env:init` to generate local credentials');
+  process.exit(1);
+}
 const BUILD_QUEUE_NAME = process.env['REAPD_BUILD_QUEUE'] ?? 'build';
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const HANDLED_PR_ACTIONS = new Set(['opened', 'synchronize', 'reopened', 'closed']);
