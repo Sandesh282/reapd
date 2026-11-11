@@ -202,15 +202,20 @@ curl -fsS -X POST "http://127.0.0.1:$API_PORT/webhooks/github" \
 # ── 3. Fire 3 rapid commits to trigger in-flight superseding ─────────────────
 echo "⚡ Firing 3 rapid commits to PR #$TEST_PR_NUMBER..."
 send_pr_webhook "$DELIVERY_GEN1" "opened" "$SHA_GEN1"
-# Poll until Gen 1 enters BUILDING so its log sink is guaranteed to exist before Gen 2 supersedes it
+# Poll until Gen 1 enters an in-flight state so its log sink is guaranteed to exist before Gen 2 supersedes it
+GEN1_CUR=""
 for _ in {1..40}; do
   GEN1_CUR="$(docker exec -i reapd-postgres psql -U reapd -d reapd -tAq -c \
     "SELECT status FROM deployments WHERE subdomain = 'pr-$TEST_PR_NUMBER' AND generation = 1 LIMIT 1;")"
-  if [[ "$GEN1_CUR" == "BUILDING" ]]; then
+  if [[ "$GEN1_CUR" == "BUILDING" || "$GEN1_CUR" == "STARTING" || "$GEN1_CUR" == "TESTING" ]]; then
     break
   fi
   sleep 0.25
 done
+[[ "$GEN1_CUR" == "BUILDING" || "$GEN1_CUR" == "STARTING" || "$GEN1_CUR" == "TESTING" ]] || {
+  echo "❌ FAIL: gen 1 never reached an in-flight state before superseding (status=$GEN1_CUR)"
+  exit 1
+}
 sleep 0.5
 send_pr_webhook "$DELIVERY_GEN2" "synchronize" "$SHA_GEN2"
 sleep 0.5

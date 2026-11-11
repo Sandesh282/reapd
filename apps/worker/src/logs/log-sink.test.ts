@@ -270,14 +270,14 @@ test('createLogSink drops oldest lines when maxQueueSize is exceeded and surface
   );
   assert.equal(texts.at(-1), 'line-6', 'newest lines must be preserved when oldest are dropped');
 
-  // Verify tuple-level OOM errors (`[[Error("OOM..."), null]]`) and rejected promises are caught,
-  // rate-limited during batch flushes, and always reported with suppressed count on `end()`.
+  // Verify both rejected promises (`failExecCount: 1`) and tuple-level OOM errors (`tupleErrorCount: 4`)
+  // are caught, rate-limited during batch flushes, and always reported with suppressed count on `end()`.
   const warnings: string[] = [];
   t.mock.method(console, 'warn', (...args: unknown[]) => {
     warnings.push(args.map(String).join(' '));
   });
 
-  const tupleErrorFake = createFakeRedis({ tupleErrorCount: 5 });
+  const tupleErrorFake = createFakeRedis({ failExecCount: 1, tupleErrorCount: 4 });
   const resilientSink = createLogSink({
     deploymentId,
     redis: tupleErrorFake.client,
@@ -290,11 +290,15 @@ test('createLogSink drops oldest lines when maxQueueSize is exceeded and surface
   await assert.doesNotReject(() => resilientSink.end('FAILED'));
 
   assert.equal(warnings.length, 2, 'expected 1 rate-limited batch warning + 1 unthrottled end-marker warning');
-  assert.match(warnings[0] ?? '', /OOM command not allowed/, 'first batch warning must surface tuple-level OOM error');
+  assert.match(
+    warnings[0] ?? '',
+    /simulated Redis socket rejection/,
+    'first batch warning must surface rejected pipeline.exec() error',
+  );
   assert.match(
     warnings[1] ?? '',
     /Failed to write end marker \(FAILED\).*OOM command not allowed.*\(\+3 earlier warning\(s\) suppressed\)/,
-    'end() warning must bypass rate limiter and report suppressed batch warning count',
+    'end() warning must bypass rate limiter, surface tuple-level OOM error, and report suppressed batch warning count',
   );
 });
 
@@ -310,7 +314,7 @@ test('createLogSink handles Redis ready timeout gracefully and fast-fails subseq
   const sink = createLogSink({
     deploymentId,
     redis: stuckFake.client,
-    readyTimeoutMs: 30,
+    readyTimeoutMs: 200,
   });
 
   sink.write('system', 'stdout', 'line-1');
@@ -318,14 +322,14 @@ test('createLogSink handles Redis ready timeout gracefully and fast-fails subseq
   await assert.doesNotReject(() => sink.flush());
   assert.equal(stuckFake.xadds.length, 0, 'no entries should be written when Redis never reaches ready');
 
-  // Subsequent flush + end should fail immediately via `readyTimedOut` without waiting another 30ms each
+  // Subsequent flush + end should fail immediately via `readyTimedOut` without waiting another 200ms each
   const startMs = Date.now();
   sink.write('system', 'stdout', 'line-3');
   await assert.doesNotReject(() => sink.flush());
   await assert.doesNotReject(() => sink.end('FAILED'));
   const elapsedMs = Date.now() - startMs;
 
-  assert.ok(elapsedMs < 25, `expected fast-fail after initial ready timeout, took ${elapsedMs}ms`);
+  assert.ok(elapsedMs < 100, `expected fast-fail after initial ready timeout, took ${elapsedMs}ms`);
   assert.equal(warnings.length, 2);
   assert.match(warnings[0] ?? '', /Redis not ready \(dropped 2 line\(s\)\)/);
   assert.match(

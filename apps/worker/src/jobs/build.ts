@@ -257,7 +257,7 @@ export async function buildJobHandler(job: Job<BuildJobPayload>): Promise<void> 
 
     // ── Phase 4: TESTING → LIVE ──────────────────────────────────────────────
     // Flush all pending log lines BEFORE committing `LIVE` in Postgres so when the worker
-    // itself commits `LIVE`, the full build log body is already in Redis (`end:LIVE` follows
+    // itself commits `LIVE`, all build output is already in Redis (`end:LIVE` follows
     // immediately in `finally`).
     await sink.flush();
 
@@ -274,7 +274,6 @@ export async function buildJobHandler(job: Job<BuildJobPayload>): Promise<void> 
     }
 
     sink.write('system', 'stdout', `[reapd] Preview LIVE at https://${subdomain}.preview.localhost`);
-    await sink.flush();
     finalBuildStatus = 'LIVE';
     console.log(`🟢 LIVE: https://${subdomain}.preview.localhost (deployment ${deploymentId})`);
   } catch (err) {

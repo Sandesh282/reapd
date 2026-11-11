@@ -195,6 +195,7 @@ export function createLogSink(opts: CreateLogSinkOptions): LogSink {
   const ownsRedis = !opts.redis;
 
   let redis: LogRedisClient;
+  let lastRedisError = '';
   if (opts.redis) {
     redis = opts.redis;
   } else {
@@ -216,8 +217,12 @@ export function createLogSink(opts: CreateLogSinkOptions): LogSink {
         commandTimeout: 3000,
         lazyConnect: false,
       });
-      // Attach a no-op error listener so transient connection errors never crash the process as unhandled
-      ioredis.on('error', () => {});
+      // Capture the most recent connection/auth error (redacted) so not-ready timeouts and
+      // end-marker warnings surface the underlying cause without crashing as an unhandled event.
+      ioredis.on('error', (err: unknown) => {
+        const msg = err instanceof Error ? err.message : String(err);
+        lastRedisError = redactSecrets(msg);
+      });
       redis = ioredis;
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -261,14 +266,18 @@ export function createLogSink(opts: CreateLogSinkOptions): LogSink {
       readyTimedOut = false;
       return;
     }
+    const errSuffix = lastRedisError ? `, lastError=${lastRedisError}` : '';
     if (readyTimedOut) {
-      throw new Error(`Redis log sink remains unavailable after earlier timeout (status=${redis.status})`);
+      throw new Error(
+        `Redis log sink remains unavailable after earlier timeout (status=${redis.status}${errSuffix})`,
+      );
     }
     try {
       await waitForRedisReady(redis, readyTimeoutMs);
     } catch (err) {
       readyTimedOut = true;
-      throw err;
+      const baseMsg = err instanceof Error ? err.message : String(err);
+      throw new Error(`${baseMsg}${errSuffix}`);
     }
   }
 
@@ -335,6 +344,7 @@ export function createLogSink(opts: CreateLogSinkOptions): LogSink {
     } finally {
       // Clear `activeDrain` synchronously in the same tick as the loop exit check so a `write()`
       // arriving immediately after the while condition sees `activeDrain === null` and schedules.
+      // The re-schedule check below is defensive (unreachable while nothing awaits after the loop).
       activeDrain = null;
       if ((queue.length > 0 || droppedCount > 0) && !microtaskScheduled) {
         microtaskScheduled = true;
@@ -410,13 +420,22 @@ export function createLogSink(opts: CreateLogSinkOptions): LogSink {
       pipe.expire(streamKey, finalTtlSeconds);
       const execResult = await pipe.exec();
       assertPipelineExecSucceeded(execResult);
+      if (suppressedWarnings > 0) {
+        console.warn(
+          `⚠️  [log-sink] Completed stream (${finalStatus}) for ${deploymentId} after ${suppressedWarnings} suppressed warning(s)`,
+        );
+        suppressedWarnings = 0;
+      }
     } catch (err) {
       // Always emit the end-marker failure (bypassing the 5s rate limiter) and flush any
       // suppressed warning count so an outage never hides the missing terminal stream marker.
       const msg = err instanceof Error ? err.message : String(err);
+      const errDetail = lastRedisError && !msg.includes(lastRedisError) ? ` (lastError=${lastRedisError})` : '';
       const suffix = suppressedWarnings > 0 ? ` (+${suppressedWarnings} earlier warning(s) suppressed)` : '';
       suppressedWarnings = 0;
-      console.warn(`⚠️  [log-sink] Failed to write end marker (${finalStatus}) for ${deploymentId}: ${msg}${suffix}`);
+      console.warn(
+        `⚠️  [log-sink] Failed to write end marker (${finalStatus}) for ${deploymentId}: ${msg}${errDetail}${suffix}`,
+      );
     } finally {
       if (ownsRedis) {
         await redis.quit().catch(() => {
