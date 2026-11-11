@@ -61,10 +61,19 @@ const DEFAULT_API_BASE_URL = 'http://127.0.0.1:3001';
 
 /** Resolves the control-plane API base URL (without trailing slash). */
 export function getApiBaseUrl(): string {
-  const raw =
-    (typeof process !== 'undefined' && process.env?.['NEXT_PUBLIC_API_URL']) ||
-    DEFAULT_API_BASE_URL;
+  // IMPORTANT: Must use literal `process.env.NEXT_PUBLIC_API_URL` member access so Next.js
+  // statically inlines the value into the browser bundle at build time.
+  const raw = process.env.NEXT_PUBLIC_API_URL || DEFAULT_API_BASE_URL;
   return raw.replace(/\/+$/, '');
+}
+
+/** Extracts the display host (`pr-42.preview.localhost`) from a preview URL, falling back cleanly. */
+export function formatPreviewHost(previewUrl: string, fallbackSubdomain?: string): string {
+  try {
+    return new URL(previewUrl).host;
+  } catch {
+    return fallbackSubdomain ? `${fallbackSubdomain}.preview.localhost` : previewUrl;
+  }
 }
 
 /** Builds the SSE endpoint URL for a deployment's build logs. */

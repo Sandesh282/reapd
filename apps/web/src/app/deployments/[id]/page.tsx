@@ -14,6 +14,7 @@ import { StatusBadge } from '../../../components/StatusBadge';
 import {
   fetchDeploymentDetail,
   formatDurationMs,
+  formatPreviewHost,
   shortSha,
   type DeploymentDetailWithEvents,
 } from '../../../lib/api';
@@ -46,13 +47,13 @@ export default function DeploymentDetailPage(): React.ReactElement {
     if (!deploymentId) return;
 
     let active = true;
-    let currentController: AbortController | null = null;
+    const controller = new AbortController();
+    let inFlight = false;
     let timer: ReturnType<typeof setInterval> | null = null;
 
     const load = async (): Promise<void> => {
-      currentController?.abort();
-      const controller = new AbortController();
-      currentController = controller;
+      if (inFlight) return;
+      inFlight = true;
 
       try {
         const detail = await fetchDeploymentDetail(deploymentId, {
@@ -82,6 +83,7 @@ export default function DeploymentDetailPage(): React.ReactElement {
         if (!active || controller.signal.aborted) return;
         setError(err instanceof Error ? err.message : 'Failed to load deployment');
       } finally {
+        inFlight = false;
         if (active && !controller.signal.aborted) {
           setLoading(false);
         }
@@ -95,7 +97,7 @@ export default function DeploymentDetailPage(): React.ReactElement {
 
     return () => {
       active = false;
-      currentController?.abort();
+      controller.abort();
       if (timer) {
         clearInterval(timer);
       }
@@ -147,10 +149,10 @@ export default function DeploymentDetailPage(): React.ReactElement {
               <span className="meta-value mono">
                 {deployment.status === 'LIVE' ? (
                   <a href={deployment.previewUrl} target="_blank" rel="noopener noreferrer">
-                    {deployment.subdomain}.preview.localhost ↗
+                    {formatPreviewHost(deployment.previewUrl, deployment.subdomain)} ↗
                   </a>
                 ) : (
-                  `${deployment.subdomain}.preview.localhost`
+                  formatPreviewHost(deployment.previewUrl, deployment.subdomain)
                 )}
               </span>
             </div>

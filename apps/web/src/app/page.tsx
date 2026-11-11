@@ -10,39 +10,52 @@ import { StatusBadge } from '../components/StatusBadge';
 import {
   fetchDeployments,
   formatDurationMs,
+  formatPreviewHost,
   shortSha,
   type DeploymentSummaryItem,
 } from '../lib/api';
 
 const POLL_INTERVAL_MS = 3000;
+const FILTER_DEBOUNCE_MS = 250;
 
 export default function DeploymentsListPage(): React.ReactElement {
   const [deployments, setDeployments] = useState<DeploymentSummaryItem[]>([]);
   const [repoFilter, setRepoFilter] = useState<string>('');
   const [prFilter, setPrFilter] = useState<string>('');
+  const [debouncedRepo, setDebouncedRepo] = useState<string>('');
+  const [debouncedPr, setDebouncedPr] = useState<string>('');
   const [loading, setLoading] = useState<boolean>(true);
   const [error, setError] = useState<string | null>(null);
   const [lastUpdated, setLastUpdated] = useState<string | null>(null);
 
   useEffect(() => {
+    const t = setTimeout(() => {
+      setDebouncedRepo(repoFilter);
+      setDebouncedPr(prFilter);
+    }, FILTER_DEBOUNCE_MS);
+    return () => clearTimeout(t);
+  }, [repoFilter, prFilter]);
+
+  useEffect(() => {
     let active = true;
-    let currentController: AbortController | null = null;
+    const controller = new AbortController();
+    let inFlight = false;
 
     const load = async (): Promise<void> => {
-      currentController?.abort();
-      const controller = new AbortController();
-      currentController = controller;
+      if (inFlight) return;
 
-      const parsedPr = prFilter.trim() ? Number(prFilter.trim()) : undefined;
+      const parsedPr = debouncedPr.trim() ? Number(debouncedPr.trim()) : undefined;
       if (parsedPr !== undefined && (!Number.isInteger(parsedPr) || parsedPr <= 0)) {
+        setDeployments([]);
         setError('PR filter must be a positive integer');
         setLoading(false);
         return;
       }
 
+      inFlight = true;
       try {
         const list = await fetchDeployments({
-          ...(repoFilter.trim() ? { repo: repoFilter.trim() } : {}),
+          ...(debouncedRepo.trim() ? { repo: debouncedRepo.trim() } : {}),
           ...(parsedPr !== undefined ? { pr: parsedPr } : {}),
           limit: 50,
           signal: controller.signal,
@@ -55,6 +68,7 @@ export default function DeploymentsListPage(): React.ReactElement {
         if (!active || controller.signal.aborted) return;
         setError(err instanceof Error ? err.message : 'Failed to fetch deployments');
       } finally {
+        inFlight = false;
         if (active && !controller.signal.aborted) {
           setLoading(false);
         }
@@ -68,10 +82,10 @@ export default function DeploymentsListPage(): React.ReactElement {
 
     return () => {
       active = false;
-      currentController?.abort();
+      controller.abort();
       clearInterval(timer);
     };
-  }, [repoFilter, prFilter]);
+  }, [debouncedRepo, debouncedPr]);
 
   return (
     <div>
@@ -143,11 +157,11 @@ export default function DeploymentsListPage(): React.ReactElement {
                   <td className="mono">
                     {d.status === 'LIVE' ? (
                       <a href={d.previewUrl} target="_blank" rel="noopener noreferrer">
-                        {d.subdomain}.preview.localhost ↗
+                        {formatPreviewHost(d.previewUrl, d.subdomain)} ↗
                       </a>
                     ) : (
                       <span style={{ color: 'var(--text-secondary)' }}>
-                        {d.subdomain}.preview.localhost
+                        {formatPreviewHost(d.previewUrl, d.subdomain)}
                       </span>
                     )}
                   </td>

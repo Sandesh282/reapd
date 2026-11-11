@@ -72,7 +72,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - name: Verify all workspace typecheck shards succeeded
-        if: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}
+        if: ${{ needs.workspace_typecheck.result != 'success' || needs.web_production_build.result != 'success' }}
         run: exit 1
       - name: All type checks passed
         run: echo "✅ All workspace type checks and @reapd/web build passed"

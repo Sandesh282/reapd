@@ -5,7 +5,9 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
   formatDurationMs,
+  formatPreviewHost,
   formatTerminalLine,
+  getApiBaseUrl,
   getDeploymentLogsSseUrl,
   shortSha,
 } from './api.js';
@@ -41,8 +43,24 @@ void test('formatDurationMs, shortSha, and getDeploymentLogsSseUrl format values
 
   assert.equal(shortSha('0123456789abcdef0123456789abcdef01234567'), '0123456');
   assert.equal(
+    formatPreviewHost('https://pr-501.preview.localhost', 'pr-501'),
+    'pr-501.preview.localhost',
+  );
+  assert.equal(
     getDeploymentLogsSseUrl('11111111-1111-4111-8111-111111111111', 'http://127.0.0.1:3001/'),
     'http://127.0.0.1:3001/api/deployments/11111111-1111-4111-8111-111111111111/logs',
   );
+
+  const prevEnv = process.env.NEXT_PUBLIC_API_URL;
+  try {
+    process.env.NEXT_PUBLIC_API_URL = 'http://localhost:4000///';
+    assert.equal(getApiBaseUrl(), 'http://localhost:4000');
+  } finally {
+    if (prevEnv === undefined) {
+      delete process.env.NEXT_PUBLIC_API_URL;
+    } else {
+      process.env.NEXT_PUBLIC_API_URL = prevEnv;
+    }
+  }
 });
 

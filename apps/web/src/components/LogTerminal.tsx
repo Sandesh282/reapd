@@ -142,7 +142,7 @@ export default function LogTerminal({
         if (payload.expired) {
           setConnState('expired');
           term.writeln(
-            '\x1b[33m[reapd] Build logs for this deployment have expired (24h Redis stream TTL). Archival to object storage is deferred past Phase 5.\x1b[0m',
+            '\x1b[33m[reapd] Build logs for this deployment have expired (24h Redis stream TTL).\x1b[0m',
           );
         } else {
           setConnState('completed');
