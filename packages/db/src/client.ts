@@ -17,12 +17,9 @@ if (process.env['NODE_ENV'] === 'production' && !process.env['DATABASE_URL']) {
   throw new Error('DATABASE_URL must be set when NODE_ENV=production');
 }
 
-if (!process.env['DATABASE_URL']) {
-  // No credential default: the old public `reapd_dev_password` no longer exists. Stay import-safe
-  // (unit tests import this module without a database) but make the cause obvious on auth failure.
-  console.warn('⚠️  DATABASE_URL is not set — run `npm run env:init` to generate local credentials');
-}
-
+// No hardcoded credential default: the old public `reapd_dev_password` no longer exists.
+// Kept import-safe without noisy warnings so unit tests that import `@reapd/db` without
+// touching Postgres run cleanly; auth errors (`28P01`) fail loudly on actual queries.
 const sql = postgres(process.env['DATABASE_URL'] ?? 'postgres://reapd@localhost:5432/reapd');
 
 export const db = drizzle(sql, { schema });

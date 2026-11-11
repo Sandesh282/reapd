@@ -19,6 +19,8 @@ PG_PASS="$(grep -E '^POSTGRES_PASSWORD=' "$ENV_FILE" | head -1 | cut -d= -f2-)"
 [[ -n "$PG_PASS" ]] || { echo "❌ POSTGRES_PASSWORD is empty in .env — run: npm run env:init" >&2; exit 1; }
 
 # Wait (up to ~60s) for Postgres to accept connections over the local socket.
+# Note: when invoked via `npm run infra:up` or CI (`docker compose up -d --wait`), the container's
+# healthcheck has already waited for the temporary init server to finish before this script runs.
 ready=false
 for _ in $(seq 1 30); do
   if docker exec "$CONTAINER" pg_isready -U reapd -d reapd -q 2>/dev/null; then
@@ -30,9 +32,10 @@ done
 $ready || { echo "❌ $CONTAINER did not become ready" >&2; exit 1; }
 
 # Password is passed via the docker CLI's own environment (`-e PGPASSWORD` without a value), so it is
-# not part of any process argument list.
+# not part of any process argument list. Use `awk '{print $1}'` in case the container is attached to
+# multiple networks and `hostname -i` returns space-separated IPs.
 export PGPASSWORD="$PG_PASS"
-if docker exec -e PGPASSWORD "$CONTAINER" sh -c 'psql -h "$(hostname -i)" -U reapd -d reapd -tAq -c "SELECT 1"' >/dev/null 2>&1; then
+if docker exec -e PGPASSWORD "$CONTAINER" sh -c 'psql -h "$(hostname -i | awk "{print \$1}")" -U reapd -d reapd -tAq -c "SELECT 1"' >/dev/null 2>&1; then
   echo "✅ Postgres password already matches .env"
   exit 0
 fi
