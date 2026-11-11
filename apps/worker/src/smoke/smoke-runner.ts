@@ -176,9 +176,10 @@ export function isAllowedSmokeRequestUrl(reqUrl: string, previewOrigin: string):
   if (parsed.origin.toLowerCase() === previewOrigin.toLowerCase()) {
     return true;
   }
-  const host = parsed.hostname.toLowerCase();
+  const host = parsed.hostname.toLowerCase().replace(/\.+$/, '');
   const isIpv6Literal = host.startsWith('[') && host.endsWith(']');
   if (
+    !host ||
     (!isIpv6Literal && !host.includes('.')) ||
     host === 'localhost' ||
     host.endsWith('.localhost') ||

@@ -71,7 +71,7 @@ jobs:
 
       - name: Provision Chromium for Phase 6 Playwright smoke gate
         if: ${{ matrix.gate.script == './infra/scripts/phase6-smoke.sh' }}
-        run: npx playwright install chromium
+        run: npx --no-install playwright-core install chromium
 
       - name: Install mkcert and generate wildcard *.preview.localhost TLS certs
         run: |

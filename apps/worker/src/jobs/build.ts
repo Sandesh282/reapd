@@ -81,10 +81,9 @@ async function bestEffortPostStickyPrComment(params: {
   buildDurationMs: number | null;
   smokeResult: SmokeTestRunSummary | null;
   failureReason?: string | null;
-  sink: LogSink | null;
   signal: AbortSignal;
 }): Promise<void> {
-  const { deployment, status, buildDurationMs, smokeResult, failureReason, sink, signal } = params;
+  const { deployment, status, buildDurationMs, smokeResult, failureReason, signal } = params;
   try {
     const res = await upsertPrComment({
       deploymentId: deployment.id,
@@ -106,10 +105,8 @@ async function bestEffortPostStickyPrComment(params: {
       signal,
     });
     if (res.action === 'created' || res.action === 'updated') {
-      sink?.write(
-        'system',
-        'stdout',
-        `[reapd] Sticky PR comment ${res.action} on PR #${deployment.prNumber} (comment_id=${res.commentId})`,
+      console.log(
+        `💬 Sticky PR comment ${res.action} on PR #${deployment.prNumber} (comment_id=${res.commentId})`,
       );
     }
   } catch (err) {
@@ -375,7 +372,6 @@ export async function buildJobHandler(job: Job<BuildJobPayload>): Promise<void> 
       status: 'LIVE',
       buildDurationMs,
       smokeResult,
-      sink: null,
       signal: ac.signal,
     });
   } catch (err) {
@@ -434,7 +430,6 @@ export async function buildJobHandler(job: Job<BuildJobPayload>): Promise<void> 
         buildDurationMs,
         smokeResult,
         failureReason: reason,
-        sink: null,
         signal: ac.signal,
       });
     }

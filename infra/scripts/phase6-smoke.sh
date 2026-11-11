@@ -88,7 +88,7 @@ function verifyGitHubAppJwt(authHeader) {
     return false;
   }
   const payload = JSON.parse(Buffer.from(payloadB64, 'base64url').toString('utf8'));
-  return payload.iss === '6001' && typeof payload.exp === 'number' && payload.exp > Math.floor(Date.now() / 1000);
+  return String(payload.iss) === '6001' && typeof payload.exp === 'number' && payload.exp > Math.floor(Date.now() / 1000);
 }
 
 let nextCommentId = 9001;
@@ -129,9 +129,13 @@ const server = http.createServer((req, res) => {
         res.writeHead(401, { 'content-type': 'application/json' });
         return res.end(JSON.stringify({ message: 'Invalid RS256 GitHub App JWT' }));
       }
-      if (!parsedBody || !parsedBody.permissions || parsedBody.permissions.pull_requests !== 'write') {
+      const perms = parsedBody && parsedBody.permissions ? parsedBody.permissions : null;
+      const validPerms =
+        perms &&
+        (perms.pull_requests === 'write' || perms.contents === 'read');
+      if (!validPerms) {
         res.writeHead(422, { 'content-type': 'application/json' });
-        return res.end(JSON.stringify({ message: 'Expected permissions.pull_requests = write' }));
+        return res.end(JSON.stringify({ message: 'Expected permissions.pull_requests=write or contents=read' }));
       }
       res.writeHead(201, { 'content-type': 'application/json' });
       return res.end(JSON.stringify({ token: 'ghs_mock_phase6_installation_token_123456' }));

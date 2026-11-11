@@ -29,10 +29,13 @@ void test('isAllowedSmokeRequestUrl enforces exact preview origin for *.localhos
   assert.equal(isAllowedSmokeRequestUrl('https://pr-42.preview.localhost:3001/health', origin), false);
   assert.equal(isAllowedSmokeRequestUrl('http://pr-42.preview.localhost:6379/', origin), false);
 
-  // Other *.localhost, localhost, single-label, or .internal/.lan origins -> blocked
+  // Other *.localhost, localhost, trailing-dot, single-label, or .internal/.lan origins -> blocked
   assert.equal(isAllowedSmokeRequestUrl('http://localhost:3001/api/deployments', origin), false);
+  assert.equal(isAllowedSmokeRequestUrl('http://localhost.:3001/api/deployments', origin), false);
   assert.equal(isAllowedSmokeRequestUrl('https://pr-99.preview.localhost/', origin), false);
+  assert.equal(isAllowedSmokeRequestUrl('https://pr-99.preview.localhost./', origin), false);
   assert.equal(isAllowedSmokeRequestUrl('http://redis:6379/', origin), false);
+  assert.equal(isAllowedSmokeRequestUrl('http://redis.:6379/', origin), false);
   assert.equal(isAllowedSmokeRequestUrl('http://postgres:5432/', origin), false);
   assert.equal(isAllowedSmokeRequestUrl('http://host.docker.internal:3001/', origin), false);
   assert.equal(isAllowedSmokeRequestUrl('http://service.lan/', origin), false);

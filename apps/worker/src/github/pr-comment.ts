@@ -4,11 +4,14 @@
 // Design invariants:
 //   1. Best-effort: comment failures are caught and warned — a GitHub comment API outage
 //      or missing permission NEVER fails a deployment that already reached LIVE or FAILED.
-//   2. Generation fencing: before creating/updating the sticky comment on a PR, we read
+//   2. Best-effort generation fencing: before creating/updating the sticky comment on a PR, we read
 //      `pull_requests.latest_generation` (`getPullRequestStickyCommentState`). If a newer
 //      commit generation has already arrived (`deployment.generation < latestGeneration`),
-//      we skip updating the comment so an older slow-failing build never overwrites a newer
-//      generation's status table.
+//      we skip updating the comment so an older slow-failing build does not overwrite a newer
+//      generation's status table. On initial `POST`, `setPullRequestStickyCommentId` also
+//      re-checks `latest_generation <= expectedGeneration` in SQL and deletes the newly created
+//      comment if superseded while posting. (A tiny residual TOCTOU window remains on `PATCH`
+//      if a newer generation finishes while the older `PATCH` HTTP call is in flight.)
 //   3. Sticky upsert (`PATCH` -> fallback `POST`):
 //      - When `sticky_comment_id` is stored on `pull_requests`, we `PATCH`
 //        `/repos/:owner/:repo/issues/comments/:comment_id`.
@@ -279,7 +282,12 @@ export async function upsertPrComment(
       method: 'DELETE',
       headers,
       signal: combinedSignal,
-    }).catch(() => {});
+    }).catch((delErr: unknown) => {
+      const msg = delErr instanceof Error ? delErr.message : String(delErr);
+      console.warn(
+        `⚠️  Failed to DELETE superseded PR comment ${created.id} on PR #${opts.prNumber}: ${redactSecrets(msg)}`,
+      );
+    });
     return {
       action: 'skipped',
       commentId: null,
