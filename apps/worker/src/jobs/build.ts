@@ -22,11 +22,11 @@ import {
   pollUntilHealthy,
   removeImage,
 } from '@reapd/docker-client';
-import type { BuildLogEndStatus } from '@reapd/types';
+import type { BuildLogEndStatus, DeploymentStatus } from '@reapd/types';
 import { cloneRepoAtSha } from '../builder/git-clone.js';
 import { buildDockerImage } from '../builder/image-builder.js';
 import { getInstallationToken } from '../github/auth.js';
-import { createLogSink, type LogSink } from '../logs/log-sink.js';
+import { createLogSink, type LogSink, redactSecrets } from '../logs/log-sink.js';
 
 export interface BuildJobPayload {
   deploymentId: string;
@@ -60,7 +60,7 @@ export function parseGenerationFromTag(repoTag: string): number | null {
   return match?.[1] ? Number(match[1]) : null;
 }
 
-function toBuildLogEndStatus(status: string): BuildLogEndStatus {
+function toBuildLogEndStatus(status: DeploymentStatus): BuildLogEndStatus {
   if (status === 'LIVE' || status === 'SUPERSEDED') return status;
   return 'FAILED';
 }
@@ -144,7 +144,7 @@ export async function buildJobHandler(job: Job<BuildJobPayload>): Promise<void> 
       ...(authToken ? { authToken } : {}),
       signal: ac.signal,
       onLog: (stream, line) => {
-        console.log(`[git:${subdomain}] ${line}`);
+        console.log(`[git:${subdomain}] ${redactSecrets(line)}`);
         sink?.write('git', stream, line);
       },
     });
@@ -160,7 +160,7 @@ export async function buildJobHandler(job: Job<BuildJobPayload>): Promise<void> 
         subdomain,
         signal: ac.signal,
         onLog: (stream, line) => {
-          console.log(`[build:${subdomain}] ${line}`);
+          console.log(`[build:${subdomain}] ${redactSecrets(line)}`);
           sink?.write('build', stream, line);
         },
       });
@@ -255,9 +255,9 @@ export async function buildJobHandler(job: Job<BuildJobPayload>): Promise<void> 
     }
 
     // ── Phase 4: TESTING → LIVE ──────────────────────────────────────────────
-    // Flush all pending log lines BEFORE committing `LIVE` in Postgres so any SSE client
-    // observing `status = LIVE` in the DB is guaranteed the full build log tail is already in Redis.
-    sink.write('system', 'stdout', `[reapd] Preview LIVE at https://${subdomain}.preview.localhost`);
+    // Flush all pending log lines BEFORE committing `LIVE` in Postgres so when the worker
+    // itself commits `LIVE`, the full build log body is already in Redis (`end:LIVE` follows
+    // immediately in `finally`).
     await sink.flush();
 
     const liveTrans = await transitionDeploymentStatus(db, {
@@ -267,9 +267,13 @@ export async function buildJobHandler(job: Job<BuildJobPayload>): Promise<void> 
     if (!liveTrans.transitioned) {
       await forceRemoveContainer(docker, container.id).catch(() => {});
       finalBuildStatus = toBuildLogEndStatus(liveTrans.finalStatus);
+      sink.write('system', 'stderr', `[reapd] Transition to LIVE fenced (${liveTrans.finalStatus})`);
+      await sink.flush();
       return;
     }
 
+    sink.write('system', 'stdout', `[reapd] Preview LIVE at https://${subdomain}.preview.localhost`);
+    await sink.flush();
     finalBuildStatus = 'LIVE';
     console.log(`🟢 LIVE: https://${subdomain}.preview.localhost (deployment ${deploymentId})`);
   } catch (err) {
@@ -300,7 +304,8 @@ export async function buildJobHandler(job: Job<BuildJobPayload>): Promise<void> 
       throw err;
     }
 
-    const reason = err instanceof Error ? err.message.slice(0, 512) : String(err).slice(0, 512);
+    const rawReason = err instanceof Error ? err.message : String(err);
+    const reason = redactSecrets(rawReason).slice(0, 512);
     finalBuildStatus = 'FAILED';
     if (sink) {
       sink.write('system', 'stderr', `[reapd] Build failed: ${reason}`);

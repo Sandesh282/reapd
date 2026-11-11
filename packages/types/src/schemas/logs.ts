@@ -52,10 +52,19 @@ export function formatBuildLogEndMarker(status: BuildLogEndStatus): string {
   return `end:${status}`;
 }
 
-/** Parses an `end:<STATUS>` system marker line, returning the terminal build status or `null`. */
-export function parseBuildLogEndMarker(text: string): BuildLogEndStatus | null {
-  if (!text.startsWith('end:')) return null;
-  const raw = text.slice(4);
+/**
+ * Parses an `end:<STATUS>` marker from a log entry (`{ source, text }`), returning the terminal
+ * build status or `null`.
+ *
+ * SECURITY: Requires `entry.source === 'system'` so repo-controlled `git` or `build` output
+ * containing a literal `"end:LIVE"` line can never forge an early end-of-stream marker.
+ */
+export function parseBuildLogEndMarker(entry: {
+  source: string;
+  text: string;
+}): BuildLogEndStatus | null {
+  if (entry.source !== 'system' || !entry.text.startsWith('end:')) return null;
+  const raw = entry.text.slice(4);
   const parsed = BuildLogEndStatusSchema.safeParse(raw);
   return parsed.success ? parsed.data : null;
 }

@@ -1,7 +1,8 @@
 // apps/worker/src/logs/log-sink.test.ts
-// Unit tests for `createLogSink`, `redactSecrets`, and `sanitizeAndTruncateLine`.
+// Unit tests for `createLogSink`, `redactSecrets`, `sanitizeAndTruncateLine`, and `parseBuildLogEndMarker`.
 
 import assert from 'node:assert/strict';
+import { EventEmitter } from 'node:events';
 import test from 'node:test';
 import {
   formatBuildLogEndMarker,
@@ -15,6 +16,7 @@ import {
   createLogSink,
   type LogRedisClient,
   type LogRedisPipeline,
+  type PipelineExecResult,
   redactSecrets,
   sanitizeAndTruncateLine,
 } from './log-sink.js';
@@ -33,7 +35,13 @@ interface RecordedExpire {
   seconds: number;
 }
 
-function createFakeRedis(opts?: { failExecCount?: number; delayMs?: number }): {
+function createFakeRedis(opts?: {
+  failExecCount?: number;
+  tupleErrorCount?: number;
+  delayMs?: number;
+  initialStatus?: 'ready' | 'connecting';
+  readyAfterMs?: number;
+}): {
   client: LogRedisClient;
   xadds: RecordedXadd[];
   expires: RecordedExpire[];
@@ -41,10 +49,33 @@ function createFakeRedis(opts?: { failExecCount?: number; delayMs?: number }): {
 } {
   const xadds: RecordedXadd[] = [];
   const expires: RecordedExpire[] = [];
-  let remainingFailures = opts?.failExecCount ?? 0;
-  const state = { execCalls: 0 };
+  let remainingRejections = opts?.failExecCount ?? 0;
+  let remainingTupleErrors = opts?.tupleErrorCount ?? 0;
+  const state = {
+    execCalls: 0,
+    status: opts?.initialStatus ?? 'ready',
+  };
+  const emitter = new EventEmitter();
+
+  if (state.status === 'connecting' && opts?.readyAfterMs !== undefined) {
+    setTimeout(() => {
+      state.status = 'ready';
+      emitter.emit('ready');
+    }, opts.readyAfterMs);
+  }
 
   const client: LogRedisClient = {
+    get status() {
+      return state.status;
+    },
+    once(event: string, listener: (...args: unknown[]) => void) {
+      emitter.once(event, listener);
+      return client;
+    },
+    off(event: string, listener: (...args: unknown[]) => void) {
+      emitter.off(event, listener);
+      return client;
+    },
     pipeline(): LogRedisPipeline {
       const stagedXadds: RecordedXadd[] = [];
       const stagedExpires: RecordedExpire[] = [];
@@ -63,18 +94,22 @@ function createFakeRedis(opts?: { failExecCount?: number; delayMs?: number }): {
         expire(key: string, seconds: number) {
           stagedExpires.push({ key, seconds });
         },
-        async exec() {
+        async exec(): Promise<PipelineExecResult> {
           state.execCalls += 1;
           if (opts?.delayMs) {
             await new Promise((r) => setTimeout(r, opts.delayMs));
           }
-          if (remainingFailures > 0) {
-            remainingFailures -= 1;
-            throw new Error('simulated Redis OOM / timeout');
+          if (remainingRejections > 0) {
+            remainingRejections -= 1;
+            throw new Error('simulated Redis socket rejection');
+          }
+          if (remainingTupleErrors > 0) {
+            remainingTupleErrors -= 1;
+            return [[new Error("OOM command not allowed when used memory > 'maxmemory'"), null]];
           }
           xadds.push(...stagedXadds);
           expires.push(...stagedExpires);
-          return [];
+          return stagedXadds.map((_, idx) => [null, `1000-${idx}`]);
         },
       };
     },
@@ -123,72 +158,97 @@ test('redactSecrets strips GitHub tokens, Authorization headers, Basic/Bearer cr
   assert.ok(truncated.endsWith(' ... [truncated]'), 'truncated line must end with marker');
 });
 
-test('createLogSink batches XADDs in order, refreshes 6h safety TTL on every flush, writes end marker with 24h TTL, and ignores writes after end()', async () => {
+test('parseBuildLogEndMarker requires source === "system" and rejects forged git/build lines', () => {
+  assert.equal(
+    parseBuildLogEndMarker({ source: 'system', text: 'end:LIVE' }),
+    'LIVE',
+  );
+  assert.equal(
+    parseBuildLogEndMarker({ source: 'system', text: 'end:FAILED' }),
+    'FAILED',
+  );
+  assert.equal(
+    parseBuildLogEndMarker({ source: 'system', text: 'end:SUPERSEDED' }),
+    'SUPERSEDED',
+  );
+  // Repo-controlled git/build output with literal `end:LIVE` must NEVER be treated as an end marker
+  assert.equal(
+    parseBuildLogEndMarker({ source: 'build', text: 'end:LIVE' }),
+    null,
+  );
+  assert.equal(
+    parseBuildLogEndMarker({ source: 'git', text: 'end:FAILED' }),
+    null,
+  );
+  assert.equal(
+    parseBuildLogEndMarker({ source: 'system', text: 'end:EXPIRED' }),
+    null,
+  );
+});
+
+test('createLogSink waits for Redis ready before first flush so early lines are never lost, refreshes 6h safety TTL, writes end marker with 24h TTL, and seals after end()', async () => {
   const deploymentId = '00000000-0000-0000-0000-000000000501';
+  // Simulate ioredis socket still connecting when the first write() fires
+  const fake = createFakeRedis({ initialStatus: 'connecting', readyAfterMs: 25 });
+  const sink = createLogSink({
+    deploymentId,
+    redis: fake.client,
+  });
+
+  sink.write('system', 'stdout', '[reapd] Deployment -> BUILDING', 999);
+  sink.write('git', 'stdout', 'Cloning repository...', 1000);
+  sink.write('build', 'stderr', '#1 [internal] load build definition', 1001);
+  await sink.flush();
+
+  const expectedKey = logBuildStreamKey(deploymentId);
+  assert.equal(fake.xadds.length, 3, 'all 3 initial lines (including -> BUILDING) must be preserved while connecting');
+  assert.equal(fake.xadds[0]?.text, '[reapd] Deployment -> BUILDING');
+  assert.equal(fake.xadds[0]?.maxLen, String(LOG_STREAM_MAXLEN));
+  assert.equal(fake.expires.length, 1);
+  assert.deepEqual(fake.expires[0], { key: expectedKey, seconds: LOG_SAFETY_TTL_SECONDS });
+
+  await sink.end('LIVE');
+
+  assert.equal(fake.xadds.length, 4);
+  const endEntry = fake.xadds[3];
+  assert.ok(endEntry);
+  assert.equal(endEntry.source, 'system');
+  assert.equal(endEntry.text, formatBuildLogEndMarker('LIVE'));
+  assert.equal(parseBuildLogEndMarker({ source: endEntry.source, text: endEntry.text }), 'LIVE');
+
+  assert.equal(fake.expires.length, 2);
+  assert.deepEqual(fake.expires[1], { key: expectedKey, seconds: LOG_FINAL_TTL_SECONDS });
+
+  // Writes and duplicate end() calls after seal must be ignored
+  sink.write('build', 'stdout', 'late line after end');
+  await sink.flush();
+  await sink.end('FAILED');
+  assert.equal(fake.xadds.length, 4);
+});
+
+test('createLogSink handles a 1,500-line synchronous stdout burst with zero drops against a healthy fake', async () => {
+  const deploymentId = '00000000-0000-0000-0000-000000000503';
   const fake = createFakeRedis();
   const sink = createLogSink({
     deploymentId,
     redis: fake.client,
   });
 
-  sink.write('git', 'stdout', 'Cloning repository...', 1000);
-  sink.write('build', 'stderr', '#1 [internal] load build definition', 1001);
+  for (let i = 1; i <= 1500; i++) {
+    sink.write('build', 'stderr', `burst-line-${i}`, 3000 + i);
+  }
   await sink.flush();
 
-  const expectedKey = logBuildStreamKey(deploymentId);
-  assert.equal(fake.xadds.length, 2);
-  assert.deepEqual(
-    fake.xadds.map((x) => ({
-      key: x.key,
-      maxLen: x.maxLen,
-      source: x.source,
-      stream: x.stream,
-      ts: x.ts,
-      text: x.text,
-    })),
-    [
-      {
-        key: expectedKey,
-        maxLen: String(LOG_STREAM_MAXLEN),
-        source: 'git',
-        stream: 'stdout',
-        ts: '1000',
-        text: 'Cloning repository...',
-      },
-      {
-        key: expectedKey,
-        maxLen: String(LOG_STREAM_MAXLEN),
-        source: 'build',
-        stream: 'stderr',
-        ts: '1001',
-        text: '#1 [internal] load build definition',
-      },
-    ],
+  assert.equal(fake.xadds.length, 1500, 'all 1,500 synchronous burst lines must be flushed without drops');
+  assert.ok(
+    !fake.xadds.some((x) => x.text.includes('dropped due to backpressure')),
+    'zero drop notices expected for 1,500-line burst',
   );
-  assert.equal(fake.expires.length, 1);
-  assert.deepEqual(fake.expires[0], { key: expectedKey, seconds: LOG_SAFETY_TTL_SECONDS });
-
-  // End the stream with LIVE
-  await sink.end('LIVE');
-
-  assert.equal(fake.xadds.length, 3);
-  const endEntry = fake.xadds[2];
-  assert.ok(endEntry);
-  assert.equal(endEntry.source, 'system');
-  assert.equal(endEntry.text, formatBuildLogEndMarker('LIVE'));
-  assert.equal(parseBuildLogEndMarker(endEntry.text), 'LIVE');
-
-  assert.equal(fake.expires.length, 2);
-  assert.deepEqual(fake.expires[1], { key: expectedKey, seconds: LOG_FINAL_TTL_SECONDS });
-
-  // Writes and duplicate end() calls after seal must be ignored (cannot resurrect key without TTL)
-  sink.write('build', 'stdout', 'late line after end');
-  await sink.flush();
-  await sink.end('FAILED');
-  assert.equal(fake.xadds.length, 3);
+  assert.equal(fake.xadds[0]?.text, 'burst-line-1');
+  assert.equal(fake.xadds[1499]?.text, 'burst-line-1500');
 });
 
-test('createLogSink drops oldest lines under backpressure and emits a dropped-lines system notice, and swallows Redis errors without throwing', async () => {
+test('createLogSink drops oldest lines when maxQueueSize is exceeded and surfaces both rejected and tuple-level pipeline.exec() errors without throwing', async () => {
   const deploymentId = '00000000-0000-0000-0000-000000000502';
   const fake = createFakeRedis({ delayMs: 25 });
   const sink = createLogSink({
@@ -198,7 +258,6 @@ test('createLogSink drops oldest lines under backpressure and emits a dropped-li
     maxBatchSize: 2,
   });
 
-  // First write starts an async drain (batches up to 2 items) while we enqueue 5 more into a maxQueueSize=3 buffer
   for (let i = 1; i <= 6; i++) {
     sink.write('build', 'stderr', `line-${i}`, 2000 + i);
   }
@@ -211,13 +270,16 @@ test('createLogSink drops oldest lines under backpressure and emits a dropped-li
   );
   assert.equal(texts.at(-1), 'line-6', 'newest lines must be preserved when oldest are dropped');
 
-  // Verify Redis pipeline failures are swallowed (never reject flush or end)
-  const failingFake = createFakeRedis({ failExecCount: 10 });
+  // Verify tuple-level OOM errors (`[[Error("OOM..."), null]]`) and rejected promises are caught & rate-limited
+  const tupleErrorFake = createFakeRedis({ tupleErrorCount: 5, failExecCount: 2 });
   const resilientSink = createLogSink({
     deploymentId,
-    redis: failingFake.client,
+    redis: tupleErrorFake.client,
+    maxBatchSize: 1,
   });
-  resilientSink.write('system', 'stdout', 'should not throw on Redis failure');
+  for (let i = 0; i < 4; i++) {
+    resilientSink.write('system', 'stdout', `fail-line-${i}`);
+  }
   await assert.doesNotReject(() => resilientSink.flush());
   await assert.doesNotReject(() => resilientSink.end('FAILED'));
 });
