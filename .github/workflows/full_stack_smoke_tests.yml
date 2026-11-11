@@ -69,8 +69,7 @@ jobs:
       - name: Set up Node & dependencies
         uses: ./.github/actions/setup-node-and-deps
 
-      - name: Provision Chromium for Phase 6 Playwright smoke gate
-        if: ${{ matrix.gate.script == './infra/scripts/phase6-smoke.sh' }}
+      - name: Provision Chromium for Playwright smoke runner
         run: npx --no-install playwright-core install chromium
 
       - name: Install mkcert and generate wildcard *.preview.localhost TLS certs
