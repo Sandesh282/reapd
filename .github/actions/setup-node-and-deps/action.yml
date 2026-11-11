@@ -1,0 +1,26 @@
+name: 'Setup reapd Node & Dependencies'
+description: 'Merges latest main on PRs, sets up Node.js 22 with npm cache, and installs workspace dependencies cleanly.'
+runs:
+  using: 'composite'
+  steps:
+    - name: Merge latest main branch into PR checkout
+      if: ${{ github.event_name == 'pull_request' }}
+      shell: bash
+      run: |
+        git config user.name "github-actions[bot]"
+        git config user.email "github-actions[bot]@users.noreply.github.com"
+        git fetch origin main --depth=50
+        git merge --no-edit --no-commit origin/main || {
+          echo "❌ PR branch has merge conflicts with origin/main"
+          exit 1
+        }
+
+    - name: Set up Node.js 22
+      uses: actions/setup-node@v4
+      with:
+        node-version: '22'
+        cache: 'npm'
+
+    - name: Install workspace dependencies
+      shell: bash
+      run: npm ci

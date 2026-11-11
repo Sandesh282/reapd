@@ -1,0 +1,36 @@
+name: Feature / Deferred Item
+description: Track a roadmap enhancement, architectural improvement, or deferred review item
+title: ""
+labels: ["enhancement"]
+body:
+  - type: dropdown
+    id: subsystem
+    attributes:
+      label: Subsystem / Layer
+      options:
+        - "apps/api (Webhooks, REST, SSE)"
+        - "apps/worker (BullMQ, Git clone, BuildKit)"
+        - "apps/worker/reconciler (Desired-state cleanup, TTL, GC)"
+        - "packages/db (PostgreSQL 17, Drizzle, State machine transitions)"
+        - "packages/docker-client (Container lifecycle, 8-byte log demux, Traefik)"
+        - "apps/web (Next.js Dashboard, xterm UI)"
+        - "infra (docker-compose, smoke scripts, CI)"
+    validations:
+      required: true
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Context & Motivation
+      description: Why is this needed, or which PR/phase deferred it?
+    validations:
+      required: true
+
+  - type: textarea
+    id: design
+    attributes:
+      label: Proposed Design / Acceptance Criteria
+      description: What should change and how will we verify it?
+    validations:
+      required: true
+

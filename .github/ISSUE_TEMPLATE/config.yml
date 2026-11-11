@@ -1,0 +1,6 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Architecture & Roadmap (PRD v2.2)
+    url: https://github.com/Sandesh282/reapd
+    about: Check the 8-phase roadmap and architectural decisions before filing an issue.
+

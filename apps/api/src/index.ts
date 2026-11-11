@@ -12,6 +12,8 @@ import { Queue } from 'bullmq';
 import { Redis } from 'ioredis';
 import {
   db,
+  deleteRepositoriesByInstallationId,
+  deleteRepositoryByGithubId,
   findRepositoryByGithubId,
   upsertRepository,
   ingestPullRequestWebhook,
@@ -139,14 +141,43 @@ app.post('/webhooks/github', async (req, reply) => {
 
 /**
  * Handles `installation` and `installation_repositories` events.
- * Upserts each repository that was granted access to the GitHub App.
+ * Upserts each repository that was granted access to the GitHub App, or
+ * removes repositories when the installation is deleted or access is revoked.
  */
 async function handleInstallationEvent(body: Record<string, unknown>): Promise<void> {
   const action = body['action'] as string | undefined;
-  if (action !== 'created' && action !== 'added') return;
-
   const installationId = (body['installation'] as { id: number } | undefined)?.id;
   if (!installationId) return;
+
+  if (action === 'deleted') {
+    const activeIds = await deleteRepositoriesByInstallationId(db, installationId);
+    for (const deployId of activeIds) {
+      await redis.publish(`cancel:deploy:${deployId}`, '1');
+    }
+    app.log.info(
+      { installationId, cancelledBuilds: activeIds.length },
+      'Repositories removed on installation deleted',
+    );
+    return;
+  }
+
+  if (action === 'removed') {
+    const removedRepos =
+      (body['repositories_removed'] as Array<{ id: number; full_name?: string }> | undefined) ?? [];
+    for (const repo of removedRepos) {
+      const activeIds = await deleteRepositoryByGithubId(db, repo.id, installationId);
+      for (const deployId of activeIds) {
+        await redis.publish(`cancel:deploy:${deployId}`, '1');
+      }
+      app.log.info(
+        { repoId: repo.id, fullName: repo.full_name, cancelledBuilds: activeIds.length },
+        'Repository removed from installation',
+      );
+    }
+    return;
+  }
+
+  if (action !== 'created' && action !== 'added') return;
 
   const repos = (
     (body['repositories'] as Array<{ id: number; name: string; full_name: string }> | undefined) ??
@@ -188,14 +219,13 @@ async function handlePullRequestEvent(
 
   const payload = parsed.data;
 
-  // 'closed' PRs are handled by the Phase 4 reconciler
-  if (payload.action === 'closed') {
-    return { received: true, ignored: true };
-  }
-
   // Reject PRs originating from external or deleted forks so untrusted code never runs in BuildKit
+  // (allow `closed` events through even when head.repo is null/missing because the author deleted their fork branch)
   const headRepo = payload.pull_request.head.repo;
-  if (headRepo === null || (headRepo !== undefined && headRepo.id !== payload.repository.id)) {
+  if (
+    payload.action !== 'closed' &&
+    (!headRepo || headRepo.id !== payload.repository.id)
+  ) {
     app.log.warn(
       { headRepoId: headRepo?.id ?? null, baseRepoId: payload.repository.id },
       'Ignoring pull_request from external or deleted fork',
@@ -246,7 +276,7 @@ async function handlePullRequestEvent(
 
   const result = await ingestPullRequestWebhook(db, webhook);
 
-  if (result.duplicate || !result.newDeploymentId) {
+  if (result.duplicate) {
     app.log.info({ deliveryId }, 'Duplicate delivery — skipping');
     return { received: true, duplicate: true };
   }
@@ -255,6 +285,22 @@ async function handlePullRequestEvent(
   for (const supersededId of result.supersededIds) {
     await redis.publish(`cancel:deploy:${supersededId}`, '1');
     app.log.info({ supersededId }, 'Cancel signal published');
+  }
+
+  if (payload.action === 'closed') {
+    app.log.info(
+      {
+        prNumber: payload.pull_request.number,
+        supersededCount: result.supersededIds.length,
+        expiredCount: result.expiredIds?.length ?? 0,
+      },
+      '🔒 PR closed — expired LIVE and superseded in-flight deployments',
+    );
+    return { received: true, duplicate: false };
+  }
+
+  if (!result.newDeploymentId) {
+    throw new Error(`Expected newDeploymentId for pull_request action=${payload.action}`);
   }
 
   // Enqueue the new build job (attempts: 1 because failed deployments are marked

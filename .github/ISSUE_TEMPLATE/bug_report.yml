@@ -1,0 +1,48 @@
+name: Bug Report
+description: Report a bug or unexpected behavior in reapd
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: dropdown
+    id: subsystem
+    attributes:
+      label: Subsystem / Layer
+      description: Which part of reapd is affected?
+      options:
+        - "apps/api (Webhooks, REST, SSE)"
+        - "apps/worker (BullMQ, Git clone, BuildKit)"
+        - "apps/worker/reconciler (Desired-state cleanup, TTL, GC)"
+        - "packages/db (PostgreSQL 17, Drizzle, State machine transitions)"
+        - "packages/docker-client (Container lifecycle, 8-byte log demux, Traefik)"
+        - "apps/web (Next.js Dashboard, xterm UI)"
+        - "infra (docker-compose, smoke scripts, CI)"
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What happened?
+      description: Describe the bug and what you expected to happen instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to Reproduce
+      description: Exact commands, webhook payloads, or smoke script steps to reproduce.
+      placeholder: |
+        1. Run `...`
+        2. Send webhook / run CLI `...`
+        3. Observe error in logs
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant Logs / Audit Trail
+      description: Paste any relevant worker/API logs or `deployment_events` rows.
+      render: shell
+

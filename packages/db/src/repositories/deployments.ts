@@ -233,4 +233,146 @@ export async function getDeploymentWithRepo(
   };
 }
 
+/**
+ * Marks all `LIVE` deployments whose `expires_at <= NOW()` as `EXPIRED`
+ * and records an immutable `deployment_events` entry for each.
+ * Uses `idx_deployments_reconcile (status, expires_at)`.
+ *
+ * Note on lock ordering: this CTE locks only `deployments` rows (`ORDER BY id FOR UPDATE SKIP LOCKED`)
+ * and never acquires a `pull_requests` lock, so it cannot form a deadlock cycle with
+ * `transitionDeploymentStatus` or `ingestPullRequestWebhook`. Any row currently locked by
+ * an active worker transaction is safely skipped until the next sweep.
+ */
+export async function expireDueDeployments(
+  db: DrizzleClient,
+  opts?: { repoId?: string }
+): Promise<string[]> {
+  return db.transaction(async (tx) => {
+    const repoFilter = opts?.repoId
+      ? sql`AND pull_request_id IN (SELECT id FROM pull_requests WHERE repo_id = ${opts.repoId})`
+      : sql``;
+
+    const expired = await tx.execute<{ id: string }>(sql`
+      WITH due AS (
+        SELECT id
+        FROM deployments
+        WHERE status = 'LIVE'
+          AND expires_at <= NOW()
+          ${repoFilter}
+        ORDER BY id
+        FOR UPDATE SKIP LOCKED
+      )
+      UPDATE deployments d
+      SET status     = 'EXPIRED',
+          updated_at = NOW()
+      FROM due
+      WHERE d.id = due.id
+      RETURNING d.id
+    `);
+
+    for (const row of expired) {
+      await tx.execute(sql`
+        INSERT INTO deployment_events (deployment_id, from_status, to_status, reason)
+        VALUES (
+          ${row.id},
+          'LIVE'::deployment_status,
+          'EXPIRED'::deployment_status,
+          'TTL expired (reconciler sweep)'
+        )
+      `);
+    }
+
+    return expired.map((r) => r.id);
+  });
+}
+
+/**
+ * Fences any deployment stuck in `QUEUED`, `BUILDING`, `STARTING`, or `TESTING`
+ * whose `updated_at` is older than `maxAgeMinutes` (default: 20 minutes per PRD §6.1)
+ * by transitioning it to `FAILED`.
+ *
+ * Note on lock ordering: locks only `deployments` (`ORDER BY id FOR UPDATE SKIP LOCKED`)
+ * and never waits on `pull_requests`, avoiding any deadlock cycle.
+ */
+export async function fenceStuckDeployments(
+  db: DrizzleClient,
+  maxAgeMinutes = 20,
+  opts?: { repoId?: string }
+): Promise<string[]> {
+  return db.transaction(async (tx) => {
+    const reason = `Build timed out or worker crashed (exceeded ${maxAgeMinutes}m reconciler fence)`;
+    const repoFilter = opts?.repoId
+      ? sql`AND pull_request_id IN (SELECT id FROM pull_requests WHERE repo_id = ${opts.repoId})`
+      : sql``;
+
+    const stuck = await tx.execute<{ id: string; status: DeploymentStatus }>(sql`
+      WITH stale AS (
+        SELECT id, status
+        FROM deployments
+        WHERE status IN ('QUEUED', 'BUILDING', 'STARTING', 'TESTING')
+          AND updated_at <= NOW() - (${maxAgeMinutes} * INTERVAL '1 minute')
+          ${repoFilter}
+        ORDER BY id
+        FOR UPDATE SKIP LOCKED
+      )
+      UPDATE deployments d
+      SET status         = 'FAILED',
+          failure_reason = ${reason},
+          updated_at     = NOW()
+      FROM stale
+      WHERE d.id = stale.id
+      RETURNING d.id, stale.status
+    `);
+
+    for (const row of stuck) {
+      await tx.execute(sql`
+        INSERT INTO deployment_events (deployment_id, from_status, to_status, reason)
+        VALUES (
+          ${row.id},
+          ${row.status}::deployment_status,
+          'FAILED'::deployment_status,
+          ${reason}
+        )
+      `);
+    }
+
+    return stuck.map((r) => r.id);
+  });
+}
+
+/**
+ * Returns the set of deployment IDs that are legitimately allowed to own a
+ * Docker container or image right now (`QUEUED`, `BUILDING`, `STARTING`, `TESTING`, or `LIVE`).
+ * Any managed container or image whose `reapd.deployment_id` is NOT in this set is an orphan.
+ */
+export async function getActiveDeploymentIds(
+  db: DrizzleClient
+): Promise<{
+  activeBuildOrLiveIds: Set<string>;
+  activeContainerIds: Set<string>;
+}> {
+  const rows = await db.execute<{ id: string; status: DeploymentStatus }>(sql`
+    SELECT id, status
+    FROM deployments
+    WHERE status IN ('QUEUED', 'BUILDING', 'STARTING', 'TESTING', 'LIVE')
+  `);
+
+  const activeBuildOrLiveIds = new Set<string>();
+  const activeContainerIds = new Set<string>();
+
+  for (const row of rows) {
+    activeBuildOrLiveIds.add(row.id);
+    if (
+      row.status === 'STARTING' ||
+      row.status === 'TESTING' ||
+      row.status === 'LIVE'
+    ) {
+      activeContainerIds.add(row.id);
+    }
+  }
+
+  return { activeBuildOrLiveIds, activeContainerIds };
+}
+
+
 

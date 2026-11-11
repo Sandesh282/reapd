@@ -51,9 +51,12 @@ export async function cloneRepoAtSha(opts: CloneRepoOptions): Promise<CloneResul
 
   try {
     const gitEnv = buildGitEnv(opts.authToken);
+    // 2-minute hard cap so a hung network clone cannot block a worker slot indefinitely
+    const cloneTimeout = AbortSignal.timeout(2 * 60 * 1000);
+    const combinedSignal = AbortSignal.any([opts.signal, cloneTimeout]);
 
     const git = (args: string[]) =>
-      runProcess({ cmd: 'git', args, cwd: workDir, env: gitEnv, signal: opts.signal, onLog: opts.onLog });
+      runProcess({ cmd: 'git', args, cwd: workDir, env: gitEnv, signal: combinedSignal, onLog: opts.onLog });
 
     await git(['init', '--quiet']);
     await git(['remote', 'add', 'origin', '--', opts.repoUrl]);
@@ -67,7 +70,7 @@ export async function cloneRepoAtSha(opts: CloneRepoOptions): Promise<CloneResul
       args: ['rev-parse', 'HEAD'],
       cwd: workDir,
       env: gitEnv,
-      signal: opts.signal,
+      signal: combinedSignal,
       onLog: (_stream, line) => {
         if (line.trim().length === 40) resolvedSha = line.trim();
       },

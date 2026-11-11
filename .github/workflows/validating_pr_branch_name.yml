@@ -1,0 +1,26 @@
+name: Validate PR branch name
+
+on:
+  pull_request:
+    types:
+      - opened
+      - reopened
+
+permissions: read-all
+
+jobs:
+  validate_branch_name:
+    name: Ensure PR is not opened from main or release-*
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check head branch name
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const branch = context.payload.pull_request.head.ref;
+            if (branch === 'main' || branch.startsWith('release-')) {
+              core.setFailed(
+                `PRs must not be opened directly from '${branch}'. Use a feature or phase branch (e.g. 'phase/4-reconciler-superseding' or 'fix/...').`
+              );
+            }
+

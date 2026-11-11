@@ -51,6 +51,10 @@ export interface RunProcessOptions {
 export function runProcess(opts: RunProcessOptions): Promise<void> {
   return new Promise((resolve, reject) => {
     if (opts.signal.aborted) {
+      const reason = opts.signal.reason as { name?: string } | undefined;
+      if (reason?.name === 'TimeoutError') {
+        return reject(new Error(`${opts.cmd} ${opts.args[0]} timed out before start`));
+      }
       return reject(new AbortError(`${opts.cmd} aborted before start`));
     }
 
@@ -91,6 +95,12 @@ export function runProcess(opts: RunProcessOptions): Promise<void> {
     child.on('close', (code) => {
       opts.signal.removeEventListener('abort', onAbort);
       if (aborted) {
+        const reason = opts.signal.reason as { name?: string } | undefined;
+        if (reason?.name === 'TimeoutError') {
+          return reject(
+            new Error(`${opts.cmd} ${opts.args[0]} timed out: ${stderrTail.trim()}`)
+          );
+        }
         return reject(new AbortError(`${opts.cmd} aborted by signal`));
       }
       if (code !== 0) {

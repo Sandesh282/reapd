@@ -18,6 +18,8 @@ import {
 } from '@reapd/docker-client';
 import { cloneRepoAtSha } from '../builder/git-clone.js';
 import { buildDockerImage } from '../builder/image-builder.js';
+import { runReconcileSweep } from '../reconciler/index.js';
+import { closeDb } from '@reapd/db';
 
 async function main(): Promise<void> {
   const [command, ...rest] = process.argv.slice(2);
@@ -28,6 +30,8 @@ async function main(): Promise<void> {
     await runDown(rest);
   } else if (command === 'ls') {
     await runLs();
+  } else if (command === 'reconcile') {
+    await runReconcile();
   } else {
     printUsage();
     process.exitCode = 1;
@@ -205,11 +209,23 @@ async function runLs(): Promise<void> {
   );
 }
 
+async function runReconcile(): Promise<void> {
+  try {
+    const res = await runReconcileSweep();
+    console.log(
+      `♻️  Reconcile complete: expired=${res.expiredDeploymentIds.length}, fenced=${res.fencedDeploymentIds.length}, removedContainers=${res.removedContainerIds.length}, removedImages=${res.removedImageTags.length}, removedTmpDirs=${res.removedTmpDirs.length}`
+    );
+  } finally {
+    await closeDb().catch(() => {});
+  }
+}
+
 function printUsage(): void {
   console.log(`Usage:
-  reapd-cli up   --repo <url-or-path> --pr <number> [--sha <sha>] [--subpath <dir>] [--port <port>] [--health-path <path>]
-  reapd-cli down --pr <number>
-  reapd-cli ls`);
+  reapd-cli up        --repo <url-or-path> --pr <number> [--sha <sha>] [--subpath <dir>] [--port <port>] [--health-path <path>]
+  reapd-cli down      --pr <number>
+  reapd-cli ls
+  reapd-cli reconcile`);
 }
 
 main().catch((err: unknown) => {

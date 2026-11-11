@@ -10,6 +10,7 @@ export interface IngestResult {
   duplicate: boolean;
   newDeploymentId?: string;
   supersededIds: string[];
+  expiredIds?: string[];
 }
 
 /**
@@ -20,14 +21,20 @@ export interface IngestResult {
  * touching any other table.
  *
  * Within a single transaction:
- *  1. Gate on delivery_id uniqueness
- *  2. Upsert the PR row, incrementing latest_generation
- *  3. Supersede all in-flight deployments (QUEUED/BUILDING/STARTING/TESTING)
- *  4. Insert a new QUEUED deployment + its initial audit event
+ *  - For `opened` / `synchronize` / `reopened`:
+ *    1. Gate on delivery_id uniqueness
+ *    2. Upsert the PR row, incrementing latest_generation and setting is_open = TRUE
+ *    3. Supersede all in-flight deployments (QUEUED/BUILDING/STARTING/TESTING)
+ *    4. Insert a new QUEUED deployment + its initial audit event
+ *  - For `closed`:
+ *    1. Gate on delivery_id uniqueness
+ *    2. Upsert/lock the PR row, incrementing latest_generation (fences any in-flight workers) and setting is_open = FALSE
+ *    3. Supersede all in-flight deployments (QUEUED/BUILDING/STARTING/TESTING)
+ *    4. Expire all LIVE deployments on this PR (LIVE → EXPIRED)
  *
  * After the transaction commits, the caller is responsible for:
  *  - Publishing cancel signals to Redis for each supersededId
- *  - Enqueuing the new deployment to BullMQ
+ *  - Enqueuing the new deployment to BullMQ (when newDeploymentId is present)
  */
 export async function ingestPullRequestWebhook(
   db: DrizzleClient,
@@ -47,25 +54,34 @@ export async function ingestPullRequestWebhook(
       return { duplicate: true, supersededIds: [] };
     }
 
+    const isClose = payload.action === 'closed';
+
     // ── Step 2: Upsert PR, increment generation ─────────────────────────────
     const prs = await tx.execute<{ id: string; latest_generation: number }>(sql`
       INSERT INTO pull_requests (repo_id, pr_number, branch_name, latest_generation, is_open)
-      VALUES (${payload.repoId}, ${payload.prNumber}, ${payload.branchName}, 1, TRUE)
+      VALUES (${payload.repoId}, ${payload.prNumber}, ${payload.branchName}, 1, ${!isClose})
       ON CONFLICT (repo_id, pr_number) DO UPDATE
         SET branch_name       = EXCLUDED.branch_name,
             latest_generation = pull_requests.latest_generation + 1,
-            is_open           = TRUE
+            is_open           = ${!isClose}
       RETURNING id, latest_generation
     `);
 
     const pr = prs[0]!;
 
     // ── Step 3: Supersede all in-flight deployments ─────────────────────────
+    const supersedeFailureReason = isClose
+      ? `Superseded by PR #${payload.prNumber} close (gen ${pr.latest_generation})`
+      : `Superseded by commit ${payload.commitSha.slice(0, 7)} (gen ${pr.latest_generation})`;
+    const supersedeEventReason = isClose
+      ? `Pull request closed (generation ${pr.latest_generation})`
+      : `Superseded by generation ${pr.latest_generation}`;
+
     const superseded = await tx.execute<{ id: string; status: string }>(sql`
       UPDATE deployments
       SET
         status         = 'SUPERSEDED',
-        failure_reason = ${'Superseded by commit ' + payload.commitSha.slice(0, 7) + ' (gen ' + pr.latest_generation + ')'},
+        failure_reason = ${supersedeFailureReason},
         updated_at     = NOW()
       WHERE pull_request_id = ${pr.id}
         AND status IN ('QUEUED', 'BUILDING', 'STARTING', 'TESTING')
@@ -79,12 +95,42 @@ export async function ingestPullRequestWebhook(
           ${old.id},
           ${old.status}::deployment_status,
           'SUPERSEDED',
-          ${'Superseded by generation ' + pr.latest_generation}
+          ${supersedeEventReason}
         )
       `);
     }
 
-    // ── Step 4: Insert new QUEUED deployment + initial audit event ───────────
+    // ── Step 4a: On PR close, expire any LIVE deployments and return ────────
+    if (isClose) {
+      const expired = await tx.execute<{ id: string }>(sql`
+        UPDATE deployments
+        SET status     = 'EXPIRED',
+            updated_at = NOW()
+        WHERE pull_request_id = ${pr.id}
+          AND status = 'LIVE'
+        RETURNING id
+      `);
+
+      for (const exp of expired) {
+        await tx.execute(sql`
+          INSERT INTO deployment_events (deployment_id, from_status, to_status, reason)
+          VALUES (
+            ${exp.id},
+            'LIVE'::deployment_status,
+            'EXPIRED'::deployment_status,
+            'Pull request closed'
+          )
+        `);
+      }
+
+      return {
+        duplicate: false,
+        supersededIds: superseded.map((r) => r.id),
+        expiredIds: expired.map((r) => r.id),
+      };
+    }
+
+    // ── Step 4b: Insert new QUEUED deployment + initial audit event ──────────
     const newDeploys = await tx.execute<{ id: string }>(sql`
       INSERT INTO deployments (
         pull_request_id, commit_sha, generation, subdomain, status, expires_at
@@ -176,4 +222,62 @@ export async function upsertRepository(
     installationId: Number(row.installation_id),
   };
 }
+
+/**
+ * Deletes a repository row by its GitHub repo ID and installation ID (cascades to PRs and deployments).
+ * Returns the IDs of any in-flight deployments (`QUEUED`/`BUILDING`/`STARTING`/`TESTING`) that belonged
+ * to that repository so the caller can publish `cancel:deploy:<id>` signals immediately.
+ */
+export async function deleteRepositoryByGithubId(
+  db: DrizzleClient,
+  githubRepoId: number,
+  installationId: number
+): Promise<string[]> {
+  return db.transaction(async (tx) => {
+    const active = await tx.execute<{ id: string }>(sql`
+      SELECT d.id
+      FROM deployments d
+      JOIN pull_requests pr ON pr.id = d.pull_request_id
+      JOIN repositories  r  ON r.id  = pr.repo_id
+      WHERE r.github_repo_id = ${githubRepoId}
+        AND r.installation_id = ${installationId}
+        AND d.status IN ('QUEUED', 'BUILDING', 'STARTING', 'TESTING')
+    `);
+
+    await tx.execute(sql`
+      DELETE FROM repositories
+      WHERE github_repo_id = ${githubRepoId}
+        AND installation_id = ${installationId}
+    `);
+
+    return active.map((r) => r.id);
+  });
+}
+
+/**
+ * Deletes all repository rows belonging to an uninstalled GitHub App installation.
+ * Returns the IDs of any in-flight deployments so the caller can publish cancel signals.
+ */
+export async function deleteRepositoriesByInstallationId(
+  db: DrizzleClient,
+  installationId: number
+): Promise<string[]> {
+  return db.transaction(async (tx) => {
+    const active = await tx.execute<{ id: string }>(sql`
+      SELECT d.id
+      FROM deployments d
+      JOIN pull_requests pr ON pr.id = d.pull_request_id
+      JOIN repositories  r  ON r.id  = pr.repo_id
+      WHERE r.installation_id = ${installationId}
+        AND d.status IN ('QUEUED', 'BUILDING', 'STARTING', 'TESTING')
+    `);
+
+    await tx.execute(sql`
+      DELETE FROM repositories WHERE installation_id = ${installationId}
+    `);
+
+    return active.map((r) => r.id);
+  });
+}
+
 

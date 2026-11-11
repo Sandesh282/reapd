@@ -1,0 +1,59 @@
+name: Type checks
+
+permissions: read-all
+
+on:
+  push:
+    branches:
+      - main
+      - release-*
+  pull_request:
+    branches:
+      - main
+      - release-*
+    types:
+      - opened
+      - synchronize
+      - reopened
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  workspace_typecheck:
+    name: Typecheck (${{ matrix.workspace }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        workspace:
+          - '@reapd/types'
+          - '@reapd/db'
+          - '@reapd/docker-client'
+          - '@reapd/worker'
+          - '@reapd/api'
+          - '@reapd/web'
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 50
+
+      - name: Set up Node & dependencies
+        uses: ./.github/actions/setup-node-and-deps
+
+      - name: Run tsc --noEmit for ${{ matrix.workspace }}
+        run: npm run typecheck --workspace ${{ matrix.workspace }}
+
+  check_all_type_checks_pass:
+    name: Check that all type checks pass
+    needs: [workspace_typecheck]
+    if: always()
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Verify all workspace typecheck shards succeeded
+        if: ${{ needs.workspace_typecheck.result != 'success' }}
+        run: exit 1
+      - name: All type checks passed
+        run: echo "✅ All workspace type checks passed"
