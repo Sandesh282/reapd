@@ -10,7 +10,7 @@
 [![CI — All Type Checks](https://github.com/Sandesh282/reapd/actions/workflows/all_type_checks.yml/badge.svg)](https://github.com/Sandesh282/reapd/actions/workflows/all_type_checks.yml)
 
 ![TypeScript](https://img.shields.io/badge/TypeScript-5.x-3178C6?logo=typescript&logoColor=white)
-![Node.js](https://img.shields.io/badge/Node.js-26.x-339933?logo=node.js&logoColor=white)
+![Node.js](https://img.shields.io/badge/Node.js-22%2B-339933?logo=node.js&logoColor=white)
 ![Fastify](https://img.shields.io/badge/Fastify-5-000000?logo=fastify&logoColor=white)
 ![Next.js](https://img.shields.io/badge/Next.js-15-000000?logo=next.js&logoColor=white)
 ![PostgreSQL](https://img.shields.io/badge/PostgreSQL-17-4169E1?logo=postgresql&logoColor=white)
@@ -81,11 +81,11 @@ flowchart TD
 
 When you attach to a Docker container, you don't get raw stdout. The API multiplexes `stdout` and `stderr` into a single byte stream where every chunk is prefixed by an 8-byte header: 1 byte for stream type, 3 bytes of padding, 4 bytes for payload length. Split on `\n` directly and you'll corrupt lines that span frame boundaries or mash two lines that share one frame.
 
-[`packages/docker-client/src/log-demux.ts`](packages/docker-client/src/log-demux.ts) handles this with a carry buffer and a two-state machine (`HEADER` to `PAYLOAD`). It reassembles frames first, then splits on newlines, tagging each line `stdout` or `stderr` before passing it upstream.
+[`packages/docker-client/src/log-demux.ts`](packages/docker-client/src/log-demux.ts) handles this by buffering incoming chunks until a complete frame (8-byte header plus payload) is available. It reassembles frames first, then splits on newlines, tagging each line `stdout` or `stderr` before passing it upstream.
 
-From there, the worker's log sink ([`apps/worker/src/logs/log-sink.ts`](apps/worker/src/logs/log-sink.ts)) batches lines into a Redis Stream (`XADD build-log:<id> MAXLEN ~ 2000`) with an async background flush, so a 1,500-line burst from a noisy build step doesn't stall the event loop. Every flush also refreshes a 6h `EXPIRE` on the key, so streams from crashed workers don't accumulate forever.
+From there, the worker's log sink ([`apps/worker/src/logs/log-sink.ts`](apps/worker/src/logs/log-sink.ts)) batches lines into a Redis Stream (`XADD logs:build:<id> MAXLEN ~ 2000`) with an async background flush, so a 1,500-line burst from a noisy build step doesn't stall the event loop. Every flush also refreshes a 6h `EXPIRE` on the key, so streams from crashed workers don't accumulate forever.
 
-On the read side, the SSE route ([`apps/api/src/routes/deployments.ts`](apps/api/src/routes/deployments.ts)) uses `XREAD BLOCK 2000` with the browser's `Last-Event-ID` as the cursor, so a tab that reconnects mid-build picks up exactly where it left off. Two edge cases worth mentioning: the route rejects any entry where `source !== 'system'` to block forged `end:LIVE` markers injected via a malicious build step, and if the worker died before writing the end marker, `XINFO STREAM` lets the route detect a stalled stream and close the SSE connection cleanly instead of hanging.
+On the read side, the SSE route ([`apps/api/src/routes/deployments.ts`](apps/api/src/routes/deployments.ts)) uses `XREAD COUNT 200 BLOCK 5000` with the browser's `Last-Event-ID` as the cursor, so a tab that reconnects mid-build picks up exactly where it left off. Two edge cases worth mentioning: the route rejects any entry where `source !== 'system'` to block forged `end:LIVE` markers injected via a malicious build step, and if the worker died before writing the end marker, the route falls back to Postgres on every `XREAD` timeout: once the deployment is terminal in the DB it does one short grace read for any final lines, then closes the SSE connection instead of hanging. On resume, `XINFO STREAM` is used for gap detection, so a client that reconnects after `MAXLEN` trimmed its cursor is told that entries were dropped.
 
 ### 2 · Routing without reloads
 
@@ -97,10 +97,11 @@ Instead, reapd stamps each container at `docker create` time with Traefik v3 lab
 traefik.enable=true
 traefik.http.routers.pr-{n}.rule=Host(`pr-{n}.preview.localhost`)
 traefik.http.routers.pr-{n}.entrypoints=websecure
+traefik.http.routers.pr-{n}.tls=true
 traefik.http.services.pr-{n}.loadbalancer.server.port={containerPort}
 ```
 
-Traefik watches the Docker socket through a read-only TCP socket-proxy (no `exec`, no `post`, no host escape) and picks up the new route within ~50 ms. When the container is reaped, the route disappears with it. No cleanup step, no stale config entry.
+Traefik watches Docker through a TCP socket-proxy that blocks `EXEC`, `HOST`, `VOLUMES` and `PRIVILEGED` (`POST` is enabled because the worker also creates containers and builds images through it) and picks up the new route as soon as Docker emits the container-start event. When the container is reaped, the route disappears with it. No cleanup step, no stale config entry.
 
 ### 3 · Rapid pushes without zombie containers
 
@@ -108,10 +109,8 @@ Push three commits in five seconds and you get three webhooks, three BullMQ jobs
 
 The fix is a monotonic generation counter on the `pull_requests` row, combined with two layers of cancellation:
 
-1. Each worker takes a `SELECT ... FOR UPDATE` on the PR row and reads `latest_generation`. If its own generation is already stale, it transitions to `SUPERSEDED` immediately and exits. If it wins, it increments the counter, making every other in-flight worker stale on their next check.
-2. The winning worker also publishes to `cancel:deploy:<id>`. Losing workers subscribe to this channel and receive an `AbortSignal` within < 1 s, stopping the Docker build mid-flight. No polling, no waiting for the next DB round-trip.
-
-A superseded build stops within a second of the newer push arriving.
+1. **Ingest.** The API handles every webhook in one transaction: it locks the PR row, increments `latest_generation`, and marks every older non-terminal deployment for that PR `SUPERSEDED`. A worker that dequeues a stale job later is caught by `transitionDeploymentStatus`, which rewrites any forward transition from an older generation to `SUPERSEDED`.
+2. **Cancel signal.** After the transaction commits, the API publishes to `cancel:deploy:<id>` for each superseded deployment. Each worker subscribes to the channel for the job it is running and wires it to an `AbortSignal`, which stops the in-flight Docker build instead of letting it run to completion. No polling, no waiting for the next DB round-trip.
 
 ### 4 · Smoke testing without letting the page call home
 
@@ -129,20 +128,26 @@ If Chromium isn't installed, the probe returns `SKIPPED` via `SmokeUnavailableEr
 
 After the smoke result is committed, `upsertPrComment` ([`apps/worker/src/github/pr-comment.ts`](apps/worker/src/github/pr-comment.ts)) updates the sticky PR comment in-place: `POST` on first deploy, `PATCH` on every subsequent generation, `POST` again if the original was deleted with the orphaned duplicate cleaned up immediately. The comment ID lives in `pull_requests.sticky_comment_id` with an optimistic-lock check, so a concurrent supersede can't leave two comments on the same PR.
 
-### 5 · State machine enforced at the database, not in application code
+### 5 · A pure state machine, applied under row locks
 
-The deployment lifecycle is a strict one-way graph:
+The deployment lifecycle is a strict one-way graph. The edges live in one pure function ([`packages/types/src/domain/state-machine.ts`](packages/types/src/domain/state-machine.ts)), so every writer shares the same rules:
 
 ```
-QUEUED → BUILDING → STARTING → TESTING → LIVE
-                                        ↘ FAILED
-                              ↘ SUPERSEDED (any state)
-LIVE → EXPIRED  (TTL-elapsed, via reconciler)
+QUEUED → BUILDING → STARTING → TESTING → LIVE → EXPIRED
+
+QUEUED, BUILDING, STARTING, TESTING → FAILED
+QUEUED, BUILDING, STARTING, TESTING → SUPERSEDED
 ```
 
-Transitions go through a single `UPDATE ... WHERE status = $expected RETURNING *`. If the row has already moved because a concurrent push superseded it or the reconciler expired it, the update matches zero rows and the function throws. There's no way to double-transition or rewind; the DB enforces it.
+- `QUEUED`, `BUILDING`, `STARTING` and `TESTING` can each move forward one step, or go to `FAILED` or `SUPERSEDED`.
+- `LIVE` can only go to `EXPIRED` (PR closed or TTL elapsed).
+- `FAILED`, `SUPERSEDED` and `EXPIRED` are terminal and can never be overwritten.
 
-Webhook idempotency works the same way. `(repo_id, pr_number, head_sha)` has a unique constraint, so a re-delivered webhook upserts the existing row instead of queuing a duplicate job. The `generation` column handles the race where a stale BullMQ job finally dequeues after a newer generation has already won the lock. It checks, sees it's behind, and exits without touching the container or the DB.
+Every transition goes through `transitionDeploymentStatus` ([`packages/db/src/repositories/deployments.ts`](packages/db/src/repositories/deployments.ts)), which runs in one transaction. It locks the parent `pull_requests` row, then the `deployments` row (`FOR UPDATE`, always in that order, so concurrent webhooks and workers can't deadlock). It then checks the edge with `assertValidTransition` and writes the new status plus an audit row in `deployment_events`. If the deployment is already terminal, because a push superseded it or the reconciler expired it, the call is a no-op and returns `transitioned: false` so the caller can clean up. An edge that isn't allowed throws `InvalidStateTransitionError`. The database provides the locking and atomicity; the rules themselves are in application code.
+
+The `generation` column handles the race where a stale BullMQ job finally dequeues after a newer push has won. `pull_requests.latest_generation` is bumped on every webhook, and any transition from an older generation (other than to `SUPERSEDED`/`EXPIRED`) is rewritten to `SUPERSEDED` ("Preempted by generation N"), so a stale job can never take a deployment `LIVE`. The worker also tags images with the generation (`reapd-pr-104:g2-a1b2c3d`) and only removes images from older generations, so it never touches a newer one's container.
+
+Webhook idempotency is a separate check. Each delivery's `X-GitHub-Delivery` ID is inserted into `webhook_deliveries` with `ON CONFLICT DO NOTHING` inside the same transaction as the rest of the ingest, so a re-delivered webhook returns early without queuing a duplicate job. (`pull_requests` is unique on `(repo_id, pr_number)`.)
 
 ---
 
@@ -168,15 +173,15 @@ Webhook idempotency works the same way. `(repo_id, pr_number, head_sha)` has a u
 
 ## CI / Verification
 
-**28 checks** across 5 workflows on every PR:
+**29 checks** across 6 workflows on every PR:
 
 | Workflow | Jobs |
 |----------|------|
 | Backend unit tests | Verify test files exist · `@reapd/docker-client` · `@reapd/worker` · `@reapd/api` · PostgreSQL 17 integration |
 | Full-stack smoke tests | Phase 1 (Hardened Container & Traefik TLS) · Phase 2 (CLI Clone & BuildKit) · Phase 3 (Webhook HMAC & Idempotency) · Phase 4 (Rapid Superseding & Reconciler) · Phase 5 (REST API & SSE Log Streaming) · Phase 6 (Playwright Smoke Runner & Sticky PR Comment) |
-| All lint checks | ESLint across all workspaces |
+| All lint checks | ShellCheck on the smoke scripts · 4-layer architecture and import boundaries · bad-pattern check (`@ts-ignore`, `.only(`, committed secrets) · lockfile and Node engine consistency · Docker socket-proxy hardening and loopback-only ports |
 | All type checks | `tsc --noEmit` across all workspaces |
-| PR hygiene | Branch name validation · PR description template check |
+| PR hygiene (two workflows) | Branch name validation · PR description template check |
 
 Each smoke gate is a self-contained `bash` script in [`infra/scripts/`](infra/scripts/) that spins up the full Docker Compose stack, exercises the real code path end-to-end, and tears everything down. The Phase 6 gate runs the GitHub App mock server, fires a webhook, streams SSE, and asserts the sticky PR comment was posted.
 
@@ -195,7 +200,7 @@ reapd/
 │   ├── docker-client/# Docker Engine API client, 8-byte log demux, AbortError
 │   └── types/        # Shared TypeScript types (DeploymentStatus, TestRunStatus…)
 ├── infra/
-│   ├── docker-compose.yml      # Infra services: Traefik, Redis, Postgres, socket-proxy (API/worker/web run separately)
+│   ├── docker-compose.yml      # Infra services: Traefik, Redis, Postgres, socket-proxy, Prometheus, Grafana (API/worker/web run separately)
 │   └── scripts/
 │       ├── cli-smoke.sh        # Phase 1: container isolation + Traefik TLS
 │       ├── phase2-smoke.sh     # Phase 2: git clone + BuildKit image build
@@ -256,7 +261,7 @@ Then run the application processes in separate terminals:
 ```bash
 npm run build                        # Turborepo builds all packages in dependency order
 npm run dev --workspace apps/api     # Fastify API on :3001
-npm run dev --workspace apps/worker  # BullMQ worker + reconciler (or split via REAPD_ROLE=worker / REAPD_ROLE=reconciler)
+npm run dev --workspace apps/worker  # BullMQ worker
 npm run dev --workspace apps/web     # Next.js dashboard on :3000
 ```
 
@@ -296,7 +301,7 @@ The API and worker each expose Prometheus metrics (`prom-client`). `docker compo
 | `reapd_webhook_requests_total{event,action}` | counter | API, counted after HMAC verification |
 | `reapd_webhook_rejections_total{reason}` | counter | API, rejected/deduplicated deliveries (`invalid_signature`, `fork_rejected`, `duplicate`, etc.) |
 
-Endpoints: API at `http://127.0.0.1:3001/metrics` (with best-effort rejection of common reverse-proxy/tunnel headers like `X-Forwarded-*`, `Forwarded`, `X-Real-IP`, `CF-Connecting-IP`), worker at `http://127.0.0.1:9091/metrics` (override with `REAPD_WORKER_METRICS_HOST` / `REAPD_WORKER_METRICS_PORT`), and standalone reconciler (`REAPD_ROLE=reconciler`) at `http://127.0.0.1:9092/metrics` (override with `REAPD_RECONCILER_METRICS_HOST` / `REAPD_RECONCILER_METRICS_PORT`). All listeners bind to `127.0.0.1` by default — on Docker Desktop (`macOS`/`Windows`), `host.docker.internal` reaches host loopback directly; on Linux, where `host-gateway` resolves to the Docker bridge IP, set `REAPD_WORKER_METRICS_HOST` and `REAPD_API_HOST` to the bridge IP or run Prometheus with host networking.
+Endpoints: API at `http://127.0.0.1:3001/metrics` (with best-effort rejection of common reverse-proxy/tunnel headers like `X-Forwarded-*`, `Forwarded`, `X-Real-IP`, `CF-Connecting-IP`), worker at `http://127.0.0.1:9091/metrics` (override with `REAPD_WORKER_METRICS_HOST` / `REAPD_WORKER_METRICS_PORT`). Both bind to `127.0.0.1` by default — on Docker Desktop (`macOS`/`Windows`), `host.docker.internal` reaches host loopback directly; on Linux, where `host-gateway` resolves to the Docker bridge IP, set `REAPD_WORKER_METRICS_HOST` and `REAPD_API_HOST` to the bridge IP or run Prometheus with host networking.
 
 ---
 
