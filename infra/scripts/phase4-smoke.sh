@@ -16,6 +16,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 TMP_REPO="$(mktemp -d /tmp/reapd-phase4-repo-XXXXXX)"
 API_LOG="$(mktemp /tmp/reapd-phase4-api-XXXXXX.log)"
 WORKER_LOG="$(mktemp /tmp/reapd-phase4-worker-XXXXXX.log)"
+RECONCILER_LOG="$(mktemp /tmp/reapd-phase4-reconciler-XXXXXX.log)"
 API_PORT=3041
 TEST_SECRET="phase4-smoke-webhook-secret"
 TEST_QUEUE="build-phase4-$$"
@@ -23,13 +24,18 @@ TEST_REPO_ID=999401
 TEST_PR_NUMBER=401
 RUN_TOKEN="$(node -e 'console.log(crypto.randomUUID())')"
 ZOMBIE_CONTAINER_NAME="reapd-pr-zombie-401"
+CRASH_CONTAINER_NAME="reapd-pr-crash-401"
 DELIVERY_INSTALL="$(node -e 'console.log(crypto.randomUUID())')"
 DELIVERY_GEN1="$(node -e 'console.log(crypto.randomUUID())')"
 DELIVERY_GEN2="$(node -e 'console.log(crypto.randomUUID())')"
 DELIVERY_GEN3="$(node -e 'console.log(crypto.randomUUID())')"
 DELIVERY_CLOSE="$(node -e 'console.log(crypto.randomUUID())')"
+DELIVERY_CRASH="$(node -e 'console.log(crypto.randomUUID())')"
+DELIVERY_RECOVER="$(node -e 'console.log(crypto.randomUUID())')"
+DELIVERY_CLOSE2="$(node -e 'console.log(crypto.randomUUID())')"
 API_PID=""
 WORKER_PID=""
+RECONCILER_PID=""
 
 cleanup() {
   if [[ -n "$API_PID" ]] && kill -0 "$API_PID" 2>/dev/null; then
@@ -37,11 +43,16 @@ cleanup() {
     wait "$API_PID" 2>/dev/null || true
   fi
   if [[ -n "$WORKER_PID" ]] && kill -0 "$WORKER_PID" 2>/dev/null; then
+    pkill -9 -P "$WORKER_PID" 2>/dev/null || true
     kill "$WORKER_PID" 2>/dev/null || true
     wait "$WORKER_PID" 2>/dev/null || true
   fi
-  rm -rf "$TMP_REPO" "$API_LOG" "$WORKER_LOG"
-  docker rm -f -v "$ZOMBIE_CONTAINER_NAME" >/dev/null 2>&1 || true
+  if [[ -n "$RECONCILER_PID" ]] && kill -0 "$RECONCILER_PID" 2>/dev/null; then
+    kill "$RECONCILER_PID" 2>/dev/null || true
+    wait "$RECONCILER_PID" 2>/dev/null || true
+  fi
+  rm -rf "$TMP_REPO" "$API_LOG" "$WORKER_LOG" "$RECONCILER_LOG"
+  docker rm -f -v "$ZOMBIE_CONTAINER_NAME" "$CRASH_CONTAINER_NAME" >/dev/null 2>&1 || true
   (cd "$ROOT" && npm run reapd -- down --pr "$TEST_PR_NUMBER" >/dev/null 2>&1) || true
   DEPLOY_IDS="$(docker exec -i reapd-postgres psql -U reapd -d reapd -tAq -c \
     "SELECT d.id FROM deployments d JOIN pull_requests pr ON pr.id = d.pull_request_id JOIN repositories r ON r.id = pr.repo_id WHERE r.github_repo_id = $TEST_REPO_ID;" 2>/dev/null || true)"
@@ -51,7 +62,8 @@ cleanup() {
   docker exec -i reapd-redis sh -c "redis-cli --scan --pattern 'bull:$TEST_QUEUE*' | xargs -r redis-cli del" >/dev/null 2>&1 || true
   docker exec -i reapd-postgres psql -U reapd -d reapd -q <<SQL >/dev/null 2>&1 || true
 DELETE FROM webhook_deliveries WHERE delivery_id IN (
-  '$DELIVERY_INSTALL', '$DELIVERY_GEN1', '$DELIVERY_GEN2', '$DELIVERY_GEN3', '$DELIVERY_CLOSE'
+  '$DELIVERY_INSTALL', '$DELIVERY_GEN1', '$DELIVERY_GEN2', '$DELIVERY_GEN3',
+  '$DELIVERY_CLOSE', '$DELIVERY_CRASH', '$DELIVERY_RECOVER', '$DELIVERY_CLOSE2'
 );
 DELETE FROM repositories WHERE github_repo_id = $TEST_REPO_ID;
 SQL
@@ -97,11 +109,13 @@ EOF
 SHA_GEN1="$(write_commit "reapd-phase4-gen1" "RUN echo 'gen1-$RUN_TOKEN' && sleep 6")"
 SHA_GEN2="$(write_commit "reapd-phase4-gen2" "RUN echo 'gen2-$RUN_TOKEN' && sleep 4")"
 SHA_GEN3="$(write_commit "reapd-phase4-gen3" "")"
+SHA_CRASH="$(write_commit "reapd-phase4-crash" "RUN echo 'crash-$RUN_TOKEN' && sleep 12")"
 
 echo "📝 Fixture commits created (run token $RUN_TOKEN):"
 echo "   Gen 1: $SHA_GEN1 (uncached 6s build)"
 echo "   Gen 2: $SHA_GEN2 (uncached 4s build)"
 echo "   Gen 3: $SHA_GEN3"
+echo "   Crash: $SHA_CRASH (uncached 12s build for SIGKILL recovery test)"
 
 cd "$ROOT"
 MKCERT_CAROOT="$(mkcert -CAROOT)"
@@ -363,4 +377,150 @@ const [apiMetricsUrl, workerMetricsUrl] = process.argv.slice(2);
 });
 NODE_EOF
 
-echo "✅ PASS: Phase 4 verification gate complete (3-commit superseding -> orphan container GC -> PR close container+image teardown)"
+# ── 7. SIGKILL worker mid-build & verify standalone reconciler fences + reaps ─
+echo "💥 Testing worker SIGKILL crash recovery with standalone reconciler (REAPD_ROLE=reconciler)..."
+kill "$WORKER_PID" 2>/dev/null || true
+wait "$WORKER_PID" 2>/dev/null || true
+WORKER_PID=""
+
+# Start a worker-only process (REAPD_ROLE=worker, no embedded reconciler loop)
+REAPD_ROLE=worker REAPD_REPO_URL_OVERRIDE="$TMP_REPO" REAPD_BUILD_QUEUE="$TEST_QUEUE" REAPD_WORKER_METRICS_PORT="$WORKER_METRICS_PORT" \
+  node --import tsx "$ROOT/apps/worker/src/index.ts" >>"$WORKER_LOG" 2>&1 &
+WORKER_PID=$!
+sleep 1
+
+# Reopen PR #401 with the 12s crash commit (Generation 4)
+send_pr_webhook "$DELIVERY_CRASH" "reopened" "$SHA_CRASH" "open"
+
+GEN4_CUR=""
+for _ in {1..40}; do
+  GEN4_CUR="$(docker exec -i reapd-postgres psql -U reapd -d reapd -tAq -c \
+    "SELECT status FROM deployments WHERE subdomain = 'pr-$TEST_PR_NUMBER' AND generation = 4 LIMIT 1;")"
+  if [[ "$GEN4_CUR" == "BUILDING" ]]; then
+    break
+  fi
+  sleep 0.25
+done
+
+if [[ "$GEN4_CUR" != "BUILDING" ]]; then
+  echo "❌ FAIL: expected Generation 4 to enter BUILDING before SIGKILL, got '$GEN4_CUR'"
+  cat "$WORKER_LOG"
+  exit 1
+fi
+
+GEN4_ID="$(docker exec -i reapd-postgres psql -U reapd -d reapd -tAq -c \
+  "SELECT id FROM deployments WHERE subdomain = 'pr-$TEST_PR_NUMBER' AND generation = 4 LIMIT 1;")"
+
+# Spawn a managed container tied to GEN4_ID to simulate an orphan container left behind at crash time
+docker run -d \
+  --name "$CRASH_CONTAINER_NAME" \
+  --label "reapd.managed=true" \
+  --label "reapd.deployment_id=$GEN4_ID" \
+  --label "reapd.subdomain=pr-crash-401" \
+  node:22-alpine sleep 300 >/dev/null
+
+# SIGKILL (-9) the worker and any child docker build process so SIGTERM handlers cannot run
+pkill -9 -P "$WORKER_PID" 2>/dev/null || true
+kill -9 "$WORKER_PID" 2>/dev/null || true
+wait "$WORKER_PID" 2>/dev/null || true
+WORKER_PID=""
+
+GEN4_AFTER_SIGKILL="$(docker exec -i reapd-postgres psql -U reapd -d reapd -tAq -c \
+  "SELECT status FROM deployments WHERE id = '$GEN4_ID' LIMIT 1;")"
+if [[ "$GEN4_AFTER_SIGKILL" != "BUILDING" ]]; then
+  echo "❌ FAIL: expected Generation 4 to remain stuck in BUILDING immediately after SIGKILL, got '$GEN4_AFTER_SIGKILL'"
+  exit 1
+fi
+echo "💀 Worker SIGKILLed mid-build — Generation 4 ($GEN4_ID) is stuck in BUILDING with orphan container $CRASH_CONTAINER_NAME"
+
+# Boot standalone reconciler (REAPD_ROLE=reconciler) with 0.03m (~1.8s) stuck fence threshold
+RECONCILER_METRICS_PORT=19095
+REAPD_ROLE=reconciler REAPD_STUCK_THRESHOLD_MINUTES=0.03 REAPD_RECONCILE_INTERVAL_MS=1000 REAPD_RECONCILER_METRICS_PORT="$RECONCILER_METRICS_PORT" \
+  node --import tsx "$ROOT/apps/worker/src/index.ts" >"$RECONCILER_LOG" 2>&1 &
+RECONCILER_PID=$!
+
+# Wait for standalone reconciler to fence Generation 4 -> FAILED and reap $CRASH_CONTAINER_NAME
+CRASH_RECOVERED=0
+for _ in {1..30}; do
+  GEN4_STATUS="$(docker exec -i reapd-postgres psql -U reapd -d reapd -tAq -c \
+    "SELECT status FROM deployments WHERE id = '$GEN4_ID' LIMIT 1;")"
+  if [[ "$GEN4_STATUS" == "FAILED" ]] && ! docker inspect "$CRASH_CONTAINER_NAME" >/dev/null 2>&1; then
+    CRASH_RECOVERED=1
+    break
+  fi
+  sleep 0.5
+done
+
+if [[ "$CRASH_RECOVERED" != "1" ]]; then
+  echo "❌ FAIL: standalone reconciler did not fence stuck Generation 4 (status=$GEN4_STATUS) or reap $CRASH_CONTAINER_NAME"
+  cat "$RECONCILER_LOG"
+  exit 1
+fi
+
+GEN4_REASON="$(docker exec -i reapd-postgres psql -U reapd -d reapd -tAq -c \
+  "SELECT COALESCE(failure_reason, '') FROM deployments WHERE id = '$GEN4_ID' LIMIT 1;")"
+if [[ "$GEN4_REASON" != *"reconciler fence"* ]]; then
+  echo "❌ FAIL: expected failure_reason to mention reconciler fence, got '$GEN4_REASON'"
+  exit 1
+fi
+
+FENCE_EVENT_COUNT="$(docker exec -i reapd-postgres psql -U reapd -d reapd -tAq -c \
+  "SELECT COUNT(*) FROM deployment_events WHERE deployment_id = '$GEN4_ID' AND from_status = 'BUILDING' AND to_status = 'FAILED';")"
+if [[ "$FENCE_EVENT_COUNT" != "1" ]]; then
+  echo "❌ FAIL: expected 1 BUILDING -> FAILED audit event in deployment_events for $GEN4_ID, got '$FENCE_EVENT_COUNT'"
+  exit 1
+fi
+
+# Verify standalone reconciler Prometheus metrics on its dedicated port
+node - "http://127.0.0.1:$RECONCILER_METRICS_PORT/metrics" <<'NODE_EOF'
+const assert = require('node:assert/strict');
+const [reconcilerMetricsUrl] = process.argv.slice(2);
+
+(async () => {
+  const text = await (await fetch(reconcilerMetricsUrl)).text();
+  assert.match(text, /reapd_reconciler_fenced_total\{[^}]*service="reconciler"[^}]*\}\s+[1-9]\d*/);
+  assert.match(text, /reapd_deployments_total\{[^}]*status="FAILED"[^}]*service="reconciler"[^}]*\}\s+[1-9]\d*/);
+  assert.match(text, /reapd_reconciler_orphans_removed_total\{[^}]*kind="container"[^}]*service="reconciler"[^}]*\}\s+[1-9]\d*/);
+  assert.match(text, /reapd_reconciler_last_success_timestamp_seconds\{[^}]*service="reconciler"[^}]*\}\s+[1-9]\d*/);
+  console.log('✅ Standalone reconciler /metrics verified: fenced_total, FAILED transition, and container orphan GC');
+})().catch((err) => {
+  console.error(err);
+  process.exit(1);
+});
+NODE_EOF
+
+# Start a fresh worker (REAPD_ROLE=worker) and push a recovery commit (Generation 5) to prove PR #401 recovers to LIVE
+echo "🔄 Starting fresh worker and sending recovery commit (Generation 5)..."
+REAPD_ROLE=worker REAPD_REPO_URL_OVERRIDE="$TMP_REPO" REAPD_BUILD_QUEUE="$TEST_QUEUE" REAPD_WORKER_METRICS_PORT="$WORKER_METRICS_PORT" \
+  node --import tsx "$ROOT/apps/worker/src/index.ts" >>"$WORKER_LOG" 2>&1 &
+WORKER_PID=$!
+sleep 1
+
+send_pr_webhook "$DELIVERY_RECOVER" "synchronize" "$SHA_GEN3" "open"
+
+GEN5_STATUS=""
+for _ in {1..120}; do
+  GEN5_STATUS="$(docker exec -i reapd-postgres psql -U reapd -d reapd -tAq -c \
+    "SELECT status FROM deployments WHERE subdomain = 'pr-$TEST_PR_NUMBER' AND generation = 5 LIMIT 1;")"
+  if [[ "$GEN5_STATUS" == "LIVE" || "$GEN5_STATUS" == "FAILED" || "$GEN5_STATUS" == "SUPERSEDED" ]]; then
+    break
+  fi
+  sleep 1
+done
+
+if [[ "$GEN5_STATUS" != "LIVE" ]]; then
+  echo "❌ FAIL: expected recovery Generation 5 to reach LIVE after worker restart, got '$GEN5_STATUS'"
+  cat "$WORKER_LOG"
+  exit 1
+fi
+
+RECOVERED_BODY="$(curl -fsSL "https://pr-$TEST_PR_NUMBER.preview.localhost/")"
+if [[ "$RECOVERED_BODY" != "reapd-phase4-gen3" ]]; then
+  echo "❌ FAIL: expected 'reapd-phase4-gen3' from recovered preview, got '$RECOVERED_BODY'"
+  exit 1
+fi
+echo "✅ Recovery Generation 5 reached LIVE and serves '$RECOVERED_BODY'"
+
+send_pr_webhook "$DELIVERY_CLOSE2" "closed" "$SHA_GEN3" "closed"
+
+echo "✅ PASS: Phase 4 verification gate complete (3-commit superseding -> orphan container GC -> PR close teardown -> SIGKILL crash recovery + standalone reconciler)"
