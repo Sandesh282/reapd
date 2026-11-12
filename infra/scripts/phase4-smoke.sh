@@ -392,33 +392,51 @@ REAPD_ROLE=worker REAPD_REPO_URL_OVERRIDE="$TMP_REPO" REAPD_BUILD_QUEUE="$TEST_Q
 WORKER_PID=$!
 sleep 1
 
-# Reopen PR #401 with the 12s crash commit (Generation 4)
+# Reopen PR #401 with the 12s crash commit.
+# NOTE: ingestPullRequestWebhook bumps latest_generation on EVERY action, including 'closed'
+# (Step 6 above already bumped it once).  So the actual DB generation of the crash deployment
+# is NOT predictable from counting webhook calls — discover it by selecting the newest row.
 send_pr_webhook "$DELIVERY_CRASH" "reopened" "$SHA_CRASH" "open"
 
-GEN4_CUR=""
+# Wait for the crash deployment to appear as QUEUED or BUILDING (newest row for this subdomain)
+CRASH_DEPLOY_ID=""
 for _ in {1..40}; do
-  GEN4_CUR="$(docker exec -i reapd-postgres psql -U reapd -d reapd -tAq -c \
-    "SELECT status FROM deployments WHERE subdomain = 'pr-$TEST_PR_NUMBER' AND generation = 4 LIMIT 1;")"
-  if [[ "$GEN4_CUR" == "BUILDING" ]]; then
+  CRASH_DEPLOY_ID="$(docker exec -i reapd-postgres psql -U reapd -d reapd -tAq -c \
+    "SELECT id FROM deployments WHERE subdomain = 'pr-$TEST_PR_NUMBER' AND status IN ('QUEUED','BUILDING') ORDER BY generation DESC LIMIT 1;")"
+  if [[ -n "$CRASH_DEPLOY_ID" ]]; then
     break
   fi
   sleep 0.25
 done
 
-if [[ "$GEN4_CUR" != "BUILDING" ]]; then
-  echo "❌ FAIL: expected Generation 4 to enter BUILDING before SIGKILL, got '$GEN4_CUR'"
+if [[ -z "$CRASH_DEPLOY_ID" ]]; then
+  echo "❌ FAIL: crash deployment never appeared as QUEUED or BUILDING (reopened webhook may not have created a deployment)"
   cat "$WORKER_LOG"
   exit 1
 fi
 
-GEN4_ID="$(docker exec -i reapd-postgres psql -U reapd -d reapd -tAq -c \
-  "SELECT id FROM deployments WHERE subdomain = 'pr-$TEST_PR_NUMBER' AND generation = 4 LIMIT 1;")"
+# Poll until the crash deployment reaches BUILDING
+CRASH_STATUS_CUR=""
+for _ in {1..40}; do
+  CRASH_STATUS_CUR="$(docker exec -i reapd-postgres psql -U reapd -d reapd -tAq -c \
+    "SELECT status FROM deployments WHERE id = '$CRASH_DEPLOY_ID' LIMIT 1;")"
+  if [[ "$CRASH_STATUS_CUR" == "BUILDING" ]]; then
+    break
+  fi
+  sleep 0.25
+done
 
-# Spawn a managed container tied to GEN4_ID to simulate an orphan container left behind at crash time
+if [[ "$CRASH_STATUS_CUR" != "BUILDING" ]]; then
+  echo "❌ FAIL: expected crash deployment ($CRASH_DEPLOY_ID) to enter BUILDING before SIGKILL, got '$CRASH_STATUS_CUR'"
+  cat "$WORKER_LOG"
+  exit 1
+fi
+
+# Spawn a managed container tied to CRASH_DEPLOY_ID to simulate the orphan left behind at crash time
 docker run -d \
   --name "$CRASH_CONTAINER_NAME" \
   --label "reapd.managed=true" \
-  --label "reapd.deployment_id=$GEN4_ID" \
+  --label "reapd.deployment_id=$CRASH_DEPLOY_ID" \
   --label "reapd.subdomain=pr-crash-401" \
   node:22-alpine sleep 300 >/dev/null
 
@@ -429,16 +447,16 @@ wait "$WORKER_PID" 2>/dev/null || true
 WORKER_PID=""
 
 # Remove any running preview container for this PR that the worker may have started before the
-# SIGKILL, so it doesn't confuse the Generation 5 container-start step later.
+# SIGKILL, so it doesn't confuse the recovery worker's container-start step later.
 docker rm -f "reapd-pr-$TEST_PR_NUMBER" >/dev/null 2>&1 || true
 
-GEN4_AFTER_SIGKILL="$(docker exec -i reapd-postgres psql -U reapd -d reapd -tAq -c \
-  "SELECT status FROM deployments WHERE id = '$GEN4_ID' LIMIT 1;")"
-if [[ "$GEN4_AFTER_SIGKILL" != "BUILDING" ]]; then
-  echo "❌ FAIL: expected Generation 4 to remain stuck in BUILDING immediately after SIGKILL, got '$GEN4_AFTER_SIGKILL'"
+CRASH_AFTER_SIGKILL="$(docker exec -i reapd-postgres psql -U reapd -d reapd -tAq -c \
+  "SELECT status FROM deployments WHERE id = '$CRASH_DEPLOY_ID' LIMIT 1;")"
+if [[ "$CRASH_AFTER_SIGKILL" != "BUILDING" ]]; then
+  echo "❌ FAIL: expected crash deployment to remain stuck in BUILDING immediately after SIGKILL, got '$CRASH_AFTER_SIGKILL'"
   exit 1
 fi
-echo "💀 Worker SIGKILLed mid-build — Generation 4 ($GEN4_ID) is stuck in BUILDING with orphan container $CRASH_CONTAINER_NAME"
+echo "💀 Worker SIGKILLed mid-build — crash deployment ($CRASH_DEPLOY_ID) is stuck in BUILDING with orphan container $CRASH_CONTAINER_NAME"
 
 # Boot standalone reconciler (REAPD_ROLE=reconciler) with 0.03m (~1.8s) stuck fence threshold
 RECONCILER_METRICS_PORT=19095
@@ -459,12 +477,12 @@ if ! curl -fsS "http://127.0.0.1:$RECONCILER_METRICS_PORT/metrics" >/dev/null 2>
   exit 1
 fi
 
-# Wait for standalone reconciler to fence Generation 4 -> FAILED and reap $CRASH_CONTAINER_NAME
+# Wait for standalone reconciler to fence the crash deployment -> FAILED and reap $CRASH_CONTAINER_NAME
 CRASH_RECOVERED=0
 for _ in {1..30}; do
-  GEN4_STATUS="$(docker exec -i reapd-postgres psql -U reapd -d reapd -tAq -c \
-    "SELECT status FROM deployments WHERE id = '$GEN4_ID' LIMIT 1;")"
-  if [[ "$GEN4_STATUS" == "FAILED" ]] && ! docker inspect "$CRASH_CONTAINER_NAME" >/dev/null 2>&1; then
+  CRASH_STATUS_NOW="$(docker exec -i reapd-postgres psql -U reapd -d reapd -tAq -c \
+    "SELECT status FROM deployments WHERE id = '$CRASH_DEPLOY_ID' LIMIT 1;")"
+  if [[ "$CRASH_STATUS_NOW" == "FAILED" ]] && ! docker inspect "$CRASH_CONTAINER_NAME" >/dev/null 2>&1; then
     CRASH_RECOVERED=1
     break
   fi
@@ -472,22 +490,22 @@ for _ in {1..30}; do
 done
 
 if [[ "$CRASH_RECOVERED" != "1" ]]; then
-  echo "❌ FAIL: standalone reconciler did not fence stuck Generation 4 (status=$GEN4_STATUS) or reap $CRASH_CONTAINER_NAME"
+  echo "❌ FAIL: standalone reconciler did not fence stuck crash deployment (status=$CRASH_STATUS_NOW) or reap $CRASH_CONTAINER_NAME"
   cat "$RECONCILER_LOG"
   exit 1
 fi
 
-GEN4_REASON="$(docker exec -i reapd-postgres psql -U reapd -d reapd -tAq -c \
-  "SELECT COALESCE(failure_reason, '') FROM deployments WHERE id = '$GEN4_ID' LIMIT 1;")"
-if [[ "$GEN4_REASON" != *"reconciler fence"* ]]; then
-  echo "❌ FAIL: expected failure_reason to mention reconciler fence, got '$GEN4_REASON'"
+CRASH_REASON="$(docker exec -i reapd-postgres psql -U reapd -d reapd -tAq -c \
+  "SELECT COALESCE(failure_reason, '') FROM deployments WHERE id = '$CRASH_DEPLOY_ID' LIMIT 1;")"
+if [[ "$CRASH_REASON" != *"reconciler fence"* ]]; then
+  echo "❌ FAIL: expected failure_reason to mention reconciler fence, got '$CRASH_REASON'"
   exit 1
 fi
 
 FENCE_EVENT_COUNT="$(docker exec -i reapd-postgres psql -U reapd -d reapd -tAq -c \
-  "SELECT COUNT(*) FROM deployment_events WHERE deployment_id = '$GEN4_ID' AND from_status = 'BUILDING' AND to_status = 'FAILED';")"
+  "SELECT COUNT(*) FROM deployment_events WHERE deployment_id = '$CRASH_DEPLOY_ID' AND from_status = 'BUILDING' AND to_status = 'FAILED';")"
 if [[ "$FENCE_EVENT_COUNT" != "1" ]]; then
-  echo "❌ FAIL: expected 1 BUILDING -> FAILED audit event in deployment_events for $GEN4_ID, got '$FENCE_EVENT_COUNT'"
+  echo "❌ FAIL: expected 1 BUILDING -> FAILED audit event in deployment_events for $CRASH_DEPLOY_ID, got '$FENCE_EVENT_COUNT'"
   exit 1
 fi
 
@@ -509,8 +527,9 @@ const [reconcilerMetricsUrl] = process.argv.slice(2);
 });
 NODE_EOF
 
-# Start a fresh worker (REAPD_ROLE=worker) and push a recovery commit (Generation 5) to prove PR #401 recovers to LIVE
-echo "🔄 Starting fresh worker and sending recovery commit (Generation 5)..."
+# Start a fresh worker (REAPD_ROLE=worker) and push a recovery commit to prove PR #401 recovers to LIVE.
+# Same note: don't hard-code generation numbers — poll the newest row for the subdomain.
+echo "🔄 Starting fresh worker and sending recovery commit..."
 REAPD_ROLE=worker REAPD_REPO_URL_OVERRIDE="$TMP_REPO" REAPD_BUILD_QUEUE="$TEST_QUEUE" REAPD_WORKER_METRICS_PORT="$WORKER_METRICS_PORT" \
   node --import tsx "$ROOT/apps/worker/src/index.ts" >>"$WORKER_LOG" 2>&1 &
 WORKER_PID=$!
@@ -518,18 +537,19 @@ sleep 1
 
 send_pr_webhook "$DELIVERY_RECOVER" "synchronize" "$SHA_GEN3" "open"
 
-GEN5_STATUS=""
+RECOVER_STATUS=""
 for _ in {1..120}; do
-  GEN5_STATUS="$(docker exec -i reapd-postgres psql -U reapd -d reapd -tAq -c \
-    "SELECT status FROM deployments WHERE subdomain = 'pr-$TEST_PR_NUMBER' AND generation = 5 LIMIT 1;")"
-  if [[ "$GEN5_STATUS" == "LIVE" || "$GEN5_STATUS" == "FAILED" || "$GEN5_STATUS" == "SUPERSEDED" ]]; then
+  # Select the newest deployment for this subdomain — it must be DIFFERENT from the crash one
+  RECOVER_STATUS="$(docker exec -i reapd-postgres psql -U reapd -d reapd -tAq -c \
+    "SELECT status FROM deployments WHERE subdomain = 'pr-$TEST_PR_NUMBER' AND id != '$CRASH_DEPLOY_ID' ORDER BY generation DESC LIMIT 1;")"
+  if [[ "$RECOVER_STATUS" == "LIVE" || "$RECOVER_STATUS" == "FAILED" || "$RECOVER_STATUS" == "SUPERSEDED" ]]; then
     break
   fi
   sleep 1
 done
 
-if [[ "$GEN5_STATUS" != "LIVE" ]]; then
-  echo "❌ FAIL: expected recovery Generation 5 to reach LIVE after worker restart, got '$GEN5_STATUS'"
+if [[ "$RECOVER_STATUS" != "LIVE" ]]; then
+  echo "❌ FAIL: expected recovery deployment to reach LIVE after worker restart, got '$RECOVER_STATUS'"
   cat "$WORKER_LOG"
   exit 1
 fi
@@ -539,7 +559,7 @@ if [[ "$RECOVERED_BODY" != "reapd-phase4-gen3" ]]; then
   echo "❌ FAIL: expected 'reapd-phase4-gen3' from recovered preview, got '$RECOVERED_BODY'"
   exit 1
 fi
-echo "✅ Recovery Generation 5 reached LIVE and serves '$RECOVERED_BODY'"
+echo "✅ Recovery deployment reached LIVE and serves '$RECOVERED_BODY'"
 
 send_pr_webhook "$DELIVERY_CLOSE2" "closed" "$SHA_GEN3" "closed"
 
