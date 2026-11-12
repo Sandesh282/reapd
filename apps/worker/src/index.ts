@@ -31,6 +31,30 @@ export * from './jobs/build.js';
 export * from './logs/log-sink.js';
 export * from './reconciler/index.js';
 
+export type WorkerRole = 'all' | 'worker' | 'reconciler';
+
+export function parseWorkerRole(raw = process.env['REAPD_ROLE']): WorkerRole {
+  const normalized = (raw ?? 'all').trim().toLowerCase();
+  if (normalized === '' || normalized === 'all') return 'all';
+  if (normalized === 'worker') return 'worker';
+  if (normalized === 'reconciler') return 'reconciler';
+  throw new Error(
+    `Invalid REAPD_ROLE="${raw}". Expected "all", "worker", or "reconciler".`
+  );
+}
+
+export function resolveMetricsPort(
+  role: WorkerRole,
+  env: NodeJS.ProcessEnv = process.env
+): number {
+  const raw =
+    role === 'reconciler'
+      ? env['REAPD_RECONCILER_METRICS_PORT'] ?? env['REAPD_WORKER_METRICS_PORT'] ?? '9092'
+      : env['REAPD_WORKER_METRICS_PORT'] ?? '9091';
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : role === 'reconciler' ? 9092 : 9091;
+}
+
 function checkIsMainModule(): boolean {
   const entryArg = process.argv[1];
   if (!entryArg) return false;
@@ -50,26 +74,63 @@ if (isMainModule) {
     // .env is optional when variables are injected via the environment
   }
 
+  const role = parseWorkerRole();
+  const enableWorker = role === 'all' || role === 'worker';
+  const enableReconciler = role === 'all' || role === 'reconciler';
+
   const redisUrl = process.env['REDIS_URL'];
-  if (!redisUrl) {
+  if (enableWorker && !redisUrl) {
     console.error('❌ REDIS_URL is not set — run `npm run env:init` to generate local credentials');
     process.exit(1);
   }
   const queueName = process.env['REAPD_BUILD_QUEUE'] ?? 'build';
-  const redis = new Redis(redisUrl, { maxRetriesPerRequest: null });
 
-  const worker = new Worker<BuildJobPayload>(queueName, buildJobHandler, {
-    connection: redis,
-    concurrency: 2,
-  });
+  let redis: Redis | null = null;
+  let worker: Worker<BuildJobPayload> | null = null;
+  if (enableWorker && redisUrl) {
+    redis = new Redis(redisUrl, { maxRetriesPerRequest: null });
+    worker = new Worker<BuildJobPayload>(queueName, buildJobHandler, {
+      connection: redis,
+      concurrency: 2,
+    });
 
-  const stopReconciler = startReconciler();
+    worker.on('ready', () => {
+      console.log('👷 BullMQ build worker ready and listening on queue "build"');
+    });
+
+    worker.on('completed', (job) => {
+      console.log(`✅ Job ${job.id} (deployment ${job.data.deploymentId}) completed`);
+    });
+
+    worker.on('failed', (job, err) => {
+      console.error(
+        `❌ Job ${job?.id} (deployment ${job?.data.deploymentId}) failed: ${redactSecrets(err.message)}`,
+      );
+    });
+
+    worker.on('error', (err) => {
+      console.error('❌ BullMQ worker error:', redactSecrets(err.message));
+    });
+  }
+
+  const stopReconciler = enableReconciler
+    ? startReconciler({
+        immediate: role === 'reconciler',
+        // In standalone reconciler mode there is no BullMQ worker connection keeping the event
+        // loop alive, so pass keepAlive:true so the interval itself prevents premature exit.
+        // In all/worker modes the BullMQ Worker connection is the anchor; unref the timer so a
+        // clean shutdown is not blocked by the reconciler interval.
+        keepAlive: !enableWorker,
+      })
+    : null;
 
   // ── Prometheus queue-depth + DB status poller ────────────────────────────
-  const metricsRedis = new Redis(redisUrl, { maxRetriesPerRequest: null });
-  const metricsQueue = new Queue<BuildJobPayload>(queueName, {
-    connection: metricsRedis,
-  });
+  const metricsRedis = redisUrl ? new Redis(redisUrl, { maxRetriesPerRequest: null }) : null;
+  const metricsQueue = metricsRedis
+    ? new Queue<BuildJobPayload>(queueName, {
+        connection: metricsRedis,
+      })
+    : null;
 
   const METRICS_POLL_TIMEOUT_MS = 10_000;
   let isPollingMetrics = false;
@@ -81,7 +142,7 @@ if (isMainModule) {
     try {
       const [counts, statusCounts] = await Promise.race([
         Promise.all([
-          metricsQueue.getJobCounts('waiting', 'active', 'delayed'),
+          metricsQueue ? metricsQueue.getJobCounts('waiting', 'active', 'delayed') : Promise.resolve(null),
           countDeploymentsByStatus(db),
         ]),
         new Promise<never>((_resolve, reject) => {
@@ -92,8 +153,10 @@ if (isMainModule) {
           timeoutId.unref();
         }),
       ]);
-      queueWaiting.set((counts.waiting ?? 0) + (counts.delayed ?? 0));
-      queueActive.set(counts.active ?? 0);
+      if (counts) {
+        queueWaiting.set((counts.waiting ?? 0) + (counts.delayed ?? 0));
+        queueActive.set(counts.active ?? 0);
+      }
       activePreviews.set(statusCounts.LIVE);
       for (const [status, count] of Object.entries(statusCounts) as Array<
         [DeploymentStatus, number]
@@ -119,9 +182,12 @@ if (isMainModule) {
   const metricsPoller = setInterval(() => void pollMetrics(), 15_000);
   void pollMetrics();
 
-  // ── Metrics HTTP server on :9091 ─────────────────────────────────────────
-  const METRICS_PORT = Number(process.env['REAPD_WORKER_METRICS_PORT'] ?? 9091);
-  const METRICS_HOST = process.env['REAPD_WORKER_METRICS_HOST'] ?? '127.0.0.1';
+  // ── Metrics HTTP server (:9091 for worker/all, :9092 for standalone reconciler)
+  const METRICS_PORT = resolveMetricsPort(role);
+  const METRICS_HOST =
+    (role === 'reconciler' ? process.env['REAPD_RECONCILER_METRICS_HOST'] : undefined) ??
+    process.env['REAPD_WORKER_METRICS_HOST'] ??
+    '127.0.0.1';
   const metricsServer = createServer(async (req, res) => {
     try {
       if (req.url === '/metrics' && req.method === 'GET') {
@@ -149,44 +215,28 @@ if (isMainModule) {
     );
   });
   metricsServer.listen(METRICS_PORT, METRICS_HOST, () => {
-    console.log(`📊 Worker metrics available at http://${METRICS_HOST}:${METRICS_PORT}/metrics`);
-  });
-
-  worker.on('ready', () => {
-    console.log('👷 BullMQ build worker ready and listening on queue "build"');
-  });
-
-  worker.on('completed', (job) => {
-    console.log(`✅ Job ${job.id} (deployment ${job.data.deploymentId}) completed`);
-  });
-
-  worker.on('failed', (job, err) => {
-    console.error(
-      `❌ Job ${job?.id} (deployment ${job?.data.deploymentId}) failed: ${redactSecrets(err.message)}`,
+    console.log(
+      `📊 ${role === 'reconciler' ? 'Reconciler' : 'Worker'} metrics available at http://${METRICS_HOST}:${METRICS_PORT}/metrics`,
     );
   });
 
-  worker.on('error', (err) => {
-    console.error('❌ BullMQ worker error:', redactSecrets(err.message));
-  });
-
   const shutdown = async (): Promise<void> => {
-    console.log('🛑 Shutting down worker...');
+    console.log(`🛑 Shutting down ${role}...`);
     // Force exit after 8s if Redis or Docker sockets hang during shutdown.
     setTimeout(() => process.exit(1), 8_000).unref();
     // Stop timers and signal active builds to abort FIRST before awaiting any Redis/network close.
     clearInterval(metricsPoller);
-    stopReconciler();
+    stopReconciler?.();
     abortAllActiveBuilds();
     // Prometheus keeps scrape connections alive; drop them so close() can complete immediately.
     metricsServer.closeAllConnections();
     metricsServer.close();
     try {
-      await worker.close();
+      await worker?.close();
     } finally {
-      await metricsQueue.close().catch(() => {});
-      await metricsRedis.quit().catch(() => {});
-      await redis.quit().catch(() => {});
+      await metricsQueue?.close().catch(() => {});
+      await metricsRedis?.quit().catch(() => {});
+      await redis?.quit().catch(() => {});
       process.exit(0);
     }
   };

@@ -6,7 +6,9 @@ import { Registry, Counter, Histogram, Gauge, collectDefaultMetrics } from 'prom
 
 export const registry = new Registry();
 
-registry.setDefaultLabels({ service: 'worker' });
+const serviceLabel =
+  process.env['REAPD_ROLE']?.trim().toLowerCase() === 'reconciler' ? 'reconciler' : 'worker';
+registry.setDefaultLabels({ service: serviceLabel });
 collectDefaultMetrics({ register: registry });
 
 /**

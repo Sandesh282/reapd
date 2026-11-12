@@ -6,6 +6,8 @@
   "scripts": {
     "cli": "node --import tsx src/cli/reapd-cli.ts",
     "dev": "tsx watch src/index.ts",
+    "dev:worker": "REAPD_ROLE=worker tsx watch src/index.ts",
+    "dev:reconciler": "REAPD_ROLE=reconciler tsx watch src/index.ts",
     "build": "tsc",
     "test": "node --import tsx --test 'src/**/*.test.ts'",
     "typecheck": "tsc --noEmit",
