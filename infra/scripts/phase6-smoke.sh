@@ -29,6 +29,7 @@ API_LOG="$(mktemp /tmp/reapd-phase6-api-XXXXXX.log)"
 WORKER_LOG="$(mktemp /tmp/reapd-phase6-worker-XXXXXX.log)"
 MOCK_GH_LOG="$(mktemp /tmp/reapd-phase6-mock-gh-XXXXXX.log)"
 API_PORT=3061
+WORKER_METRICS_PORT=19091
 MOCK_GH_PORT=19061
 TEST_SECRET="phase6-smoke-webhook-secret"
 TEST_QUEUE="build-phase6-$$"
@@ -267,6 +268,7 @@ fi
 echo "👷 Starting BullMQ worker with Playwright smoke runner + sticky PR commenter..."
 REAPD_REPO_URL_OVERRIDE="$TMP_REPO" \
 REAPD_BUILD_QUEUE="$TEST_QUEUE" \
+REAPD_WORKER_METRICS_PORT="$WORKER_METRICS_PORT" \
 REAPD_SMOKE_REQUIRED="1" \
 GITHUB_APP_ID="6001" \
 GITHUB_PRIVATE_KEY_PATH="$TMP_KEY" \
@@ -492,5 +494,32 @@ DEPLOY_GEN3_ID="$(docker exec -i reapd-postgres psql -U reapd -d reapd -tAq -c \
 wait_for_deployment_status "$DEPLOY_GEN3_ID" "LIVE"
 wait_for_sticky_comment_id "$DEPLOY_GEN3_ID" "9002"
 echo "✅ Generation 3 verified: 404 on deleted comment #9001 automatically fell back to POST (#9002)"
+
+# ── 7. Verify Prometheus /metrics on API and Worker ──────────────────────────
+node - "http://127.0.0.1:$API_PORT/metrics" "http://127.0.0.1:$WORKER_METRICS_PORT/metrics" <<'NODE_EOF'
+const assert = require('node:assert/strict');
+const [apiMetricsUrl, workerMetricsUrl] = process.argv.slice(2);
+
+(async () => {
+  const apiRes = await fetch(apiMetricsUrl);
+  assert.equal(apiRes.status, 200);
+  const apiText = await apiRes.text();
+  assert.match(apiText, /reapd_webhook_requests_total\{[^}]*event="pull_request"[^}]*action="opened"[^}]*\}\s+1\b/);
+  assert.match(apiText, /reapd_webhook_requests_total\{[^}]*event="pull_request"[^}]*action="synchronize"[^}]*\}\s+2\b/);
+
+  const workerRes = await fetch(workerMetricsUrl);
+  assert.equal(workerRes.status, 200);
+  const workerText = await workerRes.text();
+  assert.match(workerText, /reapd_deployments_total\{[^}]*status="LIVE"[^}]*\}\s+2\b/);
+  assert.match(workerText, /reapd_deployments_total\{[^}]*status="FAILED"[^}]*\}\s+1\b/);
+  assert.match(workerText, /reapd_smoke_results_total\{[^}]*result="PASSED"[^}]*\}\s+2\b/);
+  assert.match(workerText, /reapd_smoke_results_total\{[^}]*result="FAILED"[^}]*\}\s+1\b/);
+  assert.match(workerText, /reapd_build_duration_seconds_count\{[^}]*\}\s+3\b/);
+  console.log('✅ Prometheus /metrics verified on API and Worker (deployments, smoke results, build duration, webhooks)');
+})().catch((err) => {
+  console.error(err);
+  process.exit(1);
+});
+NODE_EOF
 
 echo "✅ PASS: Phase 6 verification gate complete (Playwright smoke PASSED/FAILED + rollback + sticky PR comment POST/PATCH/404-fallback)"

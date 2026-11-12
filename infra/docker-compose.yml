@@ -116,6 +116,40 @@ services:
       timeout: 3s
       retries: 5
 
+  # ── Prometheus ──────────────────────────────────────────────────────────────
+  # Scrapes the API (:3001/metrics) and worker (:9091/metrics) running on the host.
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    container_name: reapd-prometheus
+    restart: unless-stopped
+    volumes:
+      - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "127.0.0.1:9090:9090"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - control-internal
+
+  # ── Grafana ─────────────────────────────────────────────────────────────────
+  # Dashboard + datasource are provisioned from ./observability/grafana.
+  grafana:
+    image: grafana/grafana:11.3.0
+    container_name: reapd-grafana
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "127.0.0.1:3030:3000"
+    depends_on:
+      - prometheus
+    networks:
+      - control-internal
+
 # ── Volumes ──────────────────────────────────────────────────────────────────
 volumes:
   postgres_data:
