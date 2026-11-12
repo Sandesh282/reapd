@@ -10,7 +10,7 @@ registry.setDefaultLabels({ service: 'worker' });
 collectDefaultMetrics({ register: registry });
 
 /**
- * Total worker-observed terminal transitions (`LIVE | FAILED | SUPERSEDED | EXPIRED`).
+ * Total worker/reconciler-observed terminal transitions (`LIVE | FAILED | SUPERSEDED | EXPIRED`).
  */
 export const deploymentsTotal = new Counter({
   name: 'reapd_deployments_total',
@@ -22,6 +22,7 @@ export const deploymentsTotal = new Counter({
 /**
  * Authoritative PostgreSQL count of deployments grouped by status (`GROUP BY status`).
  * Captures API-side superseding, worker completions, and reconciler expirations/fencing accurately.
+ * Not pre-initialized to 0 at process start so Grafana never reports a false 0 before the first DB poll.
  */
 export const deploymentsByStatus = new Gauge({
   name: 'reapd_deployments_by_status',
@@ -70,6 +71,20 @@ export const activePreviews = new Gauge({
   registers: [registry],
 });
 
+/** Unix epoch timestamp (seconds) of the last successful Redis + PostgreSQL metrics poll. */
+export const metricsPollLastSuccessTimestampSeconds = new Gauge({
+  name: 'reapd_metrics_poll_last_success_timestamp_seconds',
+  help: 'Unix timestamp in seconds of the last successful queue and DB metrics poll.',
+  registers: [registry],
+});
+
+/** Total failed or timed-out metrics poll attempts. */
+export const metricsPollErrorsTotal = new Counter({
+  name: 'reapd_metrics_poll_errors_total',
+  help: 'Total failed or timed-out queue/DB metrics poll attempts.',
+  registers: [registry],
+});
+
 /**
  * Playwright smoke check outcomes.
  * Labels: result = PASSED | FAILED | TIMED_OUT | SKIPPED
@@ -113,22 +128,10 @@ export const reconcilerOrphansRemovedTotal = new Counter({
   registers: [registry],
 });
 
-// Pre-initialize known label combinations at 0 so Prometheus/Grafana immediately
-// render time-series lines instead of "No data" before the first build finishes.
+// Pre-initialize counter label combinations at 0 (true at process start) so Prometheus
+// and Grafana immediately render counter lines instead of "No data".
 for (const status of ['LIVE', 'FAILED', 'SUPERSEDED', 'EXPIRED'] as const) {
   deploymentsTotal.labels({ status }).inc(0);
-}
-for (const status of [
-  'QUEUED',
-  'BUILDING',
-  'STARTING',
-  'TESTING',
-  'LIVE',
-  'FAILED',
-  'SUPERSEDED',
-  'EXPIRED',
-] as const) {
-  deploymentsByStatus.labels({ status }).set(0);
 }
 for (const result of ['PASSED', 'FAILED', 'TIMED_OUT', 'SKIPPED'] as const) {
   smokeResultsTotal.labels({ result }).inc(0);

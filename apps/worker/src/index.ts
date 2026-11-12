@@ -20,6 +20,8 @@ import {
   queueActive,
   activePreviews,
   deploymentsByStatus,
+  metricsPollErrorsTotal,
+  metricsPollLastSuccessTimestampSeconds,
 } from './metrics.js';
 import { startReconciler } from './reconciler/index.js';
 
@@ -69,15 +71,26 @@ if (isMainModule) {
     connection: metricsRedis,
   });
 
+  const METRICS_POLL_TIMEOUT_MS = 10_000;
   let isPollingMetrics = false;
   let lastMetricsWarnAt = 0;
   const pollMetrics = async (): Promise<void> => {
     if (isPollingMetrics) return;
     isPollingMetrics = true;
+    let timeoutId: ReturnType<typeof setTimeout> | undefined;
     try {
-      const [counts, statusCounts] = await Promise.all([
-        metricsQueue.getJobCounts('waiting', 'active', 'delayed'),
-        countDeploymentsByStatus(db),
+      const [counts, statusCounts] = await Promise.race([
+        Promise.all([
+          metricsQueue.getJobCounts('waiting', 'active', 'delayed'),
+          countDeploymentsByStatus(db),
+        ]),
+        new Promise<never>((_resolve, reject) => {
+          timeoutId = setTimeout(
+            () => reject(new Error(`Metrics poll timed out after ${METRICS_POLL_TIMEOUT_MS}ms`)),
+            METRICS_POLL_TIMEOUT_MS,
+          );
+          timeoutId.unref();
+        }),
       ]);
       queueWaiting.set((counts.waiting ?? 0) + (counts.delayed ?? 0));
       queueActive.set(counts.active ?? 0);
@@ -87,7 +100,9 @@ if (isMainModule) {
       >) {
         deploymentsByStatus.set({ status }, count);
       }
+      metricsPollLastSuccessTimestampSeconds.set(Date.now() / 1000);
     } catch (err) {
+      metricsPollErrorsTotal.inc();
       // Non-fatal (metrics may lag during Redis/DB hiccups), but surface it at most once a minute
       // so a broken connection is visible instead of silently reporting stale numbers.
       if (Date.now() - lastMetricsWarnAt > 60_000) {
@@ -96,6 +111,7 @@ if (isMainModule) {
         console.warn(`⚠️  Metrics poll failed: ${redactSecrets(msg)}`);
       }
     } finally {
+      if (timeoutId) clearTimeout(timeoutId);
       isPollingMetrics = false;
     }
   };
@@ -156,6 +172,8 @@ if (isMainModule) {
 
   const shutdown = async (): Promise<void> => {
     console.log('🛑 Shutting down worker...');
+    // Force exit after 8s if Redis or Docker sockets hang during shutdown.
+    setTimeout(() => process.exit(1), 8_000).unref();
     // Stop timers and signal active builds to abort FIRST before awaiting any Redis/network close.
     clearInterval(metricsPoller);
     stopReconciler();

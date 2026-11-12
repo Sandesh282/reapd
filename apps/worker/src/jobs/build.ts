@@ -237,8 +237,11 @@ export async function buildJobHandler(job: Job<BuildJobPayload>): Promise<void> 
       }
       throw buildErr;
     } finally {
-      const elapsedSec = Math.max(0, (buildDurationMs ?? Date.now() - buildStartMs) / 1000);
-      buildDurationSeconds.observe({ result: buildResultLabel }, elapsedSec);
+      const measuredMs =
+        buildResultLabel === 'succeeded' && buildDurationMs !== null
+          ? buildDurationMs
+          : Date.now() - buildStartMs;
+      buildDurationSeconds.observe({ result: buildResultLabel }, Math.max(0, measuredMs / 1000));
       await cloned.cleanup().catch((err: unknown) => {
         const msg = err instanceof Error ? err.message : String(err);
         console.warn(`⚠️  Failed to remove temp clone dir: ${msg}`);
@@ -377,10 +380,12 @@ export async function buildJobHandler(job: Job<BuildJobPayload>): Promise<void> 
       return;
     }
 
+    // Increment immediately after `liveTrans.transitioned === true` is confirmed, and guard
+    // post-LIVE log sealing so no error after commit can enter the catch block.
+    deploymentsTotal.inc({ status: 'LIVE' });
     finalBuildStatus = 'LIVE';
     sink.write('system', 'stdout', `[reapd] Preview LIVE at ${basePreviewUrl}`);
-    await sink.end('LIVE');
-    deploymentsTotal.inc({ status: 'LIVE' });
+    await sink.end('LIVE').catch(() => {});
     console.log(`🟢 LIVE: ${basePreviewUrl} (deployment ${deploymentId})`);
 
     // Post sticky PR comment AFTER sealing `end:LIVE` in Redis so GitHub API latency

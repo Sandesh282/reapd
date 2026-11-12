@@ -87,111 +87,109 @@ export async function runReconcileSweep(
 
   const tmpRootDir = opts?.tmpRootDir ?? tmpdir();
 
-  // ── 1. Expire LIVE deployments past their TTL ─────────────────────────────
-  const expiredDeploymentIds = await expireDueDeployments(dbClient);
-  for (const id of expiredDeploymentIds) {
-    console.log(`♻️  [reconciler] Expired TTL-elapsed deployment ${id}`);
-  }
-
-  // ── 2. Fence stuck builds older than stuckBuildMinutes ────────────────────
-  const fencedDeploymentIds = await fenceStuckDeployments(dbClient, stuckBuildMinutes);
-  for (const id of fencedDeploymentIds) {
-    console.log(`♻️  [reconciler] Fenced stuck build ${id} -> FAILED`);
-  }
-
-  // ── 3. Snapshot Docker resources FIRST, then read desired state from Postgres ─
-  // Reading Docker before Postgres prevents a TOCTOU race where a worker transitions
-  // BUILDING -> STARTING and creates a container in the millisecond after the DB read,
-  // which would otherwise look like an untracked orphan in the Docker list.
-  const [managedContainers, managedImages] = await Promise.all([
-    listManagedContainers(dockerClient),
-    listManagedImages(dockerClient),
-  ]);
-
-  const { activeBuildOrLiveIds, activeContainerIds } =
-    await getActiveDeploymentIds(dbClient);
-
-  // ── 4a. Purge orphan containers (not in STARTING, TESTING, or LIVE) ───────
-  const removedContainerIds: string[] = [];
-
-  for (const container of managedContainers) {
-    // Manual CLI previews (`reapd up`) carry `cli-pr-<n>-<uuid>` and are managed by `reapd down`
-    if (container.deploymentId.startsWith('cli-')) {
-      continue;
+  try {
+    // ── 1. Expire LIVE deployments past their TTL (UPDATE ... RETURNING id) ───
+    const expiredDeploymentIds = await expireDueDeployments(dbClient);
+    if (expiredDeploymentIds.length > 0) {
+      reconcilerExpiredTotal.inc(expiredDeploymentIds.length);
+      deploymentsTotal.inc({ status: 'EXPIRED' }, expiredDeploymentIds.length);
+    }
+    for (const id of expiredDeploymentIds) {
+      console.log(`♻️  [reconciler] Expired TTL-elapsed deployment ${id}`);
     }
 
-    const isDesired =
-      container.deploymentId !== '' &&
-      activeContainerIds.has(container.deploymentId);
+    // ── 2. Fence stuck builds older than stuckBuildMinutes (UPDATE ... RETURNING id)
+    const fencedDeploymentIds = await fenceStuckDeployments(dbClient, stuckBuildMinutes);
+    if (fencedDeploymentIds.length > 0) {
+      reconcilerFencedTotal.inc(fencedDeploymentIds.length);
+      deploymentsTotal.inc({ status: 'FAILED' }, fencedDeploymentIds.length);
+    }
+    for (const id of fencedDeploymentIds) {
+      console.log(`♻️  [reconciler] Fenced stuck build ${id} -> FAILED`);
+    }
 
-    if (!isDesired) {
-      console.log(
-        `♻️  [reconciler] Removing orphan container ${container.name} (${container.id.slice(0, 12)}, deployment=${container.deploymentId || 'unknown'})`
-      );
-      try {
-        await forceRemoveContainer(dockerClient, container.id);
-        removedContainerIds.push(container.id);
-      } catch (err: unknown) {
-        const msg = err instanceof Error ? err.message : String(err);
-        console.warn(
-          `⚠️  [reconciler] Failed to remove container ${container.id.slice(0, 12)}: ${msg}`
+    // ── 3. Snapshot Docker resources FIRST, then read desired state from Postgres ─
+    // Reading Docker before Postgres prevents a TOCTOU race where a worker transitions
+    // BUILDING -> STARTING and creates a container in the millisecond after the DB read,
+    // which would otherwise look like an untracked orphan in the Docker list.
+    const [managedContainers, managedImages] = await Promise.all([
+      listManagedContainers(dockerClient),
+      listManagedImages(dockerClient),
+    ]);
+
+    const { activeBuildOrLiveIds, activeContainerIds } =
+      await getActiveDeploymentIds(dbClient);
+
+    // ── 4a. Purge orphan containers (not in STARTING, TESTING, or LIVE) ───────
+    const removedContainerIds: string[] = [];
+
+    for (const container of managedContainers) {
+      // Manual CLI previews (`reapd up`) carry `cli-pr-<n>-<uuid>` and are managed by `reapd down`
+      if (container.deploymentId.startsWith('cli-')) {
+        continue;
+      }
+
+      const isDesired =
+        container.deploymentId !== '' &&
+        activeContainerIds.has(container.deploymentId);
+
+      if (!isDesired) {
+        console.log(
+          `♻️  [reconciler] Removing orphan container ${container.name} (${container.id.slice(0, 12)}, deployment=${container.deploymentId || 'unknown'})`
         );
+        try {
+          await forceRemoveContainer(dockerClient, container.id);
+          removedContainerIds.push(container.id);
+          reconcilerOrphansRemovedTotal.inc({ kind: 'container' });
+        } catch (err: unknown) {
+          const msg = err instanceof Error ? err.message : String(err);
+          console.warn(
+            `⚠️  [reconciler] Failed to remove container ${container.id.slice(0, 12)}: ${msg}`
+          );
+        }
       }
     }
-  }
 
-  // ── 4b. Purge orphan images (not in QUEUED/BUILDING/STARTING/TESTING/LIVE) ─
-  const removedImageTags: string[] = [];
+    // ── 4b. Purge orphan images (not in QUEUED/BUILDING/STARTING/TESTING/LIVE) ─
+    const removedImageTags: string[] = [];
 
-  for (const img of managedImages) {
-    if (img.deploymentId.startsWith('cli-')) {
-      continue;
-    }
+    for (const img of managedImages) {
+      if (img.deploymentId.startsWith('cli-')) {
+        continue;
+      }
 
-    const isDesired =
-      img.deploymentId !== '' &&
-      activeBuildOrLiveIds.has(img.deploymentId);
+      const isDesired =
+        img.deploymentId !== '' &&
+        activeBuildOrLiveIds.has(img.deploymentId);
 
-    if (!isDesired) {
-      console.log(
-        `♻️  [reconciler] Pruning orphan image ${img.repoTag} (deployment=${img.deploymentId || 'unknown'})`
-      );
-      try {
-        await removeImage(dockerClient, img.repoTag);
-        removedImageTags.push(img.repoTag);
-      } catch (err: unknown) {
-        const msg = err instanceof Error ? err.message : String(err);
-        console.warn(`⚠️  [reconciler] Failed to prune image ${img.repoTag}: ${msg}`);
+      if (!isDesired) {
+        console.log(
+          `♻️  [reconciler] Pruning orphan image ${img.repoTag} (deployment=${img.deploymentId || 'unknown'})`
+        );
+        try {
+          await removeImage(dockerClient, img.repoTag);
+          removedImageTags.push(img.repoTag);
+          reconcilerOrphansRemovedTotal.inc({ kind: 'image' });
+        } catch (err: unknown) {
+          const msg = err instanceof Error ? err.message : String(err);
+          console.warn(`⚠️  [reconciler] Failed to prune image ${img.repoTag}: ${msg}`);
+        }
       }
     }
-  }
 
-  // ── 4c. Sweep stale `/tmp/reapd-build-*` directories from crashed workers ─
-  const removedTmpDirs = await sweepStaleTempBuildDirs(tmpDirMaxAgeMs, tmpRootDir);
+    // ── 4c. Sweep stale `/tmp/reapd-build-*` directories from crashed workers ─
+    const removedTmpDirs = await sweepStaleTempBuildDirs(tmpDirMaxAgeMs, tmpRootDir);
 
-  if (expiredDeploymentIds.length > 0) {
-    reconcilerExpiredTotal.inc(expiredDeploymentIds.length);
-    deploymentsTotal.inc({ status: 'EXPIRED' }, expiredDeploymentIds.length);
+    return {
+      expiredDeploymentIds,
+      fencedDeploymentIds,
+      removedContainerIds,
+      removedImageTags,
+      removedTmpDirs,
+    };
+  } finally {
+    reconcilerSweepDurationSeconds.observe(Math.max(0, (Date.now() - sweepStartMs) / 1000));
   }
-  if (fencedDeploymentIds.length > 0) {
-    reconcilerFencedTotal.inc(fencedDeploymentIds.length);
-    deploymentsTotal.inc({ status: 'FAILED' }, fencedDeploymentIds.length);
-  }
-  if (removedContainerIds.length > 0) {
-    reconcilerOrphansRemovedTotal.inc({ kind: 'container' }, removedContainerIds.length);
-  }
-  if (removedImageTags.length > 0) {
-    reconcilerOrphansRemovedTotal.inc({ kind: 'image' }, removedImageTags.length);
-  }
-  reconcilerSweepDurationSeconds.observe(Math.max(0, (Date.now() - sweepStartMs) / 1000));
-
-  return {
-    expiredDeploymentIds,
-    fencedDeploymentIds,
-    removedContainerIds,
-    removedImageTags,
-    removedTmpDirs,
-  };
 }
 
 export async function sweepStaleTempBuildDirs(

@@ -2,7 +2,7 @@
   "title": "reapd",
   "uid": "reapd-overview",
   "schemaVersion": 39,
-  "version": 2,
+  "version": 3,
   "refresh": "15s",
   "time": { "from": "now-1h", "to": "now" },
   "panels": [
@@ -28,14 +28,19 @@
     {
       "id": 3,
       "type": "timeseries",
-      "title": "Deployments by status (PostgreSQL state)",
+      "title": "Deployment outcomes (per 5m) & active states",
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
       "datasource": { "type": "prometheus", "uid": "reapd-prometheus" },
       "targets": [
         {
           "refId": "A",
-          "expr": "max by (status) (reapd_deployments_by_status)",
-          "legendFormat": "{{status}}"
+          "expr": "round(sum by (status) (increase(reapd_deployments_total[5m])))",
+          "legendFormat": "outcome:{{status}}"
+        },
+        {
+          "refId": "B",
+          "expr": "max by (status) (reapd_deployments_by_status{status=~\"QUEUED|BUILDING|STARTING|TESTING|LIVE\"})",
+          "legendFormat": "active:{{status}}"
         }
       ]
     },
@@ -56,20 +61,20 @@
     {
       "id": 5,
       "type": "timeseries",
-      "title": "Build duration p50 / p95 (15m window)",
+      "title": "Build duration p50 / p95 (succeeded builds, 15m window)",
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
       "datasource": { "type": "prometheus", "uid": "reapd-prometheus" },
       "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
       "targets": [
         {
           "refId": "A",
-          "expr": "histogram_quantile(0.5, sum by (le) (rate(reapd_build_duration_seconds_bucket[15m])))",
-          "legendFormat": "p50"
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(reapd_build_duration_seconds_bucket{result=\"succeeded\"}[15m])))",
+          "legendFormat": "p50 (succeeded)"
         },
         {
           "refId": "B",
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(reapd_build_duration_seconds_bucket[15m])))",
-          "legendFormat": "p95"
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(reapd_build_duration_seconds_bucket{result=\"succeeded\"}[15m])))",
+          "legendFormat": "p95 (succeeded)"
         }
       ]
     },

@@ -136,13 +136,17 @@ export async function buildApp(opts?: BuildAppOptions): Promise<FastifyInstance>
     await reply.send({ ok: true });
   });
 
-  // Prometheus scrape endpoint. Rejects proxied/tunneled requests (`X-Forwarded-*`) so a
-  // webhook tunnel (e.g. ngrok / Cloudflare Tunnel) pointing at :3001 never exposes /metrics.
+  // Prometheus scrape endpoint. Best-effort rejection of common reverse-proxy/tunnel headers
+  // (`X-Forwarded-*`, `Forwarded`, `X-Real-IP`, `CF-Connecting-IP`) so a webhook tunnel
+  // (e.g. ngrok / Cloudflare Tunnel) pointing at :3001 does not expose /metrics.
   app.get('/metrics', async (req, reply) => {
     if (
       req.headers['x-forwarded-for'] !== undefined ||
       req.headers['x-forwarded-host'] !== undefined ||
-      req.headers['x-forwarded-proto'] !== undefined
+      req.headers['x-forwarded-proto'] !== undefined ||
+      req.headers['forwarded'] !== undefined ||
+      req.headers['x-real-ip'] !== undefined ||
+      req.headers['cf-connecting-ip'] !== undefined
     ) {
       return reply.status(403).send({ error: 'Metrics endpoint is not accessible via proxy' });
     }
