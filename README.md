@@ -247,8 +247,8 @@ Key variables:
 ### 3. Start the infrastructure
 
 ```bash
-docker compose -f infra/docker-compose.yml up -d
-# starts: Traefik, Redis, PostgreSQL, socket-proxy
+docker compose --env-file .env -f infra/docker-compose.yml up -d
+# starts: Traefik, Redis, PostgreSQL, socket-proxy, Prometheus, Grafana
 ```
 
 Then run the application processes in separate terminals:
@@ -276,6 +276,23 @@ bash infra/scripts/phase6-smoke.sh    # Phase 6 — Playwright smoke + PR commen
 
 ---
 
+## Observability
+
+The API and worker each expose Prometheus metrics (`prom-client`). `docker compose` also starts Prometheus (`:9090`) and Grafana (`:3030`, login `admin` / `$GRAFANA_ADMIN_PASSWORD`, default `admin`, loopback only) with a provisioned datasource and dashboard.
+
+| Metric | Type | Source |
+|--------|------|--------|
+| `reapd_deployments_total{status}` | counter | worker, per terminal state |
+| `reapd_build_duration_seconds` | histogram | worker, BuildKit image build |
+| `reapd_queue_waiting`, `reapd_queue_active` | gauge | worker, BullMQ job counts every 15s |
+| `reapd_active_previews` | gauge | worker, `LIVE` deployment count every 15s |
+| `reapd_smoke_results_total{result}` | counter | worker, Playwright outcomes |
+| `reapd_webhook_requests_total{event,action}` | counter | API, counted after HMAC verification |
+
+Endpoints: API at `http://127.0.0.1:3001/metrics`, worker at `http://127.0.0.1:9091/metrics` (override with `REAPD_WORKER_METRICS_HOST` / `REAPD_WORKER_METRICS_PORT`). Both are loopback only by default. If Prometheus in Docker can't reach the worker, set `REAPD_WORKER_METRICS_HOST=0.0.0.0` and firewall the port.
+
+---
+
 ## Upcoming Phases
 
 ### Phase 7 — Production Hardening
@@ -287,6 +304,7 @@ bash infra/scripts/phase6-smoke.sh    # Phase 6 — Playwright smoke + PR commen
 
 ### Phase 8 — Observability & Benchmarks
 
+Prometheus metrics and a provisioned Grafana dashboard are already in (see [Observability](#observability)). Still to come:
+
 - **k6 load tests** — 10-commit rapid-push superseding stress test, webhook ingestion p95, SSE reconnect under load
-- **OpenTelemetry traces** — per-deployment span from webhook receipt to `LIVE`, exported to a self-hosted Tempo instance
-- **Grafana dashboard** — build queue depth, reconciler sweep latency, active preview count
+- **OpenTelemetry traces** — per-deployment span from webhook receipt to `LIVE`
