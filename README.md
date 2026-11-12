@@ -155,8 +155,8 @@ Webhook idempotency works the same way. `(repo_id, pr_number, head_sha)` has a u
 | CPU cap | `HostConfig.NanoCpus` | 0.5 vCPU |
 | PID cap | `HostConfig.PidsLimit` | 100 (fork-bomb resistant) |
 | Linux capabilities | `HostConfig.CapDrop` | `ALL` dropped |
-| Network | `HostConfig.NetworkMode` | `reapd-preview-edge` (isolated bridge; ICC disabled) |
-| Docker socket | TCP socket-proxy | Read-only; no `exec`, `post`, `delete` passthrough to host |
+| Network | `HostConfig.NetworkMode` | `reapd-preview-edge` isolated bridge (ICC disabled deferred to Phase 7) |
+| Docker socket | TCP socket-proxy | Restricted: `EXEC`, `HOST`, `VOLUMES` blocked; `POST` enabled for container lifecycle ops |
 | Webhook auth | HMAC-SHA256 | `X-Hub-Signature-256` verified before any DB write |
 | Smoke browser | `serviceWorkers: 'block'` + `context.route` SSRF guard | Blocks private IPs, single-label hosts, loopback, non-preview origins |
 | Secret leakage | `redactSecrets()` | Applied before every log truncation, failure message write, and SSE emit |
@@ -189,13 +189,13 @@ reapd/
 ├── apps/
 │   ├── api/          # Fastify 5 REST + SSE + webhook ingestion
 │   ├── worker/       # BullMQ build worker, smoke runner, reconciler
-│   └── dashboard/    # Next.js 15 App Router + @xterm/xterm terminal
+│   └── web/           # Next.js 15 App Router + @xterm/xterm terminal
 ├── packages/
 │   ├── db/           # Drizzle ORM, PostgreSQL schema, migrations, repositories
 │   ├── docker-client/# Docker Engine API client, 8-byte log demux, AbortError
 │   └── types/        # Shared TypeScript types (DeploymentStatus, TestRunStatus…)
 ├── infra/
-│   ├── docker-compose.yml      # Full stack: API, worker, dashboard, Traefik, Redis, Postgres, socket-proxy
+│   ├── docker-compose.yml      # Infra services: Traefik, Redis, Postgres, socket-proxy (API/worker/web run separately)
 │   └── scripts/
 │       ├── cli-smoke.sh        # Phase 1: container isolation + Traefik TLS
 │       ├── phase2-smoke.sh     # Phase 2: git clone + BuildKit image build
@@ -244,11 +244,20 @@ Key variables:
 | `REAPD_SMOKE_REQUIRED` | `true` to fail deployments when smoke check is `SKIPPED` |
 | `REAPD_CHROMIUM_NO_SANDBOX` | `1` to pass `--no-sandbox` when running as root (CI) |
 
-### 3. Start the full stack
+### 3. Start the infrastructure
 
 ```bash
 docker compose -f infra/docker-compose.yml up -d
-npm run build   # Turborepo builds all packages in dependency order
+# starts: Traefik, Redis, PostgreSQL, socket-proxy
+```
+
+Then run the application processes in separate terminals:
+
+```bash
+npm run build                        # Turborepo builds all packages in dependency order
+npm run dev --workspace apps/api     # Fastify API on :3001
+npm run dev --workspace apps/worker  # BullMQ worker
+npm run dev --workspace apps/web     # Next.js dashboard on :3000
 ```
 
 ### 4. Run the smoke gates (no GitHub App required for Phases 1–5)
