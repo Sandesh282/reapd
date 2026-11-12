@@ -29,6 +29,7 @@ import {
   type VerifiedPrWebhook,
 } from '@reapd/types';
 import { registerDeploymentRoutes, type DeploymentRoutesDeps } from './routes/deployments.js';
+import { registry as metricsRegistry, webhookRequestsTotal } from './metrics.js';
 
 export * from './routes/deployments.js';
 
@@ -131,6 +132,13 @@ export async function buildApp(opts?: BuildAppOptions): Promise<FastifyInstance>
     await reply.send({ ok: true });
   });
 
+  // Prometheus scrape endpoint. The API binds to loopback by default; if you expose it,
+  // restrict /metrics at the proxy layer.
+  app.get('/metrics', async (_req, reply) => {
+    const body = await metricsRegistry.metrics();
+    await reply.header('Content-Type', metricsRegistry.contentType).send(body);
+  });
+
   await registerDeploymentRoutes(app, {
     allowedCorsOrigins: allowedOriginsSet,
     ...opts?.deploymentRoutesDeps,
@@ -164,6 +172,17 @@ export async function buildApp(opts?: BuildAppOptions): Promise<FastifyInstance>
     }
 
     // ── Step 3: Route by event type ───────────────────────────────────────────
+
+    // Label values are clamped to known sets so a signed-but-unexpected payload can never
+    // create unbounded Prometheus time series.
+    const rawActionLabel = parsedBody['action'];
+    webhookRequestsTotal.inc({
+      event: eventType === 'pull_request' || eventType === 'ping' ? eventType : 'other',
+      action:
+        typeof rawActionLabel === 'string' && HANDLED_PR_ACTIONS.has(rawActionLabel)
+          ? rawActionLabel
+          : 'other',
+    });
 
     if (eventType === 'ping') {
       return reply.send({ received: true, ignored: true });
