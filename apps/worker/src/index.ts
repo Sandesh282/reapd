@@ -1,15 +1,28 @@
 // apps/worker/src/index.ts
 // Worker barrel & daemon entrypoint.
 // When imported as a library, exports builder/job modules without side effects.
-// When executed directly (`tsx src/index.ts`), starts the BullMQ worker + reconciler.
+// When executed directly (`tsx src/index.ts`), starts the BullMQ worker + reconciler
+// and a lightweight HTTP server on :9091 exposing GET /metrics for Prometheus.
 
+import { createServer } from 'node:http';
 import { realpathSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { Worker } from 'bullmq';
+import { Worker, Queue } from 'bullmq';
 import { Redis } from 'ioredis';
+import { db, countDeploymentsByStatus } from '@reapd/db';
+import type { DeploymentStatus } from '@reapd/types';
 import { abortAllActiveBuilds, buildJobHandler, type BuildJobPayload } from './jobs/build.js';
 import { redactSecrets } from './logs/log-sink.js';
+import {
+  registry,
+  queueWaiting,
+  queueActive,
+  activePreviews,
+  deploymentsByStatus,
+  metricsPollErrorsTotal,
+  metricsPollLastSuccessTimestampSeconds,
+} from './metrics.js';
 import { startReconciler } from './reconciler/index.js';
 
 export * from './builder/git-clone.js';
@@ -52,6 +65,93 @@ if (isMainModule) {
 
   const stopReconciler = startReconciler();
 
+  // ── Prometheus queue-depth + DB status poller ────────────────────────────
+  const metricsRedis = new Redis(redisUrl, { maxRetriesPerRequest: null });
+  const metricsQueue = new Queue<BuildJobPayload>(queueName, {
+    connection: metricsRedis,
+  });
+
+  const METRICS_POLL_TIMEOUT_MS = 10_000;
+  let isPollingMetrics = false;
+  let lastMetricsWarnAt = 0;
+  const pollMetrics = async (): Promise<void> => {
+    if (isPollingMetrics) return;
+    isPollingMetrics = true;
+    let timeoutId: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const [counts, statusCounts] = await Promise.race([
+        Promise.all([
+          metricsQueue.getJobCounts('waiting', 'active', 'delayed'),
+          countDeploymentsByStatus(db),
+        ]),
+        new Promise<never>((_resolve, reject) => {
+          timeoutId = setTimeout(
+            () => reject(new Error(`Metrics poll timed out after ${METRICS_POLL_TIMEOUT_MS}ms`)),
+            METRICS_POLL_TIMEOUT_MS,
+          );
+          timeoutId.unref();
+        }),
+      ]);
+      queueWaiting.set((counts.waiting ?? 0) + (counts.delayed ?? 0));
+      queueActive.set(counts.active ?? 0);
+      activePreviews.set(statusCounts.LIVE);
+      for (const [status, count] of Object.entries(statusCounts) as Array<
+        [DeploymentStatus, number]
+      >) {
+        deploymentsByStatus.set({ status }, count);
+      }
+      metricsPollLastSuccessTimestampSeconds.set(Date.now() / 1000);
+    } catch (err) {
+      metricsPollErrorsTotal.inc();
+      // Non-fatal (metrics may lag during Redis/DB hiccups), but surface it at most once a minute
+      // so a broken connection is visible instead of silently reporting stale numbers.
+      if (Date.now() - lastMetricsWarnAt > 60_000) {
+        lastMetricsWarnAt = Date.now();
+        const msg = err instanceof Error ? err.message : String(err);
+        console.warn(`⚠️  Metrics poll failed: ${redactSecrets(msg)}`);
+      }
+    } finally {
+      if (timeoutId) clearTimeout(timeoutId);
+      isPollingMetrics = false;
+    }
+  };
+
+  const metricsPoller = setInterval(() => void pollMetrics(), 15_000);
+  void pollMetrics();
+
+  // ── Metrics HTTP server on :9091 ─────────────────────────────────────────
+  const METRICS_PORT = Number(process.env['REAPD_WORKER_METRICS_PORT'] ?? 9091);
+  const METRICS_HOST = process.env['REAPD_WORKER_METRICS_HOST'] ?? '127.0.0.1';
+  const metricsServer = createServer(async (req, res) => {
+    try {
+      if (req.url === '/metrics' && req.method === 'GET') {
+        const metrics = await registry.metrics();
+        res.writeHead(200, { 'Content-Type': registry.contentType });
+        res.end(metrics);
+      } else {
+        res.writeHead(404);
+        res.end('Not found');
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.warn(`⚠️  Failed to serialize worker metrics: ${redactSecrets(msg)}`);
+      if (!res.headersSent) {
+        res.writeHead(500);
+      }
+      res.end('Internal Server Error');
+    }
+  });
+  // Metrics are best-effort: a port conflict (e.g. a second worker on the same host, or a smoke
+  // script spawning its own worker) must never take down the build worker.
+  metricsServer.on('error', (err: NodeJS.ErrnoException) => {
+    console.warn(
+      `⚠️  Metrics server disabled (${err.code ?? 'error'} on ${METRICS_HOST}:${METRICS_PORT}): ${err.message}`,
+    );
+  });
+  metricsServer.listen(METRICS_PORT, METRICS_HOST, () => {
+    console.log(`📊 Worker metrics available at http://${METRICS_HOST}:${METRICS_PORT}/metrics`);
+  });
+
   worker.on('ready', () => {
     console.log('👷 BullMQ build worker ready and listening on queue "build"');
   });
@@ -72,12 +172,20 @@ if (isMainModule) {
 
   const shutdown = async (): Promise<void> => {
     console.log('🛑 Shutting down worker...');
-    // Clear the reconciler interval (any in-flight sweep is idempotent if interrupted by exit)
+    // Force exit after 8s if Redis or Docker sockets hang during shutdown.
+    setTimeout(() => process.exit(1), 8_000).unref();
+    // Stop timers and signal active builds to abort FIRST before awaiting any Redis/network close.
+    clearInterval(metricsPoller);
     stopReconciler();
     abortAllActiveBuilds();
+    // Prometheus keeps scrape connections alive; drop them so close() can complete immediately.
+    metricsServer.closeAllConnections();
+    metricsServer.close();
     try {
       await worker.close();
     } finally {
+      await metricsQueue.close().catch(() => {});
+      await metricsRedis.quit().catch(() => {});
       await redis.quit().catch(() => {});
       process.exit(0);
     }

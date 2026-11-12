@@ -1,0 +1,101 @@
+{
+  "title": "reapd",
+  "uid": "reapd-overview",
+  "schemaVersion": 39,
+  "version": 3,
+  "refresh": "15s",
+  "time": { "from": "now-1h", "to": "now" },
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "Build queue (waiting / active)",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "reapd-prometheus" },
+      "targets": [
+        { "refId": "A", "expr": "max(reapd_queue_waiting)", "legendFormat": "waiting" },
+        { "refId": "B", "expr": "max(reapd_queue_active)", "legendFormat": "active" }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Active previews (LIVE)",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "reapd-prometheus" },
+      "targets": [{ "refId": "A", "expr": "max(reapd_active_previews)" }]
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Deployment outcomes (per 5m) & active states",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "datasource": { "type": "prometheus", "uid": "reapd-prometheus" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "round(sum by (status) (increase(reapd_deployments_total[5m])))",
+          "legendFormat": "outcome:{{status}}"
+        },
+        {
+          "refId": "B",
+          "expr": "max by (status) (reapd_deployments_by_status{status=~\"QUEUED|BUILDING|STARTING|TESTING|LIVE\"})",
+          "legendFormat": "active:{{status}}"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Smoke results (per 5m)",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "datasource": { "type": "prometheus", "uid": "reapd-prometheus" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "round(sum by (result) (increase(reapd_smoke_results_total[5m])))",
+          "legendFormat": "{{result}}"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Build duration p50 / p95 (succeeded builds, 15m window)",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "datasource": { "type": "prometheus", "uid": "reapd-prometheus" },
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(reapd_build_duration_seconds_bucket{result=\"succeeded\"}[15m])))",
+          "legendFormat": "p50 (succeeded)"
+        },
+        {
+          "refId": "B",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(reapd_build_duration_seconds_bucket{result=\"succeeded\"}[15m])))",
+          "legendFormat": "p95 (succeeded)"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Webhooks received & rejected (per 5m)",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+      "datasource": { "type": "prometheus", "uid": "reapd-prometheus" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "round(sum by (event, action) (increase(reapd_webhook_requests_total[5m])))",
+          "legendFormat": "{{event}}/{{action}}"
+        },
+        {
+          "refId": "B",
+          "expr": "round(sum by (reason) (increase(reapd_webhook_rejections_total[5m])))",
+          "legendFormat": "rejected:{{reason}}"
+        }
+      ]
+    }
+  ]
+}

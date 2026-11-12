@@ -29,6 +29,12 @@ import {
   type VerifiedPrWebhook,
 } from '@reapd/types';
 import { registerDeploymentRoutes, type DeploymentRoutesDeps } from './routes/deployments.js';
+import {
+  deploymentsTotal,
+  registry as metricsRegistry,
+  webhookRejectionsTotal,
+  webhookRequestsTotal,
+} from './metrics.js';
 
 export * from './routes/deployments.js';
 
@@ -131,6 +137,24 @@ export async function buildApp(opts?: BuildAppOptions): Promise<FastifyInstance>
     await reply.send({ ok: true });
   });
 
+  // Prometheus scrape endpoint. Best-effort rejection of common reverse-proxy/tunnel headers
+  // (`X-Forwarded-*`, `Forwarded`, `X-Real-IP`, `CF-Connecting-IP`) so a webhook tunnel
+  // (e.g. ngrok / Cloudflare Tunnel) pointing at :3001 does not expose /metrics.
+  app.get('/metrics', async (req, reply) => {
+    if (
+      req.headers['x-forwarded-for'] !== undefined ||
+      req.headers['x-forwarded-host'] !== undefined ||
+      req.headers['x-forwarded-proto'] !== undefined ||
+      req.headers['forwarded'] !== undefined ||
+      req.headers['x-real-ip'] !== undefined ||
+      req.headers['cf-connecting-ip'] !== undefined
+    ) {
+      return reply.status(403).send({ error: 'Metrics endpoint is not accessible via proxy' });
+    }
+    const body = await metricsRegistry.metrics();
+    await reply.header('Content-Type', metricsRegistry.contentType).send(body);
+  });
+
   await registerDeploymentRoutes(app, {
     allowedCorsOrigins: allowedOriginsSet,
     ...opts?.deploymentRoutesDeps,
@@ -143,16 +167,19 @@ export async function buildApp(opts?: BuildAppOptions): Promise<FastifyInstance>
     const deliveryId = req.headers['x-github-delivery']   as string | undefined;
 
     if (!sigHeader || !eventType || !deliveryId || !UUID_REGEX.test(deliveryId)) {
+      webhookRejectionsTotal.inc({ reason: 'invalid_headers' });
       return reply.status(400).send({ error: 'Missing or invalid required GitHub webhook headers' });
     }
 
     // ── Step 2: HMAC verification (runs before JSON.parse) ────────────────────
     const rawBody = (req as unknown as Record<string, unknown>)['rawBody'] as Buffer | undefined;
     if (!rawBody) {
+      webhookRejectionsTotal.inc({ reason: 'invalid_headers' });
       return reply.status(415).send({ error: 'Expected application/json webhook payload' });
     }
 
     if (!verifySignature(rawBody, sigHeader, webhookSecret)) {
+      webhookRejectionsTotal.inc({ reason: 'invalid_signature' });
       return reply.status(401).send({ error: 'Invalid webhook signature' });
     }
 
@@ -160,10 +187,22 @@ export async function buildApp(opts?: BuildAppOptions): Promise<FastifyInstance>
     try {
       parsedBody = JSON.parse(rawBody.toString('utf8')) as Record<string, unknown>;
     } catch {
+      webhookRejectionsTotal.inc({ reason: 'malformed_json' });
       return reply.status(400).send({ error: 'Malformed JSON body' });
     }
 
     // ── Step 3: Route by event type ───────────────────────────────────────────
+
+    // Label values are clamped to known sets so a signed-but-unexpected payload can never
+    // create unbounded Prometheus time series.
+    const rawActionLabel = parsedBody['action'];
+    webhookRequestsTotal.inc({
+      event: eventType === 'pull_request' || eventType === 'ping' ? eventType : 'other',
+      action:
+        typeof rawActionLabel === 'string' && HANDLED_PR_ACTIONS.has(rawActionLabel)
+          ? rawActionLabel
+          : 'other',
+    });
 
     if (eventType === 'ping') {
       return reply.send({ received: true, ignored: true });
@@ -260,6 +299,7 @@ export async function buildApp(opts?: BuildAppOptions): Promise<FastifyInstance>
       payload.action !== 'closed' &&
       (!headRepo || headRepo.id !== payload.repository.id)
     ) {
+      webhookRejectionsTotal.inc({ reason: 'fork_rejected' });
       app.log.warn(
         { headRepoId: headRepo?.id ?? null, baseRepoId: payload.repository.id },
         'Ignoring pull_request from external or deleted fork',
@@ -309,8 +349,16 @@ export async function buildApp(opts?: BuildAppOptions): Promise<FastifyInstance>
     const result = await ingestPullRequestWebhook(db, webhook);
 
     if (result.duplicate) {
+      webhookRejectionsTotal.inc({ reason: 'duplicate' });
       app.log.info({ deliveryId }, 'Duplicate delivery — skipping');
       return { received: true, duplicate: true };
+    }
+
+    if (result.supersededIds.length > 0) {
+      deploymentsTotal.inc({ status: 'SUPERSEDED' }, result.supersededIds.length);
+    }
+    if ((result.expiredIds?.length ?? 0) > 0) {
+      deploymentsTotal.inc({ status: 'EXPIRED' }, result.expiredIds!.length);
     }
 
     for (const supersededId of result.supersededIds) {

@@ -33,6 +33,11 @@ import { getInstallationToken } from '../github/auth.js';
 import { upsertPrComment } from '../github/pr-comment.js';
 import { createLogSink, type LogSink, redactSecrets } from '../logs/log-sink.js';
 import {
+  buildDurationSeconds,
+  deploymentsTotal,
+  smokeResultsTotal,
+} from '../metrics.js';
+import {
   runPlaywrightSmokeCheck,
   shouldFailSmoke,
   type SmokeTestRunSummary,
@@ -207,6 +212,8 @@ export async function buildJobHandler(job: Job<BuildJobPayload>): Promise<void> 
       },
     });
 
+    const buildStartMs = Date.now();
+    let buildResultLabel: 'succeeded' | 'failed' | 'aborted' = 'failed';
     try {
       sink.write('system', 'stdout', `[reapd] Building image ${imageTag} with BuildKit...`);
       const built = await buildDockerImage({
@@ -222,8 +229,19 @@ export async function buildJobHandler(job: Job<BuildJobPayload>): Promise<void> 
         },
       });
       buildDurationMs = built.buildDurationMs;
+      buildResultLabel = 'succeeded';
       sink.write('system', 'stdout', `[reapd] Image ${imageTag} built in ${buildDurationMs}ms`);
+    } catch (buildErr) {
+      if (ac.signal.aborted || buildErr instanceof AbortError) {
+        buildResultLabel = 'aborted';
+      }
+      throw buildErr;
     } finally {
+      const measuredMs =
+        buildResultLabel === 'succeeded' && buildDurationMs !== null
+          ? buildDurationMs
+          : Date.now() - buildStartMs;
+      buildDurationSeconds.observe({ result: buildResultLabel }, Math.max(0, measuredMs / 1000));
       await cloned.cleanup().catch((err: unknown) => {
         const msg = err instanceof Error ? err.message : String(err);
         console.warn(`⚠️  Failed to remove temp clone dir: ${msg}`);
@@ -335,6 +353,8 @@ export async function buildJobHandler(job: Job<BuildJobPayload>): Promise<void> 
       console.warn(`⚠️  Failed to record test_run for ${deploymentId}:`, dbErr);
     });
 
+    smokeResultsTotal.inc({ result: smokeResult.status });
+
     if (shouldFailSmoke(smokeResult.status)) {
       await forceRemoveContainer(docker, container.id).catch(() => {});
       throw new Error(
@@ -360,9 +380,12 @@ export async function buildJobHandler(job: Job<BuildJobPayload>): Promise<void> 
       return;
     }
 
+    // Increment immediately after `liveTrans.transitioned === true` is confirmed, and guard
+    // post-LIVE log sealing so no error after commit can enter the catch block.
+    deploymentsTotal.inc({ status: 'LIVE' });
     finalBuildStatus = 'LIVE';
     sink.write('system', 'stdout', `[reapd] Preview LIVE at ${basePreviewUrl}`);
-    await sink.end('LIVE');
+    await sink.end('LIVE').catch(() => {});
     console.log(`🟢 LIVE: ${basePreviewUrl} (deployment ${deploymentId})`);
 
     // Post sticky PR comment AFTER sealing `end:LIVE` in Redis so GitHub API latency
@@ -388,13 +411,17 @@ export async function buildJobHandler(job: Job<BuildJobPayload>): Promise<void> 
         await sink.flush();
       }
 
-      await transitionDeploymentStatus(db, {
+      const abortTrans = await transitionDeploymentStatus(db, {
         deploymentId,
         toStatus: targetStatus,
         reason: abortReason,
       }).catch((dbErr: unknown) => {
         console.warn(`⚠️  Failed to record ${targetStatus} status for ${deploymentId}:`, dbErr);
+        return null;
       });
+      if (abortTrans?.transitioned) {
+        deploymentsTotal.inc({ status: targetStatus });
+      }
       return;
     }
 
@@ -421,6 +448,9 @@ export async function buildJobHandler(job: Job<BuildJobPayload>): Promise<void> 
 
     if (failTrans) {
       finalBuildStatus = toBuildLogEndStatus(failTrans.finalStatus);
+      if (failTrans.transitioned) {
+        deploymentsTotal.inc({ status: finalBuildStatus });
+      }
     }
 
     // Seal the build log stream AFTER committing the DB status and BEFORE calling GitHub

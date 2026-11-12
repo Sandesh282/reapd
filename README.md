@@ -247,8 +247,8 @@ Key variables:
 ### 3. Start the infrastructure
 
 ```bash
-docker compose -f infra/docker-compose.yml up -d
-# starts: Traefik, Redis, PostgreSQL, socket-proxy
+docker compose --env-file .env -f infra/docker-compose.yml up -d
+# starts: Traefik, Redis, PostgreSQL, socket-proxy, Prometheus, Grafana
 ```
 
 Then run the application processes in separate terminals:
@@ -276,6 +276,30 @@ bash infra/scripts/phase6-smoke.sh    # Phase 6 — Playwright smoke + PR commen
 
 ---
 
+## Observability
+
+The API and worker each expose Prometheus metrics (`prom-client`). `docker compose` also starts Prometheus (`:9090`) and Grafana (`:3030`, login `admin` / `$GRAFANA_ADMIN_PASSWORD`, default `admin`, loopback only) with a provisioned datasource and dashboard.
+
+| Metric | Type | Source |
+|--------|------|--------|
+| `reapd_deployments_by_status{status}` | gauge | worker, PostgreSQL `GROUP BY status` every 15s (includes API-side `SUPERSEDED` and reconciler `EXPIRED`) |
+| `reapd_deployments_total{status}` | counter | API (`SUPERSEDED`, PR-close `EXPIRED`) + worker (`LIVE`, `FAILED`) + reconciler (`EXPIRED`, `FAILED`), merged via `sum by (status)` |
+| `reapd_build_duration_seconds{result}` | histogram | worker, BuildKit image build (`succeeded`, `failed`, `aborted`) |
+| `reapd_queue_waiting`, `reapd_queue_active` | gauge | worker, BullMQ job counts every 15s |
+| `reapd_active_previews` | gauge | worker, `LIVE` deployment count every 15s |
+| `reapd_metrics_poll_last_success_timestamp_seconds` | gauge | worker, Unix timestamp of last successful Redis + DB metrics poll |
+| `reapd_smoke_results_total{result}` | counter | worker, Playwright outcomes |
+| `reapd_reconciler_sweep_duration_seconds` | histogram | reconciler sweep latency |
+| `reapd_reconciler_last_success_timestamp_seconds` | gauge | reconciler, Unix timestamp of last successful sweep |
+| `reapd_reconciler_expired_total`, `reapd_reconciler_fenced_total` | counter | reconciler TTL expirations and stuck-build fencing |
+| `reapd_reconciler_orphans_removed_total{kind}` | counter | reconciler orphan `container` / `image` cleanup |
+| `reapd_webhook_requests_total{event,action}` | counter | API, counted after HMAC verification |
+| `reapd_webhook_rejections_total{reason}` | counter | API, rejected/deduplicated deliveries (`invalid_signature`, `fork_rejected`, `duplicate`, etc.) |
+
+Endpoints: API at `http://127.0.0.1:3001/metrics` (with best-effort rejection of common reverse-proxy/tunnel headers like `X-Forwarded-*`, `Forwarded`, `X-Real-IP`, `CF-Connecting-IP`), worker at `http://127.0.0.1:9091/metrics` (override with `REAPD_WORKER_METRICS_HOST` / `REAPD_WORKER_METRICS_PORT`). Both bind to `127.0.0.1` by default — on Docker Desktop (`macOS`/`Windows`), `host.docker.internal` reaches host loopback directly; on Linux, where `host-gateway` resolves to the Docker bridge IP, set `REAPD_WORKER_METRICS_HOST` and `REAPD_API_HOST` to the bridge IP or run Prometheus with host networking.
+
+---
+
 ## Upcoming Phases
 
 ### Phase 7 — Production Hardening
@@ -287,6 +311,7 @@ bash infra/scripts/phase6-smoke.sh    # Phase 6 — Playwright smoke + PR commen
 
 ### Phase 8 — Observability & Benchmarks
 
+Prometheus metrics and a provisioned Grafana dashboard are already in (see [Observability](#observability)). Still to come:
+
 - **k6 load tests** — 10-commit rapid-push superseding stress test, webhook ingestion p95, SSE reconnect under load
-- **OpenTelemetry traces** — per-deployment span from webhook receipt to `LIVE`, exported to a self-hosted Tempo instance
-- **Grafana dashboard** — build queue depth, reconciler sweep latency, active preview count
+- **OpenTelemetry traces** — per-deployment span from webhook receipt to `LIVE`

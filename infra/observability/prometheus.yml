@@ -1,0 +1,13 @@
+global:
+  scrape_interval: 15s
+
+# The API and worker run on the host (not in compose), so Prometheus reaches them via
+# host.docker.internal. On Linux, the compose service maps it with `host-gateway`.
+scrape_configs:
+  - job_name: reapd-api
+    static_configs:
+      - targets: ['host.docker.internal:3001']
+
+  - job_name: reapd-worker
+    static_configs:
+      - targets: ['host.docker.internal:9091']

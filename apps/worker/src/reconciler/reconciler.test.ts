@@ -12,6 +12,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type Dockerode from 'dockerode';
 import type { DrizzleClient } from '@reapd/db';
+import { registry } from '../metrics.js';
 import { runReconcileSweep, sweepStaleTempBuildDirs } from './index.js';
 
 test('runReconcileSweep snapshots Docker before querying active DB IDs, preserves cli-* & active resources, and skips failed removals', async () => {
@@ -179,6 +180,13 @@ test('runReconcileSweep snapshots Docker before querying active DB IDs, preserve
     assert.deepEqual(res.removedTmpDirs, [staleDir]);
     const remainingSweep = await sweepStaleTempBuildDirs(10 * 60 * 1000, tmpRoot);
     assert.deepEqual(remainingSweep, []);
+
+    // Verify runReconcileSweep incremented Prometheus counters only for succeeded operations
+    const metricsOutput = await registry.metrics();
+    assert.match(metricsOutput, /reapd_reconciler_expired_total\{[^}]*\}\s+[1-9]\d*/);
+    assert.match(metricsOutput, /reapd_deployments_total\{[^}]*status="EXPIRED"[^}]*\}\s+[1-9]\d*/);
+    assert.match(metricsOutput, /reapd_reconciler_orphans_removed_total\{[^}]*kind="container"[^}]*\}\s+[1-9]\d*/);
+    assert.match(metricsOutput, /reapd_reconciler_orphans_removed_total\{[^}]*kind="image"[^}]*\}\s+[1-9]\d*/);
   } finally {
     await rm(tmpRoot, { recursive: true, force: true });
   }

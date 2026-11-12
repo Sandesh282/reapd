@@ -12,21 +12,21 @@
     "lint": "eslint src"
   },
   "dependencies": {
-    "fastify": "^5.2.1",
     "@fastify/cors": "^10.0.2",
-    "zod": "^3.23.8",
-    "ioredis": "^5.4.2",
-    "bullmq": "^5.34.4",
+    "@reapd/db": "*",
     "@reapd/types": "*",
-    "@reapd/db": "*"
+    "bullmq": "^5.34.4",
+    "fastify": "^5.2.1",
+    "ioredis": "^5.4.2",
+    "prom-client": "^15.1.3",
+    "zod": "^3.23.8"
   },
   "devDependencies": {
+    "@types/node": "^22.10.1",
     "tsx": "^4.19.2",
-    "typescript": "^5.7.2",
-    "@types/node": "^22.10.1"
+    "typescript": "^5.7.2"
   },
   "engines": {
     "node": ">=22"
   }
 }
-
