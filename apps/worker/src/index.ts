@@ -114,7 +114,14 @@ if (isMainModule) {
   }
 
   const stopReconciler = enableReconciler
-    ? startReconciler({ immediate: role === 'reconciler', unref: enableWorker })
+    ? startReconciler({
+        immediate: role === 'reconciler',
+        // In standalone reconciler mode there is no BullMQ worker connection keeping the event
+        // loop alive, so pass keepAlive:true so the interval itself prevents premature exit.
+        // In all/worker modes the BullMQ Worker connection is the anchor; unref the timer so a
+        // clean shutdown is not blocked by the reconciler interval.
+        keepAlive: !enableWorker,
+      })
     : null;
 
   // ── Prometheus queue-depth + DB status poller ────────────────────────────

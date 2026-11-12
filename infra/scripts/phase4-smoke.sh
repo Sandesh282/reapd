@@ -142,7 +142,10 @@ fi
 
 echo "👷 Starting BullMQ worker + Desired-State Reconciler (interval=2000ms)..."
 WORKER_METRICS_PORT=19094
-REAPD_REPO_URL_OVERRIDE="$TMP_REPO" REAPD_BUILD_QUEUE="$TEST_QUEUE" REAPD_RECONCILE_INTERVAL_MS=2000 REAPD_WORKER_METRICS_PORT="$WORKER_METRICS_PORT" \
+# REAPD_STUCK_THRESHOLD_MINUTES=999 so the embedded reconciler cannot accidentally fence
+# Generation 4 before the SIGKILL in Step 7.  The reconciler still runs every 2s to exercise
+# the zombie-container GC in Steps 5–6; it just won't fence in-flight builds.
+REAPD_ROLE=all REAPD_STUCK_THRESHOLD_MINUTES=999 REAPD_REPO_URL_OVERRIDE="$TMP_REPO" REAPD_BUILD_QUEUE="$TEST_QUEUE" REAPD_RECONCILE_INTERVAL_MS=2000 REAPD_WORKER_METRICS_PORT="$WORKER_METRICS_PORT" \
   node --import tsx "$ROOT/apps/worker/src/index.ts" >"$WORKER_LOG" 2>&1 &
 WORKER_PID=$!
 sleep 1
@@ -425,6 +428,10 @@ kill -9 "$WORKER_PID" 2>/dev/null || true
 wait "$WORKER_PID" 2>/dev/null || true
 WORKER_PID=""
 
+# Remove any running preview container for this PR that the worker may have started before the
+# SIGKILL, so it doesn't confuse the Generation 5 container-start step later.
+docker rm -f "reapd-pr-$TEST_PR_NUMBER" >/dev/null 2>&1 || true
+
 GEN4_AFTER_SIGKILL="$(docker exec -i reapd-postgres psql -U reapd -d reapd -tAq -c \
   "SELECT status FROM deployments WHERE id = '$GEN4_ID' LIMIT 1;")"
 if [[ "$GEN4_AFTER_SIGKILL" != "BUILDING" ]]; then
@@ -438,6 +445,19 @@ RECONCILER_METRICS_PORT=19095
 REAPD_ROLE=reconciler REAPD_STUCK_THRESHOLD_MINUTES=0.03 REAPD_RECONCILE_INTERVAL_MS=1000 REAPD_RECONCILER_METRICS_PORT="$RECONCILER_METRICS_PORT" \
   node --import tsx "$ROOT/apps/worker/src/index.ts" >"$RECONCILER_LOG" 2>&1 &
 RECONCILER_PID=$!
+
+# Wait for the standalone reconciler's metrics server to be ready before asserting anything
+for _ in {1..20}; do
+  if curl -fsS "http://127.0.0.1:$RECONCILER_METRICS_PORT/metrics" >/dev/null 2>&1; then
+    break
+  fi
+  sleep 0.3
+done
+if ! curl -fsS "http://127.0.0.1:$RECONCILER_METRICS_PORT/metrics" >/dev/null 2>&1; then
+  echo "❌ FAIL: standalone reconciler metrics server did not become ready on :$RECONCILER_METRICS_PORT"
+  cat "$RECONCILER_LOG"
+  exit 1
+fi
 
 # Wait for standalone reconciler to fence Generation 4 -> FAILED and reap $CRASH_CONTAINER_NAME
 CRASH_RECOVERED=0

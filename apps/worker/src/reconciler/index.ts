@@ -240,7 +240,15 @@ export async function sweepStaleTempBuildDirs(
 export function startReconciler(opts?: {
   intervalMs?: number;
   immediate?: boolean;
-  unref?: boolean;
+  /**
+   * When true (default), `timer.unref()` is called so the reconciler interval does not
+   * prevent the Node process from exiting when the BullMQ worker is the primary event-loop
+   * anchor (REAPD_ROLE=all).
+   *
+   * Pass `keepAlive: true` for standalone reconciler mode (REAPD_ROLE=reconciler) so the
+   * interval itself keeps the process alive — there is no worker connection to do that.
+   */
+  keepAlive?: boolean;
 }): () => void {
   const envInterval = Number(process.env['REAPD_RECONCILE_INTERVAL_MS']);
   const intervalMs =
@@ -284,7 +292,7 @@ export function startReconciler(opts?: {
     void tick();
   }, intervalMs);
 
-  if (opts?.unref ?? true) {
+  if (!opts?.keepAlive) {
     timer.unref();
   }
   return () => {
