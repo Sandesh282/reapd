@@ -834,3 +834,11 @@ export async function upsertTestRun(
   };
 }
 
+
+/** Returns the number of deployments currently in the `LIVE` state (used by Prometheus gauge). */
+export async function countLiveDeployments(db: DrizzleClient): Promise<number> {
+  const rows = await db.execute<{ count: string | number }>(
+    sql`SELECT COUNT(*) AS count FROM deployments WHERE status = 'LIVE'`,
+  );
+  return Number(rows[0]?.count ?? 0);
+}
