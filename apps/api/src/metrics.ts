@@ -10,6 +10,18 @@ registry.setDefaultLabels({ service: 'api' });
 collectDefaultMetrics({ register: registry });
 
 /**
+ * Total API-committed terminal deployment transitions (`SUPERSEDED` on rapid push or PR close,
+ * `EXPIRED` when closing a PR with a LIVE preview). Merged with worker `reapd_deployments_total`
+ * via `sum by (status)` in PromQL.
+ */
+export const deploymentsTotal = new Counter({
+  name: 'reapd_deployments_total',
+  help: 'Total deployments that reached a terminal state.',
+  labelNames: ['status'] as const,
+  registers: [registry],
+});
+
+/**
  * Total verified GitHub App webhook requests received.
  * Labels: event = pull_request | ping | other, action = opened | synchronize | reopened | closed | other
  */
@@ -33,6 +45,9 @@ export const webhookRejectionsTotal = new Counter({
 
 // Pre-initialize common webhook label combinations at 0 so Grafana panels render
 // immediately instead of showing "No data" prior to the first webhook delivery.
+for (const status of ['SUPERSEDED', 'EXPIRED'] as const) {
+  deploymentsTotal.labels({ status }).inc(0);
+}
 for (const action of ['opened', 'synchronize', 'reopened', 'closed'] as const) {
   webhookRequestsTotal.labels({ event: 'pull_request', action }).inc(0);
 }

@@ -127,7 +127,8 @@ if ! curl -fsS "http://127.0.0.1:$API_PORT/health" >/dev/null 2>&1; then
 fi
 
 echo "👷 Starting BullMQ worker + Desired-State Reconciler (interval=2000ms)..."
-REAPD_REPO_URL_OVERRIDE="$TMP_REPO" REAPD_BUILD_QUEUE="$TEST_QUEUE" REAPD_RECONCILE_INTERVAL_MS=2000 \
+WORKER_METRICS_PORT=19094
+REAPD_REPO_URL_OVERRIDE="$TMP_REPO" REAPD_BUILD_QUEUE="$TEST_QUEUE" REAPD_RECONCILE_INTERVAL_MS=2000 REAPD_WORKER_METRICS_PORT="$WORKER_METRICS_PORT" \
   node --import tsx "$ROOT/apps/worker/src/index.ts" >"$WORKER_LOG" 2>&1 &
 WORKER_PID=$!
 sleep 1
@@ -340,5 +341,26 @@ if [[ "$RESOURCES_GONE" != "1" ]]; then
   exit 1
 fi
 echo "✅ PR close transitioned Gen 3 LIVE -> EXPIRED and reconciler removed container + image"
+
+# Verify API and Worker Prometheus metrics recorded exact SUPERSEDED, EXPIRED, and orphan GC counts
+node - "http://127.0.0.1:$API_PORT/metrics" "http://127.0.0.1:$WORKER_METRICS_PORT/metrics" <<'NODE_EOF'
+const assert = require('node:assert/strict');
+const [apiMetricsUrl, workerMetricsUrl] = process.argv.slice(2);
+
+(async () => {
+  const apiText = await (await fetch(apiMetricsUrl)).text();
+  assert.match(apiText, /reapd_deployments_total\{[^}]*status="SUPERSEDED"[^}]*\}\s+2\b/);
+  assert.match(apiText, /reapd_deployments_total\{[^}]*status="EXPIRED"[^}]*\}\s+1\b/);
+
+  const workerText = await (await fetch(workerMetricsUrl)).text();
+  assert.match(workerText, /reapd_reconciler_orphans_removed_total\{[^}]*kind="container"[^}]*\}\s+[2-9]\d*/);
+  assert.match(workerText, /reapd_reconciler_orphans_removed_total\{[^}]*kind="image"[^}]*\}\s+[1-9]\d*/);
+  assert.match(workerText, /reapd_reconciler_last_success_timestamp_seconds\{[^}]*\}\s+[1-9]\d*/);
+  console.log('✅ Prometheus /metrics verified: 2 SUPERSEDED, 1 EXPIRED, and reconciler orphan GC counters');
+})().catch((err) => {
+  console.error(err);
+  process.exit(1);
+});
+NODE_EOF
 
 echo "✅ PASS: Phase 4 verification gate complete (3-commit superseding -> orphan container GC -> PR close container+image teardown)"

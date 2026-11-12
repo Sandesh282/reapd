@@ -30,6 +30,7 @@ import {
 } from '@reapd/types';
 import { registerDeploymentRoutes, type DeploymentRoutesDeps } from './routes/deployments.js';
 import {
+  deploymentsTotal,
   registry as metricsRegistry,
   webhookRejectionsTotal,
   webhookRequestsTotal,
@@ -351,6 +352,13 @@ export async function buildApp(opts?: BuildAppOptions): Promise<FastifyInstance>
       webhookRejectionsTotal.inc({ reason: 'duplicate' });
       app.log.info({ deliveryId }, 'Duplicate delivery — skipping');
       return { received: true, duplicate: true };
+    }
+
+    if (result.supersededIds.length > 0) {
+      deploymentsTotal.inc({ status: 'SUPERSEDED' }, result.supersededIds.length);
+    }
+    if ((result.expiredIds?.length ?? 0) > 0) {
+      deploymentsTotal.inc({ status: 'EXPIRED' }, result.expiredIds!.length);
     }
 
     for (const supersededId of result.supersededIds) {

@@ -128,6 +128,20 @@ export const reconcilerOrphansRemovedTotal = new Counter({
   registers: [registry],
 });
 
+/** Unix epoch timestamp (seconds) of the last successful reconciler sweep. */
+export const reconcilerLastSuccessTimestampSeconds = new Gauge({
+  name: 'reapd_reconciler_last_success_timestamp_seconds',
+  help: 'Unix timestamp in seconds of the last successful desired-state reconciler sweep.',
+  registers: [registry],
+});
+
+/** Total failed or timed-out reconciler sweeps. */
+export const reconcilerErrorsTotal = new Counter({
+  name: 'reapd_reconciler_errors_total',
+  help: 'Total failed or timed-out desired-state reconciler sweeps.',
+  registers: [registry],
+});
+
 // Pre-initialize counter label combinations at 0 (true at process start) so Prometheus
 // and Grafana immediately render counter lines instead of "No data".
 for (const status of ['LIVE', 'FAILED', 'SUPERSEDED', 'EXPIRED'] as const) {

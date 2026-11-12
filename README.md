@@ -283,19 +283,20 @@ The API and worker each expose Prometheus metrics (`prom-client`). `docker compo
 | Metric | Type | Source |
 |--------|------|--------|
 | `reapd_deployments_by_status{status}` | gauge | worker, PostgreSQL `GROUP BY status` every 15s (includes API-side `SUPERSEDED` and reconciler `EXPIRED`) |
-| `reapd_deployments_total{status}` | counter | worker & reconciler terminal transitions (`SUPERSEDED` counts worker-aborted builds; use `reapd_deployments_by_status` for queued supersedes) |
+| `reapd_deployments_total{status}` | counter | API (`SUPERSEDED`, PR-close `EXPIRED`) + worker (`LIVE`, `FAILED`) + reconciler (`EXPIRED`, `FAILED`), merged via `sum by (status)` |
 | `reapd_build_duration_seconds{result}` | histogram | worker, BuildKit image build (`succeeded`, `failed`, `aborted`) |
 | `reapd_queue_waiting`, `reapd_queue_active` | gauge | worker, BullMQ job counts every 15s |
 | `reapd_active_previews` | gauge | worker, `LIVE` deployment count every 15s |
 | `reapd_metrics_poll_last_success_timestamp_seconds` | gauge | worker, Unix timestamp of last successful Redis + DB metrics poll |
 | `reapd_smoke_results_total{result}` | counter | worker, Playwright outcomes |
 | `reapd_reconciler_sweep_duration_seconds` | histogram | reconciler sweep latency |
+| `reapd_reconciler_last_success_timestamp_seconds` | gauge | reconciler, Unix timestamp of last successful sweep |
 | `reapd_reconciler_expired_total`, `reapd_reconciler_fenced_total` | counter | reconciler TTL expirations and stuck-build fencing |
 | `reapd_reconciler_orphans_removed_total{kind}` | counter | reconciler orphan `container` / `image` cleanup |
 | `reapd_webhook_requests_total{event,action}` | counter | API, counted after HMAC verification |
 | `reapd_webhook_rejections_total{reason}` | counter | API, rejected/deduplicated deliveries (`invalid_signature`, `fork_rejected`, `duplicate`, etc.) |
 
-Endpoints: API at `http://127.0.0.1:3001/metrics` (with best-effort rejection of common reverse-proxy/tunnel headers like `X-Forwarded-*`, `Forwarded`, `X-Real-IP`, `CF-Connecting-IP`), worker at `http://127.0.0.1:9091/metrics` (override with `REAPD_WORKER_METRICS_HOST` / `REAPD_WORKER_METRICS_PORT`). Both bind to `127.0.0.1` by default — on Docker Desktop (`macOS`/`Windows`), `host.docker.internal` reaches host loopback directly; on Linux, where `host-gateway` resolves to the Docker bridge IP, set `REAPD_WORKER_METRICS_HOST` (and API `HOST`) to the bridge IP or run Prometheus with host networking.
+Endpoints: API at `http://127.0.0.1:3001/metrics` (with best-effort rejection of common reverse-proxy/tunnel headers like `X-Forwarded-*`, `Forwarded`, `X-Real-IP`, `CF-Connecting-IP`), worker at `http://127.0.0.1:9091/metrics` (override with `REAPD_WORKER_METRICS_HOST` / `REAPD_WORKER_METRICS_PORT`). Both bind to `127.0.0.1` by default — on Docker Desktop (`macOS`/`Windows`), `host.docker.internal` reaches host loopback directly; on Linux, where `host-gateway` resolves to the Docker bridge IP, set `REAPD_WORKER_METRICS_HOST` and `REAPD_API_HOST` to the bridge IP or run Prometheus with host networking.
 
 ---
 

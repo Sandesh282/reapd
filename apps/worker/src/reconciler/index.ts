@@ -33,8 +33,10 @@ import {
 } from '@reapd/docker-client';
 import {
   deploymentsTotal,
+  reconcilerErrorsTotal,
   reconcilerExpiredTotal,
   reconcilerFencedTotal,
+  reconcilerLastSuccessTimestampSeconds,
   reconcilerOrphansRemovedTotal,
   reconcilerSweepDurationSeconds,
 } from '../metrics.js';
@@ -180,6 +182,8 @@ export async function runReconcileSweep(
     // ── 4c. Sweep stale `/tmp/reapd-build-*` directories from crashed workers ─
     const removedTmpDirs = await sweepStaleTempBuildDirs(tmpDirMaxAgeMs, tmpRootDir);
 
+    reconcilerLastSuccessTimestampSeconds.set(Date.now() / 1000);
+
     return {
       expiredDeploymentIds,
       fencedDeploymentIds,
@@ -187,6 +191,9 @@ export async function runReconcileSweep(
       removedImageTags,
       removedTmpDirs,
     };
+  } catch (err) {
+    reconcilerErrorsTotal.inc();
+    throw err;
   } finally {
     reconcilerSweepDurationSeconds.observe(Math.max(0, (Date.now() - sweepStartMs) / 1000));
   }
