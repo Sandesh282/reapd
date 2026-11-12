@@ -18,8 +18,9 @@
 ![Traefik](https://img.shields.io/badge/Traefik-v3.6-24A1C1?logo=traefikproxy&logoColor=white)
 ![Docker](https://img.shields.io/badge/Docker-Engine-2496ED?logo=docker&logoColor=white)
 
-> Push a commit → watch it build, test, and go live in a sandboxed container —  
-> all piped to your terminal in real time, with a sticky GitHub PR comment linking the preview.
+> A self-hosted preview environment engine. Containerised builds, 8-byte Docker stream demux,  
+> Redis Streams → SSE log replay, SSRF-guarded Playwright smoke checks,  
+> and zero-reload Traefik routing — wired together on a single Linux host.
 
 </div>
 
@@ -27,7 +28,7 @@
 
 ## Why reapd?
 
-Most preview-environment platforms are hosted SaaS with per-seat pricing, opaque build queues, and no insight into what happens inside the sandbox. reapd is a self-hosted alternative that exposes every layer: a GitHub App webhook hits a Fastify API, a BullMQ worker clones and builds the commit in an isolated Docker container, build logs stream over Redis Streams → Server-Sent Events to an `@xterm/xterm` terminal in the browser, and a Playwright smoke runner validates the preview before it goes `LIVE`. The whole lifecycle — from `git push` to sticky PR comment — runs on a single Linux host with no cloud dependencies.
+Most preview-environment platforms are hosted SaaS with per-seat pricing, opaque build queues, and no insight into what happens inside the sandbox. reapd is a self-hosted alternative that exposes every layer: a GitHub App webhook hits a Fastify API, a BullMQ worker clones and builds the commit in an isolated Docker container, build logs stream over Redis Streams → Server-Sent Events to an `@xterm/xterm` terminal in the browser, and a Playwright smoke runner validates the preview before it goes `LIVE`. The whole lifecycle, from `git push` to sticky PR comment, runs on a single Linux host with no cloud dependencies.
 
 ---
 
@@ -70,25 +71,27 @@ flowchart TD
     DASH -->|"polls /deployments"| API
 ```
 
-**Control Plane** handles ingestion, state, and streaming — no Docker socket exposure. **Execution Plane** does the dirty work inside locked containers on an isolated network bridge. The two planes share only Redis (queue + streams) and Postgres (state).
+**Control Plane** handles ingestion, state, and streaming; hence no Docker socket exposure. **Execution Plane** does the dirty work inside locked containers on an isolated network bridge. The two planes share only Redis (queue + streams) and Postgres (state).
 
 ---
 
 ## Core Engineering Decisions
 
-### 1 · 8-Byte Docker Stream Demultiplexing → Redis Streams → SSE
+### 1 · The Docker log stream isn't just bytes
 
-Docker's `container/attach` and `logs` endpoints multiplex `stdout` and `stderr` into a single byte stream using an 8-byte frame header: `[stream_type (1), padding (3), payload_length (4)]`. Naive line-reading breaks on this because a single `\n`-terminated line can be split across two frames, or two lines can share one frame.
+When you attach to a Docker container, you don't get raw stdout. The API multiplexes `stdout` and `stderr` into a single byte stream where every chunk is prefixed by an 8-byte header: 1 byte for stream type, 3 bytes of padding, 4 bytes for payload length. Split on `\n` directly and you'll corrupt lines that span frame boundaries or mash two lines that share one frame.
 
-[`packages/docker-client/src/log-demux.ts`](packages/docker-client/src/log-demux.ts) maintains a carry buffer and a state machine (`HEADER` → `PAYLOAD`) that reassembles frames before splitting on `\n`. Each reassembled line is tagged `stdout` or `stderr` and handed to the worker's log sink.
+[`packages/docker-client/src/log-demux.ts`](packages/docker-client/src/log-demux.ts) handles this with a carry buffer and a two-state machine (`HEADER` to `PAYLOAD`). It reassembles frames first, then splits on newlines, tagging each line `stdout` or `stderr` before passing it upstream.
 
-The sink ([`apps/worker/src/logs/log-sink.ts`](apps/worker/src/logs/log-sink.ts)) batches lines into a Redis Stream (`XADD build-log:<id> MAXLEN ~ 2000`) with a background async flush so a synchronous 1,500-line build burst never blocks the event loop. Every flush also runs `EXPIRE 6h` on the stream key so orphaned streams self-clean.
+From there, the worker's log sink ([`apps/worker/src/logs/log-sink.ts`](apps/worker/src/logs/log-sink.ts)) batches lines into a Redis Stream (`XADD build-log:<id> MAXLEN ~ 2000`) with an async background flush, so a 1,500-line burst from a noisy build step doesn't stall the event loop. Every flush also refreshes a 6h `EXPIRE` on the key, so streams from crashed workers don't accumulate forever.
 
-The API's SSE route ([`apps/api/src/routes/deployments.ts`](apps/api/src/routes/deployments.ts)) reads from the stream using `XREAD COUNT 100 BLOCK 2000 STREAMS build-log:<id> <cursor>` and respects the browser's `Last-Event-ID` header, so a tab that reconnects mid-build replays from its last confirmed entry — no lines dropped. A forged-line guard (`source === 'system'` check) ensures clients cannot inject fake `end:LIVE` markers. If the worker died before writing the end marker, the route falls back to `XINFO STREAM` to detect a stalled stream and closes the SSE cleanly.
+On the read side, the SSE route ([`apps/api/src/routes/deployments.ts`](apps/api/src/routes/deployments.ts)) uses `XREAD BLOCK 2000` with the browser's `Last-Event-ID` as the cursor, so a tab that reconnects mid-build picks up exactly where it left off. Two edge cases worth mentioning: the route rejects any entry where `source !== 'system'` to block forged `end:LIVE` markers injected via a malicious build step, and if the worker died before writing the end marker, `XINFO STREAM` lets the route detect a stalled stream and close the SSE connection cleanly instead of hanging.
 
-### 2 · Zero-Reload Wildcard Routing via Traefik v3 Label Injection
+### 2 · Routing without reloads
 
-Each preview container gets a unique subdomain (`pr-<number>.preview.localhost` locally, `pr-<number>.preview.reapd.sh` in production). Instead of reloading a config file, reapd sets Traefik v3 container labels at `docker create` time:
+Every preview gets a subdomain (`pr-<n>.preview.localhost` locally, `pr-<n>.preview.reapd.sh` in production). The obvious approach is to write an nginx or Traefik config file and reload it. The problem is that config reloads drop in-flight connections, and at high throughput you're doing this for every push.
+
+Instead, reapd stamps each container at `docker create` time with Traefik v3 labels:
 
 ```
 traefik.enable=true
@@ -97,46 +100,38 @@ traefik.http.routers.pr-{n}.entrypoints=websecure
 traefik.http.services.pr-{n}.loadbalancer.server.port={containerPort}
 ```
 
-Traefik watches the Docker socket via a socket-proxy (read-only, no `exec`, no `post`) and picks up the new container within ~50 ms without a process restart or config reload. When the container is reaped, Traefik drops the route automatically because the labels disappear with the container.
+Traefik watches the Docker socket through a read-only TCP socket-proxy (no `exec`, no `post`, no host escape) and picks up the new route within ~50 ms. When the container is reaped, the route disappears with it. No cleanup step, no stale config entry.
 
-### 3 · Generation Fencing + Rapid-Push Superseding
+### 3 · Rapid pushes without zombie containers
 
-When a developer pushes three commits in five seconds, three webhooks arrive concurrently. Without coordination, all three would race to become `LIVE` and leave two zombie containers running.
+Push three commits in five seconds and you get three webhooks, three BullMQ jobs, and three workers racing to build. Without coordination, all three finish and you end up with three `LIVE` containers for the same PR, two of which are orphaned.
 
-reapd solves this with a **monotonic generation counter** per pull request and a two-layer lock:
+The fix is a monotonic generation counter on the `pull_requests` row, combined with two layers of cancellation:
 
-1. **Database lock** — `SELECT … FOR UPDATE` on the `pull_requests` row, then increment `latest_generation`. Any worker whose `generation < latest_generation` at transition time calls `transitionDeploymentStatus('SUPERSEDED')` and exits.
-2. **Redis pub/sub abort** — The worker that wins the lock publishes to `cancel:deploy:<id>`. Losing workers subscribe to this channel and receive an `AbortSignal` abort within < 1 s, stopping the Docker build mid-flight without polling.
+1. Each worker takes a `SELECT ... FOR UPDATE` on the PR row and reads `latest_generation`. If its own generation is already stale, it transitions to `SUPERSEDED` immediately and exits. If it wins, it increments the counter, making every other in-flight worker stale on their next check.
+2. The winning worker also publishes to `cancel:deploy:<id>`. Losing workers subscribe to this channel and receive an `AbortSignal` within < 1 s, stopping the Docker build mid-flight. No polling, no waiting for the next DB round-trip.
 
-The combination means a superseded build stops within a second of the newer push arriving, not at the next DB poll interval.
+A superseded build stops within a second of the newer push arriving.
 
-### 4 · Playwright Smoke Runner + SSRF Guard + Sticky PR Comment
+### 4 · Smoke testing without letting the page call home
 
-After a container passes the `STARTING` health-check, the worker enters the `TESTING` state and runs a headless Playwright probe ([`apps/worker/src/smoke/smoke-runner.ts`](apps/worker/src/smoke/smoke-runner.ts)). Three criteria must all pass:
+Once a container passes its `STARTING` health check, the deployment moves to `TESTING` and a headless Playwright probe runs against the preview URL ([`apps/worker/src/smoke/smoke-runner.ts`](apps/worker/src/smoke/smoke-runner.ts)). Three things have to be true for it to pass:
 
 | Criterion | Check |
 |-----------|-------|
 | HTTP status | `< 400` |
-| Rendered content | `document.body.innerText.trim().length > 0` **or** a visual element (`img`, `canvas`, `svg`, `video`, `iframe`) is present — catches blank SPA shells |
+| Rendered content | `document.body.innerText.trim().length > 0` or a visual element (`img`, `canvas`, `svg`, `video`, `iframe`) is present. A blank SPA shell with nothing but `<div id="root"></div>` fails. |
 | Zero errors | `console.error` count + uncaught `pageerror` count = 0 |
 
-**SSRF guard** — `context.route()` (not `page.route()`, which misses service workers) intercepts every outbound request the preview page makes. `isAllowedSmokeRequestUrl` permits only the preview's exact origin (`scheme + host + port`) and public CDN assets, and aborts:
-- Any `localhost` / `*.localhost` origin other than the preview's own
-- Single-label hostnames (e.g. `redis`, `postgres`)
-- `.internal` / `.lan` suffixes
-- Loopback IPs: `127.x.x.x`, `::1`, IPv4-mapped IPv6 `::ffff:7f00:0/112`
-- Trailing-dot variants (stripped before every check: `localhost.` → `localhost`)
-- Non-standard ports on the preview hostname
+The tricky part is SSRF. The preview page runs arbitrary user code and can make fetch calls to `redis`, `postgres`, `169.254.169.254`, or any internal host the Docker network can reach. `context.route()` (not `page.route()`, which doesn't cover service workers) intercepts every outbound request and runs it through `isAllowedSmokeRequestUrl`. The only things that get through are the preview's own origin and public CDN assets. Everything else is aborted before it touches the network: private IP ranges, loopback, single-label hostnames, `.internal`/`.lan`, IPv4-mapped IPv6 like `::ffff:7f00:1`, trailing-dot variants.
 
-If Chromium is not installed, the probe returns `SKIPPED` (via `SmokeUnavailableError`) — this does **not** fail the deployment, so the worker gracefully degrades on hosts without a browser binary.
+If Chromium isn't installed, the probe returns `SKIPPED` via `SmokeUnavailableError` and the deployment still goes `LIVE`. It just skips the visual check. All error strings are run through `redactSecrets()` before truncation, so tokens or passwords that leak into `console.error` never reach `test_runs.failure_message` or the public API.
 
-All error messages are **redacted before truncation** (`redactSecrets()` runs before `slice(0, 200)`) so GitHub tokens or Basic auth credentials in a page's console output can never reach `test_runs.failure_message` or the unauthenticated API.
+After the smoke result is committed, `upsertPrComment` ([`apps/worker/src/github/pr-comment.ts`](apps/worker/src/github/pr-comment.ts)) updates the sticky PR comment in-place: `POST` on first deploy, `PATCH` on every subsequent generation, `POST` again if the original was deleted with the orphaned duplicate cleaned up immediately. The comment ID lives in `pull_requests.sticky_comment_id` with an optimistic-lock check, so a concurrent supersede can't leave two comments on the same PR.
 
-**Sticky PR comment** — `upsertPrComment` ([`apps/worker/src/github/pr-comment.ts`](apps/worker/src/github/pr-comment.ts)) follows a `POST → PATCH → 404-fallback → orphan-DELETE` strategy. It stores the GitHub comment ID in `pull_requests.sticky_comment_id` with an optimistic-lock check (`setStickyCommentId` returns `false` if superseded while posting, then deletes the orphaned new comment). The comment is updated — never duplicated — across every generation of the same PR.
+### 5 · State machine enforced at the database, not in application code
 
-### 5 · Deployment State Machine + Idempotent Webhook Ingestion
-
-Every deployment follows a strict one-way state machine enforced at the database level:
+The deployment lifecycle is a strict one-way graph:
 
 ```
 QUEUED → BUILDING → STARTING → TESTING → LIVE
@@ -145,9 +140,9 @@ QUEUED → BUILDING → STARTING → TESTING → LIVE
 LIVE → EXPIRED  (TTL-elapsed, via reconciler)
 ```
 
-Valid transitions are enforced by `transitionDeploymentStatus`, which does a `UPDATE … WHERE status = $expected RETURNING *` — if the row has already moved on (e.g. SUPERSEDED by a concurrent push), the update matches zero rows and the function throws, preventing double-transitions.
+Transitions go through a single `UPDATE ... WHERE status = $expected RETURNING *`. If the row has already moved because a concurrent push superseded it or the reconciler expired it, the update matches zero rows and the function throws. There's no way to double-transition or rewind; the DB enforces it.
 
-Webhook idempotency is handled by `(repo_id, pr_number, head_sha)` uniqueness: a re-delivered `push` event for the same SHA upserts the existing deployment row rather than creating a duplicate job. A `generation` column ensures the BullMQ job for the stale generation self-terminates if a newer one has already claimed the lock.
+Webhook idempotency works the same way. `(repo_id, pr_number, head_sha)` has a unique constraint, so a re-delivered webhook upserts the existing row instead of queuing a duplicate job. The `generation` column handles the race where a stale BullMQ job finally dequeues after a newer generation has already won the lock. It checks, sees it's behind, and exits without touching the container or the DB.
 
 ---
 
@@ -286,5 +281,3 @@ bash infra/scripts/phase6-smoke.sh    # Phase 6 — Playwright smoke + PR commen
 - **k6 load tests** — 10-commit rapid-push superseding stress test, webhook ingestion p95, SSE reconnect under load
 - **OpenTelemetry traces** — per-deployment span from webhook receipt to `LIVE`, exported to a self-hosted Tempo instance
 - **Grafana dashboard** — build queue depth, reconciler sweep latency, active preview count
-
-
