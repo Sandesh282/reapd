@@ -212,6 +212,8 @@ export async function buildJobHandler(job: Job<BuildJobPayload>): Promise<void> 
       },
     });
 
+    const buildStartMs = Date.now();
+    let buildResultLabel: 'succeeded' | 'failed' | 'aborted' = 'failed';
     try {
       sink.write('system', 'stdout', `[reapd] Building image ${imageTag} with BuildKit...`);
       const built = await buildDockerImage({
@@ -227,9 +229,16 @@ export async function buildJobHandler(job: Job<BuildJobPayload>): Promise<void> 
         },
       });
       buildDurationMs = built.buildDurationMs;
-      buildDurationSeconds.observe(buildDurationMs / 1000);
+      buildResultLabel = 'succeeded';
       sink.write('system', 'stdout', `[reapd] Image ${imageTag} built in ${buildDurationMs}ms`);
+    } catch (buildErr) {
+      if (ac.signal.aborted || buildErr instanceof AbortError) {
+        buildResultLabel = 'aborted';
+      }
+      throw buildErr;
     } finally {
+      const elapsedSec = Math.max(0, (buildDurationMs ?? Date.now() - buildStartMs) / 1000);
+      buildDurationSeconds.observe({ result: buildResultLabel }, elapsedSec);
       await cloned.cleanup().catch((err: unknown) => {
         const msg = err instanceof Error ? err.message : String(err);
         console.warn(`⚠️  Failed to remove temp clone dir: ${msg}`);
@@ -397,14 +406,17 @@ export async function buildJobHandler(job: Job<BuildJobPayload>): Promise<void> 
         await sink.flush();
       }
 
-      await transitionDeploymentStatus(db, {
+      const abortTrans = await transitionDeploymentStatus(db, {
         deploymentId,
         toStatus: targetStatus,
         reason: abortReason,
       }).catch((dbErr: unknown) => {
         console.warn(`⚠️  Failed to record ${targetStatus} status for ${deploymentId}:`, dbErr);
+        return null;
       });
-      deploymentsTotal.inc({ status: targetStatus });
+      if (abortTrans?.transitioned) {
+        deploymentsTotal.inc({ status: targetStatus });
+      }
       return;
     }
 
@@ -431,9 +443,10 @@ export async function buildJobHandler(job: Job<BuildJobPayload>): Promise<void> 
 
     if (failTrans) {
       finalBuildStatus = toBuildLogEndStatus(failTrans.finalStatus);
+      if (failTrans.transitioned) {
+        deploymentsTotal.inc({ status: finalBuildStatus });
+      }
     }
-
-    deploymentsTotal.inc({ status: finalBuildStatus });
 
     // Seal the build log stream AFTER committing the DB status and BEFORE calling GitHub
     // (`sink.end()` is idempotent via its internal `ended` flag, so the `finally` call is a no-op).

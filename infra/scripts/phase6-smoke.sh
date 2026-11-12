@@ -514,7 +514,7 @@ const [apiMetricsUrl, workerMetricsUrl] = process.argv.slice(2);
   assert.match(workerText, /reapd_deployments_total\{[^}]*status="FAILED"[^}]*\}\s+1\b/);
   assert.match(workerText, /reapd_smoke_results_total\{[^}]*result="PASSED"[^}]*\}\s+2\b/);
   assert.match(workerText, /reapd_smoke_results_total\{[^}]*result="FAILED"[^}]*\}\s+1\b/);
-  assert.match(workerText, /reapd_build_duration_seconds_count\{[^}]*\}\s+3\b/);
+  assert.match(workerText, /reapd_build_duration_seconds_count\{[^}]*result="succeeded"[^}]*\}\s+3\b/);
   console.log('✅ Prometheus /metrics verified on API and Worker (deployments, smoke results, build duration, webhooks)');
 })().catch((err) => {
   console.error(err);

@@ -10,10 +10,17 @@ import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Worker, Queue } from 'bullmq';
 import { Redis } from 'ioredis';
-import { db, countLiveDeployments } from '@reapd/db';
+import { db, countDeploymentsByStatus } from '@reapd/db';
+import type { DeploymentStatus } from '@reapd/types';
 import { abortAllActiveBuilds, buildJobHandler, type BuildJobPayload } from './jobs/build.js';
 import { redactSecrets } from './logs/log-sink.js';
-import { registry, queueWaiting, queueActive, activePreviews } from './metrics.js';
+import {
+  registry,
+  queueWaiting,
+  queueActive,
+  activePreviews,
+  deploymentsByStatus,
+} from './metrics.js';
 import { startReconciler } from './reconciler/index.js';
 
 export * from './builder/git-clone.js';
@@ -56,27 +63,40 @@ if (isMainModule) {
 
   const stopReconciler = startReconciler();
 
-  // ── Prometheus queue-depth + active-previews poller ──────────────────────
+  // ── Prometheus queue-depth + DB status poller ────────────────────────────
+  const metricsRedis = new Redis(redisUrl, { maxRetriesPerRequest: null });
   const metricsQueue = new Queue<BuildJobPayload>(queueName, {
-    connection: new Redis(redisUrl, { maxRetriesPerRequest: null }),
+    connection: metricsRedis,
   });
 
+  let isPollingMetrics = false;
   let lastMetricsWarnAt = 0;
   const pollMetrics = async (): Promise<void> => {
+    if (isPollingMetrics) return;
+    isPollingMetrics = true;
     try {
-      const counts = await metricsQueue.getJobCounts('waiting', 'active');
-      queueWaiting.set(counts.waiting ?? 0);
+      const [counts, statusCounts] = await Promise.all([
+        metricsQueue.getJobCounts('waiting', 'active', 'delayed'),
+        countDeploymentsByStatus(db),
+      ]);
+      queueWaiting.set((counts.waiting ?? 0) + (counts.delayed ?? 0));
       queueActive.set(counts.active ?? 0);
-      const liveCount = await countLiveDeployments(db);
-      activePreviews.set(liveCount);
+      activePreviews.set(statusCounts.LIVE);
+      for (const [status, count] of Object.entries(statusCounts) as Array<
+        [DeploymentStatus, number]
+      >) {
+        deploymentsByStatus.set({ status }, count);
+      }
     } catch (err) {
       // Non-fatal (metrics may lag during Redis/DB hiccups), but surface it at most once a minute
-      // so a broken connection is visible instead of silently reporting zeros.
+      // so a broken connection is visible instead of silently reporting stale numbers.
       if (Date.now() - lastMetricsWarnAt > 60_000) {
         lastMetricsWarnAt = Date.now();
         const msg = err instanceof Error ? err.message : String(err);
         console.warn(`⚠️  Metrics poll failed: ${redactSecrets(msg)}`);
       }
+    } finally {
+      isPollingMetrics = false;
     }
   };
 
@@ -87,13 +107,22 @@ if (isMainModule) {
   const METRICS_PORT = Number(process.env['REAPD_WORKER_METRICS_PORT'] ?? 9091);
   const METRICS_HOST = process.env['REAPD_WORKER_METRICS_HOST'] ?? '127.0.0.1';
   const metricsServer = createServer(async (req, res) => {
-    if (req.url === '/metrics' && req.method === 'GET') {
-      const metrics = await registry.metrics();
-      res.writeHead(200, { 'Content-Type': registry.contentType });
-      res.end(metrics);
-    } else {
-      res.writeHead(404);
-      res.end('Not found');
+    try {
+      if (req.url === '/metrics' && req.method === 'GET') {
+        const metrics = await registry.metrics();
+        res.writeHead(200, { 'Content-Type': registry.contentType });
+        res.end(metrics);
+      } else {
+        res.writeHead(404);
+        res.end('Not found');
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.warn(`⚠️  Failed to serialize worker metrics: ${redactSecrets(msg)}`);
+      if (!res.headersSent) {
+        res.writeHead(500);
+      }
+      res.end('Internal Server Error');
     }
   });
   // Metrics are best-effort: a port conflict (e.g. a second worker on the same host, or a smoke
@@ -127,16 +156,18 @@ if (isMainModule) {
 
   const shutdown = async (): Promise<void> => {
     console.log('🛑 Shutting down worker...');
+    // Stop timers and signal active builds to abort FIRST before awaiting any Redis/network close.
     clearInterval(metricsPoller);
-    // Prometheus keeps scrape connections alive; drop them so close() can complete.
-    metricsServer.closeAllConnections();
-    metricsServer.close();
-    await metricsQueue.close().catch(() => {});
     stopReconciler();
     abortAllActiveBuilds();
+    // Prometheus keeps scrape connections alive; drop them so close() can complete immediately.
+    metricsServer.closeAllConnections();
+    metricsServer.close();
     try {
       await worker.close();
     } finally {
+      await metricsQueue.close().catch(() => {});
+      await metricsRedis.quit().catch(() => {});
       await redis.quit().catch(() => {});
       process.exit(0);
     }

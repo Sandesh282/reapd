@@ -282,14 +282,19 @@ The API and worker each expose Prometheus metrics (`prom-client`). `docker compo
 
 | Metric | Type | Source |
 |--------|------|--------|
-| `reapd_deployments_total{status}` | counter | worker, per terminal state |
-| `reapd_build_duration_seconds` | histogram | worker, BuildKit image build |
+| `reapd_deployments_by_status{status}` | gauge | worker, PostgreSQL `GROUP BY status` every 15s |
+| `reapd_deployments_total{status}` | counter | worker & reconciler terminal transitions |
+| `reapd_build_duration_seconds{result}` | histogram | worker, BuildKit image build (`succeeded`, `failed`, `aborted`) |
 | `reapd_queue_waiting`, `reapd_queue_active` | gauge | worker, BullMQ job counts every 15s |
 | `reapd_active_previews` | gauge | worker, `LIVE` deployment count every 15s |
 | `reapd_smoke_results_total{result}` | counter | worker, Playwright outcomes |
+| `reapd_reconciler_sweep_duration_seconds` | histogram | reconciler sweep latency |
+| `reapd_reconciler_expired_total`, `reapd_reconciler_fenced_total` | counter | reconciler TTL expirations and stuck-build fencing |
+| `reapd_reconciler_orphans_removed_total{kind}` | counter | reconciler orphan `container` / `image` cleanup |
 | `reapd_webhook_requests_total{event,action}` | counter | API, counted after HMAC verification |
+| `reapd_webhook_rejections_total{reason}` | counter | API, rejected/deduplicated deliveries (`invalid_signature`, `fork_rejected`, `duplicate`, etc.) |
 
-Endpoints: API at `http://127.0.0.1:3001/metrics`, worker at `http://127.0.0.1:9091/metrics` (override with `REAPD_WORKER_METRICS_HOST` / `REAPD_WORKER_METRICS_PORT`). Both are loopback only by default. If Prometheus in Docker can't reach the worker, set `REAPD_WORKER_METRICS_HOST=0.0.0.0` and firewall the port.
+Endpoints: API at `http://127.0.0.1:3001/metrics` (rejects proxied `X-Forwarded-*` requests with `403` so webhook tunnels do not leak metrics), worker at `http://127.0.0.1:9091/metrics` (override with `REAPD_WORKER_METRICS_HOST` / `REAPD_WORKER_METRICS_PORT`).
 
 ---
 

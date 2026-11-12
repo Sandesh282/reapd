@@ -2,7 +2,7 @@
   "title": "reapd",
   "uid": "reapd-overview",
   "schemaVersion": 39,
-  "version": 1,
+  "version": 2,
   "refresh": "15s",
   "time": { "from": "now-1h", "to": "now" },
   "panels": [
@@ -13,8 +13,8 @@
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
       "datasource": { "type": "prometheus", "uid": "reapd-prometheus" },
       "targets": [
-        { "refId": "A", "expr": "reapd_queue_waiting", "legendFormat": "waiting" },
-        { "refId": "B", "expr": "reapd_queue_active", "legendFormat": "active" }
+        { "refId": "A", "expr": "max(reapd_queue_waiting)", "legendFormat": "waiting" },
+        { "refId": "B", "expr": "max(reapd_queue_active)", "legendFormat": "active" }
       ]
     },
     {
@@ -23,18 +23,18 @@
       "title": "Active previews (LIVE)",
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
       "datasource": { "type": "prometheus", "uid": "reapd-prometheus" },
-      "targets": [{ "refId": "A", "expr": "reapd_active_previews" }]
+      "targets": [{ "refId": "A", "expr": "max(reapd_active_previews)" }]
     },
     {
       "id": 3,
       "type": "timeseries",
-      "title": "Deployment outcomes (per 5m)",
+      "title": "Deployments by status (PostgreSQL state)",
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
       "datasource": { "type": "prometheus", "uid": "reapd-prometheus" },
       "targets": [
         {
           "refId": "A",
-          "expr": "sum by (status) (increase(reapd_deployments_total[5m]))",
+          "expr": "max by (status) (reapd_deployments_by_status)",
           "legendFormat": "{{status}}"
         }
       ]
@@ -48,7 +48,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum by (result) (increase(reapd_smoke_results_total[5m]))",
+          "expr": "round(sum by (result) (increase(reapd_smoke_results_total[5m])))",
           "legendFormat": "{{result}}"
         }
       ]
@@ -56,19 +56,19 @@
     {
       "id": 5,
       "type": "timeseries",
-      "title": "Build duration p50 / p95",
+      "title": "Build duration p50 / p95 (15m window)",
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
       "datasource": { "type": "prometheus", "uid": "reapd-prometheus" },
       "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
       "targets": [
         {
           "refId": "A",
-          "expr": "histogram_quantile(0.5, sum by (le) (rate(reapd_build_duration_seconds_bucket[5m])))",
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(reapd_build_duration_seconds_bucket[15m])))",
           "legendFormat": "p50"
         },
         {
           "refId": "B",
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(reapd_build_duration_seconds_bucket[5m])))",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(reapd_build_duration_seconds_bucket[15m])))",
           "legendFormat": "p95"
         }
       ]
@@ -76,17 +76,21 @@
     {
       "id": 6,
       "type": "timeseries",
-      "title": "Webhooks received (per 5m)",
+      "title": "Webhooks received & rejected (per 5m)",
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
       "datasource": { "type": "prometheus", "uid": "reapd-prometheus" },
       "targets": [
         {
           "refId": "A",
-          "expr": "sum by (event, action) (increase(reapd_webhook_requests_total[5m]))",
+          "expr": "round(sum by (event, action) (increase(reapd_webhook_requests_total[5m])))",
           "legendFormat": "{{event}}/{{action}}"
+        },
+        {
+          "refId": "B",
+          "expr": "round(sum by (reason) (increase(reapd_webhook_rejections_total[5m])))",
+          "legendFormat": "rejected:{{reason}}"
         }
       ]
     }
   ]
 }
-

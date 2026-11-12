@@ -29,7 +29,11 @@ import {
   type VerifiedPrWebhook,
 } from '@reapd/types';
 import { registerDeploymentRoutes, type DeploymentRoutesDeps } from './routes/deployments.js';
-import { registry as metricsRegistry, webhookRequestsTotal } from './metrics.js';
+import {
+  registry as metricsRegistry,
+  webhookRejectionsTotal,
+  webhookRequestsTotal,
+} from './metrics.js';
 
 export * from './routes/deployments.js';
 
@@ -132,9 +136,16 @@ export async function buildApp(opts?: BuildAppOptions): Promise<FastifyInstance>
     await reply.send({ ok: true });
   });
 
-  // Prometheus scrape endpoint. The API binds to loopback by default; if you expose it,
-  // restrict /metrics at the proxy layer.
-  app.get('/metrics', async (_req, reply) => {
+  // Prometheus scrape endpoint. Rejects proxied/tunneled requests (`X-Forwarded-*`) so a
+  // webhook tunnel (e.g. ngrok / Cloudflare Tunnel) pointing at :3001 never exposes /metrics.
+  app.get('/metrics', async (req, reply) => {
+    if (
+      req.headers['x-forwarded-for'] !== undefined ||
+      req.headers['x-forwarded-host'] !== undefined ||
+      req.headers['x-forwarded-proto'] !== undefined
+    ) {
+      return reply.status(403).send({ error: 'Metrics endpoint is not accessible via proxy' });
+    }
     const body = await metricsRegistry.metrics();
     await reply.header('Content-Type', metricsRegistry.contentType).send(body);
   });
@@ -151,16 +162,19 @@ export async function buildApp(opts?: BuildAppOptions): Promise<FastifyInstance>
     const deliveryId = req.headers['x-github-delivery']   as string | undefined;
 
     if (!sigHeader || !eventType || !deliveryId || !UUID_REGEX.test(deliveryId)) {
+      webhookRejectionsTotal.inc({ reason: 'invalid_headers' });
       return reply.status(400).send({ error: 'Missing or invalid required GitHub webhook headers' });
     }
 
     // ── Step 2: HMAC verification (runs before JSON.parse) ────────────────────
     const rawBody = (req as unknown as Record<string, unknown>)['rawBody'] as Buffer | undefined;
     if (!rawBody) {
+      webhookRejectionsTotal.inc({ reason: 'invalid_headers' });
       return reply.status(415).send({ error: 'Expected application/json webhook payload' });
     }
 
     if (!verifySignature(rawBody, sigHeader, webhookSecret)) {
+      webhookRejectionsTotal.inc({ reason: 'invalid_signature' });
       return reply.status(401).send({ error: 'Invalid webhook signature' });
     }
 
@@ -168,6 +182,7 @@ export async function buildApp(opts?: BuildAppOptions): Promise<FastifyInstance>
     try {
       parsedBody = JSON.parse(rawBody.toString('utf8')) as Record<string, unknown>;
     } catch {
+      webhookRejectionsTotal.inc({ reason: 'malformed_json' });
       return reply.status(400).send({ error: 'Malformed JSON body' });
     }
 
@@ -279,6 +294,7 @@ export async function buildApp(opts?: BuildAppOptions): Promise<FastifyInstance>
       payload.action !== 'closed' &&
       (!headRepo || headRepo.id !== payload.repository.id)
     ) {
+      webhookRejectionsTotal.inc({ reason: 'fork_rejected' });
       app.log.warn(
         { headRepoId: headRepo?.id ?? null, baseRepoId: payload.repository.id },
         'Ignoring pull_request from external or deleted fork',
@@ -328,6 +344,7 @@ export async function buildApp(opts?: BuildAppOptions): Promise<FastifyInstance>
     const result = await ingestPullRequestWebhook(db, webhook);
 
     if (result.duplicate) {
+      webhookRejectionsTotal.inc({ reason: 'duplicate' });
       app.log.info({ deliveryId }, 'Duplicate delivery — skipping');
       return { received: true, duplicate: true };
     }

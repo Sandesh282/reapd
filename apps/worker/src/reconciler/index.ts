@@ -31,6 +31,13 @@ import {
   listManagedImages,
   removeImage,
 } from '@reapd/docker-client';
+import {
+  deploymentsTotal,
+  reconcilerExpiredTotal,
+  reconcilerFencedTotal,
+  reconcilerOrphansRemovedTotal,
+  reconcilerSweepDurationSeconds,
+} from '../metrics.js';
 
 const DEFAULT_RECONCILE_INTERVAL_MS = 60_000;
 const DEFAULT_STUCK_BUILD_MINUTES = 20;
@@ -60,6 +67,7 @@ export interface ReconcileSweepResult {
 export async function runReconcileSweep(
   opts?: ReconcileSweepOptions
 ): Promise<ReconcileSweepResult> {
+  const sweepStartMs = Date.now();
   const dbClient = opts?.dbClient ?? db;
   const dockerClient = opts?.dockerClient ?? createDockerClient();
 
@@ -160,6 +168,22 @@ export async function runReconcileSweep(
 
   // ── 4c. Sweep stale `/tmp/reapd-build-*` directories from crashed workers ─
   const removedTmpDirs = await sweepStaleTempBuildDirs(tmpDirMaxAgeMs, tmpRootDir);
+
+  if (expiredDeploymentIds.length > 0) {
+    reconcilerExpiredTotal.inc(expiredDeploymentIds.length);
+    deploymentsTotal.inc({ status: 'EXPIRED' }, expiredDeploymentIds.length);
+  }
+  if (fencedDeploymentIds.length > 0) {
+    reconcilerFencedTotal.inc(fencedDeploymentIds.length);
+    deploymentsTotal.inc({ status: 'FAILED' }, fencedDeploymentIds.length);
+  }
+  if (removedContainerIds.length > 0) {
+    reconcilerOrphansRemovedTotal.inc({ kind: 'container' }, removedContainerIds.length);
+  }
+  if (removedImageTags.length > 0) {
+    reconcilerOrphansRemovedTotal.inc({ kind: 'image' }, removedImageTags.length);
+  }
+  reconcilerSweepDurationSeconds.observe(Math.max(0, (Date.now() - sweepStartMs) / 1000));
 
   return {
     expiredDeploymentIds,

@@ -842,3 +842,32 @@ export async function countLiveDeployments(db: DrizzleClient): Promise<number> {
   );
   return Number(rows[0]?.count ?? 0);
 }
+
+/**
+ * Returns the exact count of deployments in PostgreSQL grouped by `DeploymentStatus`.
+ * Used by the Prometheus gauge collector so API-side supersedes and reconciler expirations
+ * are reflected accurately across restarts.
+ */
+export async function countDeploymentsByStatus(
+  db: DrizzleClient,
+): Promise<Record<DeploymentStatus, number>> {
+  const counts: Record<DeploymentStatus, number> = {
+    QUEUED: 0,
+    BUILDING: 0,
+    STARTING: 0,
+    TESTING: 0,
+    LIVE: 0,
+    FAILED: 0,
+    SUPERSEDED: 0,
+    EXPIRED: 0,
+  };
+  const rows = await db.execute<{ status: DeploymentStatus; count: string | number }>(
+    sql`SELECT status, COUNT(*) AS count FROM deployments GROUP BY status`,
+  );
+  for (const row of rows) {
+    if (row.status in counts) {
+      counts[row.status] = Number(row.count);
+    }
+  }
+  return counts;
+}
