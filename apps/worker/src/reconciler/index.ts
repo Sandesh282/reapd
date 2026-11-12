@@ -73,7 +73,9 @@ export async function runReconcileSweep(
   const dbClient = opts?.dbClient ?? db;
   const dockerClient = opts?.dockerClient ?? createDockerClient();
 
-  const envStuckMin = Number(process.env['REAPD_STUCK_BUILD_MINUTES']);
+  const envStuckMin = Number(
+    process.env['REAPD_STUCK_THRESHOLD_MINUTES'] ?? process.env['REAPD_STUCK_BUILD_MINUTES']
+  );
   const stuckBuildMinutes =
     opts?.stuckBuildMinutes ??
     (Number.isFinite(envStuckMin) && envStuckMin > 0
@@ -235,7 +237,11 @@ export async function sweepStaleTempBuildDirs(
  * Uses an `isRunning` guard and a 30s timeout so overlapping sweeps cannot interleave
  * or wedge the timer permanently if Docker or Postgres stalls.
  */
-export function startReconciler(opts?: { intervalMs?: number }): () => void {
+export function startReconciler(opts?: {
+  intervalMs?: number;
+  immediate?: boolean;
+  unref?: boolean;
+}): () => void {
   const envInterval = Number(process.env['REAPD_RECONCILE_INTERVAL_MS']);
   const intervalMs =
     opts?.intervalMs ??
@@ -271,11 +277,16 @@ export function startReconciler(opts?: { intervalMs?: number }): () => void {
   };
 
   console.log(`♻️  Desired-state reconciler started (interval: ${intervalMs}ms)`);
+  if (opts?.immediate) {
+    void tick();
+  }
   const timer = setInterval(() => {
     void tick();
   }, intervalMs);
 
-  timer.unref();
+  if (opts?.unref ?? true) {
+    timer.unref();
+  }
   return () => {
     stopped = true;
     clearInterval(timer);

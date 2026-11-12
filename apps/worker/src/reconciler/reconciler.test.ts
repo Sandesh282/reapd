@@ -12,6 +12,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type Dockerode from 'dockerode';
 import type { DrizzleClient } from '@reapd/db';
+import { parseWorkerRole, resolveMetricsPort } from '../index.js';
 import { registry } from '../metrics.js';
 import { runReconcileSweep, sweepStaleTempBuildDirs } from './index.js';
 
@@ -190,5 +191,68 @@ test('runReconcileSweep snapshots Docker before querying active DB IDs, preserve
   } finally {
     await rm(tmpRoot, { recursive: true, force: true });
   }
+});
+
+test('runReconcileSweep fences stuck deployments and increments fenced + FAILED counters', async () => {
+  const fakeDocker = {
+    listContainers: async () => [],
+    listImages: async () => [],
+  } as unknown as Dockerode;
+
+  let txCount = 0;
+  const fakeDb = {
+    transaction: async <T>(fn: (tx: unknown) => Promise<T>): Promise<T> => {
+      txCount++;
+      const currentTx = txCount;
+      const fakeTx = {
+        execute: async () => {
+          if (currentTx === 1) return [];
+          // tx 2 = fenceStuckDeployments
+          if (currentTx === 2) return [{ id: 'deploy-stuck-999', status: 'BUILDING' }];
+          return [];
+        },
+      };
+      return fn(fakeTx);
+    },
+    execute: async () => [],
+  } as unknown as DrizzleClient;
+
+  const tmpRoot = await mkdtemp(join(tmpdir(), 'reapd-reconcile-fence-'));
+  try {
+    const res = await runReconcileSweep({
+      dbClient: fakeDb,
+      dockerClient: fakeDocker,
+      stuckBuildMinutes: 0.05,
+      tmpRootDir: tmpRoot,
+    });
+
+    assert.deepEqual(res.fencedDeploymentIds, ['deploy-stuck-999']);
+    const metricsOutput = await registry.metrics();
+    assert.match(metricsOutput, /reapd_reconciler_fenced_total\{[^}]*\}\s+[1-9]\d*/);
+    assert.match(metricsOutput, /reapd_deployments_total\{[^}]*status="FAILED"[^}]*\}\s+[1-9]\d*/);
+    assert.match(
+      metricsOutput,
+      /reapd_reconciler_last_success_timestamp_seconds\{[^}]*\}\s+[1-9]\d*/
+    );
+  } finally {
+    await rm(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('parseWorkerRole and resolveMetricsPort support standalone worker and reconciler modes', () => {
+  assert.equal(parseWorkerRole(undefined), 'all');
+  assert.equal(parseWorkerRole(''), 'all');
+  assert.equal(parseWorkerRole('ALL'), 'all');
+  assert.equal(parseWorkerRole('worker'), 'worker');
+  assert.equal(parseWorkerRole('reconciler'), 'reconciler');
+  assert.throws(() => parseWorkerRole('invalid-role'), /Invalid REAPD_ROLE/);
+
+  assert.equal(resolveMetricsPort('all', {}), 9091);
+  assert.equal(resolveMetricsPort('worker', { REAPD_WORKER_METRICS_PORT: '19091' }), 19091);
+  assert.equal(resolveMetricsPort('reconciler', {}), 9092);
+  assert.equal(
+    resolveMetricsPort('reconciler', { REAPD_RECONCILER_METRICS_PORT: '19095' }),
+    19095
+  );
 });
 

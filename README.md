@@ -256,7 +256,7 @@ Then run the application processes in separate terminals:
 ```bash
 npm run build                        # Turborepo builds all packages in dependency order
 npm run dev --workspace apps/api     # Fastify API on :3001
-npm run dev --workspace apps/worker  # BullMQ worker
+npm run dev --workspace apps/worker  # BullMQ worker + reconciler (or split via REAPD_ROLE=worker / REAPD_ROLE=reconciler)
 npm run dev --workspace apps/web     # Next.js dashboard on :3000
 ```
 
@@ -296,7 +296,7 @@ The API and worker each expose Prometheus metrics (`prom-client`). `docker compo
 | `reapd_webhook_requests_total{event,action}` | counter | API, counted after HMAC verification |
 | `reapd_webhook_rejections_total{reason}` | counter | API, rejected/deduplicated deliveries (`invalid_signature`, `fork_rejected`, `duplicate`, etc.) |
 
-Endpoints: API at `http://127.0.0.1:3001/metrics` (with best-effort rejection of common reverse-proxy/tunnel headers like `X-Forwarded-*`, `Forwarded`, `X-Real-IP`, `CF-Connecting-IP`), worker at `http://127.0.0.1:9091/metrics` (override with `REAPD_WORKER_METRICS_HOST` / `REAPD_WORKER_METRICS_PORT`). Both bind to `127.0.0.1` by default — on Docker Desktop (`macOS`/`Windows`), `host.docker.internal` reaches host loopback directly; on Linux, where `host-gateway` resolves to the Docker bridge IP, set `REAPD_WORKER_METRICS_HOST` and `REAPD_API_HOST` to the bridge IP or run Prometheus with host networking.
+Endpoints: API at `http://127.0.0.1:3001/metrics` (with best-effort rejection of common reverse-proxy/tunnel headers like `X-Forwarded-*`, `Forwarded`, `X-Real-IP`, `CF-Connecting-IP`), worker at `http://127.0.0.1:9091/metrics` (override with `REAPD_WORKER_METRICS_HOST` / `REAPD_WORKER_METRICS_PORT`), and standalone reconciler (`REAPD_ROLE=reconciler`) at `http://127.0.0.1:9092/metrics` (override with `REAPD_RECONCILER_METRICS_HOST` / `REAPD_RECONCILER_METRICS_PORT`). All listeners bind to `127.0.0.1` by default — on Docker Desktop (`macOS`/`Windows`), `host.docker.internal` reaches host loopback directly; on Linux, where `host-gateway` resolves to the Docker bridge IP, set `REAPD_WORKER_METRICS_HOST` and `REAPD_API_HOST` to the bridge IP or run Prometheus with host networking.
 
 ---
 
