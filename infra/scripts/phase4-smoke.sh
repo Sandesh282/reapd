@@ -527,6 +527,12 @@ const [reconcilerMetricsUrl] = process.argv.slice(2);
 });
 NODE_EOF
 
+# Stop the standalone reconciler: its 1.8s fence threshold would otherwise fence the recovery
+# build mid-flight (any real build takes longer than that) and prune its image.
+kill "$RECONCILER_PID" 2>/dev/null || true
+wait "$RECONCILER_PID" 2>/dev/null || true
+RECONCILER_PID=""
+
 # Start a fresh worker (REAPD_ROLE=worker) and push a recovery commit to prove PR #401 recovers to LIVE.
 # Same note: don't hard-code generation numbers — poll the newest row for the subdomain.
 echo "🔄 Starting fresh worker and sending recovery commit..."

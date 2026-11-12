@@ -16,7 +16,9 @@ import { parseWorkerRole, resolveMetricsPort } from '../index.js';
 import { registry } from '../metrics.js';
 import { runReconcileSweep, sweepStaleTempBuildDirs } from './index.js';
 
-test('runReconcileSweep snapshots Docker before querying active DB IDs, preserves cli-* & active resources, and skips failed removals', async () => {
+test('runReconcileSweep snapshots Docker before querying active DB IDs, preserves cli-* & active resources, and skips failed removals', async (t) => {
+  t.mock.method(console, 'log', () => {});
+  t.mock.method(console, 'warn', () => {});
   const callOrder: string[] = [];
   const removedContainers: string[] = [];
   const removedImages: string[] = [];
@@ -193,7 +195,8 @@ test('runReconcileSweep snapshots Docker before querying active DB IDs, preserve
   }
 });
 
-test('runReconcileSweep fences stuck deployments and increments fenced + FAILED counters', async () => {
+test('runReconcileSweep fences stuck deployments and increments fenced + FAILED counters', async (t) => {
+  t.mock.method(console, 'log', () => {});
   const fakeDocker = {
     listContainers: async () => [],
     listImages: async () => [],
