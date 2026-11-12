@@ -33,6 +33,11 @@ import { getInstallationToken } from '../github/auth.js';
 import { upsertPrComment } from '../github/pr-comment.js';
 import { createLogSink, type LogSink, redactSecrets } from '../logs/log-sink.js';
 import {
+  buildDurationSeconds,
+  deploymentsTotal,
+  smokeResultsTotal,
+} from '../metrics.js';
+import {
   runPlaywrightSmokeCheck,
   shouldFailSmoke,
   type SmokeTestRunSummary,
@@ -222,6 +227,7 @@ export async function buildJobHandler(job: Job<BuildJobPayload>): Promise<void> 
         },
       });
       buildDurationMs = built.buildDurationMs;
+      buildDurationSeconds.observe(buildDurationMs / 1000);
       sink.write('system', 'stdout', `[reapd] Image ${imageTag} built in ${buildDurationMs}ms`);
     } finally {
       await cloned.cleanup().catch((err: unknown) => {
@@ -335,6 +341,8 @@ export async function buildJobHandler(job: Job<BuildJobPayload>): Promise<void> 
       console.warn(`⚠️  Failed to record test_run for ${deploymentId}:`, dbErr);
     });
 
+    smokeResultsTotal.inc({ result: smokeResult.status });
+
     if (shouldFailSmoke(smokeResult.status)) {
       await forceRemoveContainer(docker, container.id).catch(() => {});
       throw new Error(
@@ -363,6 +371,7 @@ export async function buildJobHandler(job: Job<BuildJobPayload>): Promise<void> 
     finalBuildStatus = 'LIVE';
     sink.write('system', 'stdout', `[reapd] Preview LIVE at ${basePreviewUrl}`);
     await sink.end('LIVE');
+    deploymentsTotal.inc({ status: 'LIVE' });
     console.log(`🟢 LIVE: ${basePreviewUrl} (deployment ${deploymentId})`);
 
     // Post sticky PR comment AFTER sealing `end:LIVE` in Redis so GitHub API latency
@@ -395,6 +404,7 @@ export async function buildJobHandler(job: Job<BuildJobPayload>): Promise<void> 
       }).catch((dbErr: unknown) => {
         console.warn(`⚠️  Failed to record ${targetStatus} status for ${deploymentId}:`, dbErr);
       });
+      deploymentsTotal.inc({ status: targetStatus });
       return;
     }
 
@@ -422,6 +432,8 @@ export async function buildJobHandler(job: Job<BuildJobPayload>): Promise<void> 
     if (failTrans) {
       finalBuildStatus = toBuildLogEndStatus(failTrans.finalStatus);
     }
+
+    deploymentsTotal.inc({ status: finalBuildStatus });
 
     // Seal the build log stream AFTER committing the DB status and BEFORE calling GitHub
     // (`sink.end()` is idempotent via its internal `ended` flag, so the `finally` call is a no-op).
